@@ -62,7 +62,7 @@
     "hero.mentor":
       "<sup>†</sup> Lead project collaborator",
     "hero.figcap":
-      "<b>核心思想。</b>一条行为请求通常不会只对应一处代码。Harness Handbook 把<span class=\"u-b\">“系统应该做什么”</span>整理成可导航的行为路径，并把路径上的每一步连接回<span class=\"u-i\">真实代码证据</span>，让理解、审核和修改都能从同一张地图出发。",
+      "一项行为请求往往牵动多处实现。Harness Handbook 将这些分散位置重新组织为可导航的行为路径，并在每一步连回可核验的代码证据——理解、审核与修改共用同一张地图。",
 
     /* ---- TL;DR ---- */
     "tldr.kicker": "一分钟速览",
