@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>app-server-transport/src/transport/remote_control/auth.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">app-server-transport/src/transport/remote_control/auth.rs</code>
+<span class="code-meta">105 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=k>use</b> codex_api::SharedAuthProvider;</i><i id="L2"><b class=k>use</b> codex_login::AuthManager;</i><i id="L3"><b class=k>use</b> codex_login::UnauthorizedRecovery;</i><i id="L4"><b class=k>use</b> std::io;</i><i id="L5"><b class=k>use</b> std::io::ErrorKind;</i><i id="L6"><b class=k>use</b> std::sync::Arc;</i><i id="L7"><b class=k>use</b> tokio::sync::watch;</i><i id="L8"><b class=k>use</b> tracing::info;</i><i id="L9"><b class=k>use</b> tracing::warn;</i><i id="L10"></i><i id="L11"><b class=k>pub</b>(<b class=k>super</b>) <b class=k>struct</b> RemoteControlConnectionAuth {</i><i id="L12">    <b class=k>pub</b>(<b class=k>super</b>) auth_provider: SharedAuthProvider,</i><i id="L13">    <b class=k>pub</b>(<b class=k>super</b>) account_id: String,</i><i id="L14">}</i><i id="L15"></i><i id="L16"><b class=k>pub</b>(<b class=k>super</b>) <b class=k>async</b> <b class=k>fn</b> load_remote_control_auth(</i><i id="L17">    auth_manager: &amp;Arc&lt;AuthManager&gt;,</i><i id="L18">) -&gt; io::Result&lt;RemoteControlConnectionAuth&gt; {</i><i id="L19">    <b class=k>let</b> <b class=k>mut</b> reloaded = <b class=k>false</b>;</i><i id="L20">    <b class=k>let</b> auth = <b class=k>loop</b> {</i><i id="L21">        <b class=k>let</b> Some(auth) = auth_manager.auth().<b class=k>await</b> <b class=k>else</b> {</i><i id="L22">            <b class=k>if</b> reloaded {</i><i id="L23">                <b class=k>return</b> Err(io::Error::new(</i><i id="L24">                    ErrorKind::PermissionDenied,</i><i id="L25">                    <b class=s>"remote control requires ChatGPT authentication"</b>,</i><i id="L26">                ));</i><i id="L27">            }</i><i id="L28">            auth_manager.reload().<b class=k>await</b>;</i><i id="L29">            reloaded = <b class=k>true</b>;</i><i id="L30">            <b class=k>continue</b>;</i><i id="L31">        };</i><i id="L32">        <b class=k>if</b> !auth.uses_codex_backend() {</i><i id="L33">            <b class=k>break</b> auth;</i><i id="L34">        }</i><i id="L35">        <b class=k>if</b> auth.get_account_id().is_none() &amp;&amp; !reloaded {</i><i id="L36">            auth_manager.reload().<b class=k>await</b>;</i><i id="L37">            reloaded = <b class=k>true</b>;</i><i id="L38">            <b class=k>continue</b>;</i><i id="L39">        }</i><i id="L40">        <b class=k>break</b> auth;</i><i id="L41">    };</i><i id="L42"></i><i id="L43">    <b class=k>if</b> !auth.uses_codex_backend() {</i><i id="L44">        <b class=k>return</b> Err(io::Error::new(</i><i id="L45">            ErrorKind::PermissionDenied,</i><i id="L46">            <b class=s>"remote control requires ChatGPT authentication; API key auth is not supported"</b>,</i><i id="L47">        ));</i><i id="L48">    }</i><i id="L49"></i><i id="L50">    Ok(RemoteControlConnectionAuth {</i><i id="L51">        auth_provider: codex_model_provider::auth_provider_from_auth(&amp;auth),</i><i id="L52">        account_id: auth.get_account_id().ok_or_else(|| {</i><i id="L53">            io::Error::new(</i><i id="L54">                ErrorKind::WouldBlock,</i><i id="L55">                <b class=s>"remote control enrollment is waiting for a ChatGPT account id"</b>,</i><i id="L56">            )</i><i id="L57">        })?,</i><i id="L58">    })</i><i id="L59">}</i><i id="L60"></i><i id="L61"><b class=k>pub</b>(<b class=k>super</b>) <b class=k>async</b> <b class=k>fn</b> recover_remote_control_auth(</i><i id="L62">    auth_recovery: &amp;<b class=k>mut</b> UnauthorizedRecovery,</i><i id="L63">    auth_change_rx: &amp;<b class=k>mut</b> watch::Receiver&lt;u64&gt;,</i><i id="L64">) -&gt; bool {</i><i id="L65">    <b class=k>if</b> !auth_recovery.has_next() {</i><i id="L66">        <b class=k>return</b> <b class=k>false</b>;</i><i id="L67">    }</i><i id="L68"></i><i id="L69">    <b class=k>let</b> mode = auth_recovery.mode_name();</i><i id="L70">    <b class=k>let</b> step = auth_recovery.step_name();</i><i id="L71">    <b class=k>let</b> auth_change_revision_before_recovery = *auth_change_rx.borrow();</i><i id="L72">    <b class=k>match</b> auth_recovery.next().<b class=k>await</b> {</i><i id="L73">        Ok(step_result) =&gt; {</i><i id="L74">            <b class=k>if</b> step_result.auth_state_changed() == Some(<b class=k>true</b>) {</i><i id="L75">                mark_recovery_auth_change_seen(</i><i id="L76">                    auth_change_rx,</i><i id="L77">                    auth_change_revision_before_recovery,</i><i id="L78">                );</i><i id="L79">            }</i><i id="L80">            <b class=m>info!</b>(</i><i id="L81">                <b class=s>"remote control auth recovery succeeded: mode={mode}, step={step}, auth_state_changed={:?}"</b>,</i><i id="L82">                step_result.auth_state_changed()</i><i id="L83">            );</i><i id="L84">            <b class=k>true</b></i><i id="L85">        }</i><i id="L86">        Err(err) =&gt; {</i><i id="L87">            <b class=m>warn!</b>(<b class=s>"remote control auth recovery failed: mode={mode}, step={step}: {err}"</b>);</i><i id="L88">            <b class=k>false</b></i><i id="L89">        }</i><i id="L90">    }</i><i id="L91">}</i><i id="L92"></i><i id="L93"><b class=k>pub</b>(<b class=k>super</b>) <b class=k>fn</b> mark_recovery_auth_change_seen(</i><i id="L94">    auth_change_rx: &amp;<b class=k>mut</b> watch::Receiver&lt;u64&gt;,</i><i id="L95">    auth_change_revision_before_recovery: u64,</i><i id="L96">) {</i><i id="L97">    <b class=k>let</b> auth_change_revision_after_recovery = *auth_change_rx.borrow();</i><i id="L98">    <b class=k>if</b> auth_change_revision_after_recovery == auth_change_revision_before_recovery.wrapping_add(<b class=n>1</b>) {</i><i id="L99">        <b class=c>// Recovery updated the same watch that wakes the outer reconnect</b></i><i id="L100">        <b class=c>// loop. Mark only that single revision seen; if more revisions</b></i><i id="L101">        <b class=c>// arrived while recovery was in flight, leave them pending so the</b></i><i id="L102">        <b class=c>// reconnect loop still reacts to the later external auth change.</b></i><i id="L103">        auth_change_rx.borrow_and_update();</i><i id="L104">    }</i><i id="L105">}</i></pre></div>
+</main>
+<script src="../../../../../assets/app.js"></script>
+</body>
+</html>

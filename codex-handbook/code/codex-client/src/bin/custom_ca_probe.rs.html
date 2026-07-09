@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>codex-client/src/bin/custom_ca_probe.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">codex-client/src/bin/custom_ca_probe.rs</code>
+<span class="code-meta">100 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=c>//! Helper binary for exercising shared custom CA environment handling in tests.</b></i><i id="L2"><b class=c>//!</b></i><i id="L3"><b class=c>//! The shared reqwest client honors `CODEX_CA_CERTIFICATE` and `SSL_CERT_FILE`, but those</b></i><i id="L4"><b class=c>//! environment variables are process-global and unsafe to mutate in parallel test execution. This</b></i><i id="L5"><b class=c>//! probe keeps the behavior under test while letting integration tests (`tests/ca_env.rs`) set</b></i><i id="L6"><b class=c>//! env vars per-process, proving:</b></i><i id="L7"><b class=c>//!</b></i><i id="L8"><b class=c>//! - env precedence is respected,</b></i><i id="L9"><b class=c>//! - multi-cert PEM bundles load,</b></i><i id="L10"><b class=c>//! - error messages guide users when CA files are invalid.</b></i><i id="L11"><b class=c>//! - optional HTTPS probes can complete a request through the constructed client.</b></i><i id="L12"><b class=c>//!</b></i><i id="L13"><b class=c>//! The detailed explanation of what "hermetic" means here lives in `codex_client::custom_ca`.</b></i><i id="L14"><b class=c>//! This binary exists so the tests can exercise</b></i><i id="L15"><b class=c>//! [`codex_client::build_reqwest_client_for_subprocess_tests`] in a separate process without</b></i><i id="L16"><b class=c>//! duplicating client-construction logic.</b></i><i id="L17"></i><i id="L18"><b class=k>use</b> std::env;</i><i id="L19"><b class=k>use</b> std::process;</i><i id="L20"><b class=k>use</b> std::time::Duration;</i><i id="L21"></i><i id="L22"><b class=k>const</b> PROBE_TLS13_ENV: &amp;str = <b class=s>"CODEX_CUSTOM_CA_PROBE_TLS13"</b>;</i><i id="L23"><b class=k>const</b> PROBE_PROXY_ENV: &amp;str = <b class=s>"CODEX_CUSTOM_CA_PROBE_PROXY"</b>;</i><i id="L24"><b class=k>const</b> PROBE_URL_ENV: &amp;str = <b class=s>"CODEX_CUSTOM_CA_PROBE_URL"</b>;</i><i id="L25"></i><i id="L26"><b class=k>fn</b> main() {</i><i id="L27">    <b class=k>let</b> runtime = <b class=k>match</b> tokio::runtime::Builder::new_current_thread()</i><i id="L28">        .enable_all()</i><i id="L29">        .build()</i><i id="L30">    {</i><i id="L31">        Ok(runtime) =&gt; runtime,</i><i id="L32">        Err(error) =&gt; {</i><i id="L33">            <b class=m>eprintln!</b>(<b class=s>"failed to create probe runtime: {error}"</b>);</i><i id="L34">            process::exit(<b class=n>1</b>);</i><i id="L35">        }</i><i id="L36">    };</i><i id="L37"></i><i id="L38">    <b class=k>match</b> runtime.block_on(run_probe()) {</i><i id="L39">        Ok(()) =&gt; <b class=m>println!</b>(<b class=s>"ok"</b>),</i><i id="L40">        Err(error) =&gt; {</i><i id="L41">            <b class=m>eprintln!</b>(<b class=s>"{error}"</b>);</i><i id="L42">            process::exit(<b class=n>1</b>);</i><i id="L43">        }</i><i id="L44">    }</i><i id="L45">}</i><i id="L46"></i><i id="L47"><b class=k>async</b> <b class=k>fn</b> run_probe() -&gt; Result&lt;(), String&gt; {</i><i id="L48">    <b class=k>let</b> proxy_url = env::var(PROBE_PROXY_ENV).ok();</i><i id="L49">    <b class=k>let</b> target_url = env::var(PROBE_URL_ENV).ok();</i><i id="L50">    <b class=k>let</b> <b class=k>mut</b> builder = reqwest::Client::builder();</i><i id="L51">    <b class=k>if</b> target_url.is_some() {</i><i id="L52">        builder = builder.timeout(Duration::from_secs(<b class=n>5</b>));</i><i id="L53">    }</i><i id="L54">    <b class=k>if</b> env::var_os(PROBE_TLS13_ENV).is_some() {</i><i id="L55">        builder = builder.min_tls_version(reqwest::tls::Version::TLS_1_3);</i><i id="L56">    }</i><i id="L57"></i><i id="L58">    <b class=k>let</b> client = build_probe_client(builder, proxy_url.as_deref())?;</i><i id="L59">    <b class=k>if</b> <b class=k>let</b> Some(url) = target_url {</i><i id="L60">        post_probe_request(&amp;client, &amp;url).<b class=k>await</b>?;</i><i id="L61">    }</i><i id="L62">    Ok(())</i><i id="L63">}</i><i id="L64"></i><i id="L65"><b class=k>fn</b> build_probe_client(</i><i id="L66">    builder: reqwest::ClientBuilder,</i><i id="L67">    proxy_url: Option&lt;&amp;str&gt;,</i><i id="L68">) -&gt; Result&lt;reqwest::Client, String&gt; {</i><i id="L69">    <b class=k>if</b> <b class=k>let</b> Some(proxy_url) = proxy_url {</i><i id="L70">        <b class=k>let</b> proxy = reqwest::Proxy::https(proxy_url)</i><i id="L71">            .map_err(|error| <b class=m>format!</b>(<b class=s>"failed to configure probe proxy {proxy_url}: {error}"</b>))?;</i><i id="L72">        <b class=k>return</b> codex_client::build_reqwest_client_with_custom_ca(builder.proxy(proxy))</i><i id="L73">            .map_err(|error| error.to_string());</i><i id="L74">    }</i><i id="L75"></i><i id="L76">    codex_client::build_reqwest_client_for_subprocess_tests(builder)</i><i id="L77">        .map_err(|error| error.to_string())</i><i id="L78">}</i><i id="L79"></i><i id="L80"><b class=k>async</b> <b class=k>fn</b> post_probe_request(client: &amp;reqwest::Client, url: &amp;str) -&gt; Result&lt;(), String&gt; {</i><i id="L81">    <b class=k>let</b> response = client</i><i id="L82">        .post(url)</i><i id="L83">        .header(<b class=s>"Content-Type"</b>, <b class=s>"application/x-www-form-urlencoded"</b>)</i><i id="L84">        .body(<b class=s>"grant_type=authorization_code&amp;code=test"</b>)</i><i id="L85">        .send()</i><i id="L86">        .<b class=k>await</b></i><i id="L87">        .map_err(|error| <b class=m>format!</b>(<b class=s>"probe request failed: {error:?}"</b>))?;</i><i id="L88">    <b class=k>let</b> status = response.status();</i><i id="L89">    <b class=k>let</b> body = response</i><i id="L90">        .text()</i><i id="L91">        .<b class=k>await</b></i><i id="L92">        .map_err(|error| <b class=m>format!</b>(<b class=s>"failed to read probe response body: {error}"</b>))?;</i><i id="L93">    <b class=k>if</b> !status.is_success() {</i><i id="L94">        <b class=k>return</b> Err(<b class=m>format!</b>(<b class=s>"probe request returned {status}: {body}"</b>));</i><i id="L95">    }</i><i id="L96">    <b class=k>if</b> body != <b class=s>"ok"</b> {</i><i id="L97">        <b class=k>return</b> Err(<b class=m>format!</b>(<b class=s>"probe response body mismatch: {body}"</b>));</i><i id="L98">    }</i><i id="L99">    Ok(())</i><i id="L100">}</i></pre></div>
+</main>
+<script src="../../../../assets/app.js"></script>
+</body>
+</html>

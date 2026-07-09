@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tui/src/app/tests/session_summary.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">tui/src/app/tests/session_summary.rs</code>
+<span class="code-meta">92 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=k>use</b> <b class=k>super</b>::*;</i><i id="L2"><b class=k>use</b> pretty_assertions::assert_eq;</i><i id="L3"></i><i id="L4"><b class=m>#[tokio::test]</b></i><i id="L5"><b class=k>async</b> <b class=k>fn</b> session_summary_skips_when_no_usage_or_resume_hint() {</i><i id="L6">    <b class=m>assert!</b>(</i><i id="L7">        session_summary(</i><i id="L8">            TokenUsage::default(),</i><i id="L9">            <b class=c>/*thread_id*/</b> None,</i><i id="L10">            <b class=c>/*thread_name*/</b> None,</i><i id="L11">            <b class=c>/*rollout_path*/</b> None,</i><i id="L12">        )</i><i id="L13">        .is_none()</i><i id="L14">    );</i><i id="L15">}</i><i id="L16"></i><i id="L17"><b class=m>#[tokio::test]</b></i><i id="L18"><b class=k>async</b> <b class=k>fn</b> session_summary_skips_resume_hint_until_rollout_exists() {</i><i id="L19">    <b class=k>let</b> usage = TokenUsage::default();</i><i id="L20">    <b class=k>let</b> conversation = ThreadId::from_string(<b class=s>"123e4567-e89b-12d3-a456-426614174000"</b>).unwrap();</i><i id="L21">    <b class=k>let</b> temp_dir = tempdir().expect(<b class=s>"temp dir"</b>);</i><i id="L22">    <b class=k>let</b> rollout_path = temp_dir.path().join(<b class=s>"rollout.jsonl"</b>);</i><i id="L23"></i><i id="L24">    <b class=m>assert!</b>(</i><i id="L25">        session_summary(</i><i id="L26">            usage,</i><i id="L27">            Some(conversation),</i><i id="L28">            <b class=c>/*thread_name*/</b> None,</i><i id="L29">            Some(&amp;rollout_path),</i><i id="L30">        )</i><i id="L31">        .is_none()</i><i id="L32">    );</i><i id="L33">}</i><i id="L34"></i><i id="L35"><b class=m>#[tokio::test]</b></i><i id="L36"><b class=k>async</b> <b class=k>fn</b> session_summary_includes_resume_hint_for_persisted_rollout() {</i><i id="L37">    <b class=k>let</b> usage = TokenUsage {</i><i id="L38">        input_tokens: <b class=n>10</b>,</i><i id="L39">        output_tokens: <b class=n>2</b>,</i><i id="L40">        total_tokens: <b class=n>12</b>,</i><i id="L41">        ..Default::default()</i><i id="L42">    };</i><i id="L43">    <b class=k>let</b> conversation = ThreadId::from_string(<b class=s>"123e4567-e89b-12d3-a456-426614174000"</b>).unwrap();</i><i id="L44">    <b class=k>let</b> temp_dir = tempdir().expect(<b class=s>"temp dir"</b>);</i><i id="L45">    <b class=k>let</b> rollout_path = temp_dir.path().join(<b class=s>"rollout.jsonl"</b>);</i><i id="L46">    std::fs::write(&amp;rollout_path, <b class=s>"{}\n"</b>).expect(<b class=s>"write rollout"</b>);</i><i id="L47"></i><i id="L48">    <b class=k>let</b> summary = session_summary(</i><i id="L49">        usage,</i><i id="L50">        Some(conversation),</i><i id="L51">        <b class=c>/*thread_name*/</b> None,</i><i id="L52">        Some(&amp;rollout_path),</i><i id="L53">    )</i><i id="L54">    .expect(<b class=s>"summary"</b>);</i><i id="L55">    <b class=m>assert_eq!</b>(</i><i id="L56">        summary.usage_line,</i><i id="L57">        Some(<b class=s>"Token usage: total=12 input=10 output=2"</b>.to_string())</i><i id="L58">    );</i><i id="L59">    <b class=m>assert_eq!</b>(</i><i id="L60">        summary.resume_hint,</i><i id="L61">        Some(<b class=s>"codex resume 123e4567-e89b-12d3-a456-426614174000"</b>.to_string())</i><i id="L62">    );</i><i id="L63">}</i><i id="L64"></i><i id="L65"><b class=m>#[tokio::test]</b></i><i id="L66"><b class=k>async</b> <b class=k>fn</b> session_summary_names_picker_item_when_thread_has_name() {</i><i id="L67">    <b class=k>let</b> usage = TokenUsage {</i><i id="L68">        input_tokens: <b class=n>10</b>,</i><i id="L69">        output_tokens: <b class=n>2</b>,</i><i id="L70">        total_tokens: <b class=n>12</b>,</i><i id="L71">        ..Default::default()</i><i id="L72">    };</i><i id="L73">    <b class=k>let</b> conversation = ThreadId::from_string(<b class=s>"123e4567-e89b-12d3-a456-426614174000"</b>).unwrap();</i><i id="L74">    <b class=k>let</b> temp_dir = tempdir().expect(<b class=s>"temp dir"</b>);</i><i id="L75">    <b class=k>let</b> rollout_path = temp_dir.path().join(<b class=s>"rollout.jsonl"</b>);</i><i id="L76">    std::fs::write(&amp;rollout_path, <b class=s>"{}\n"</b>).expect(<b class=s>"write rollout"</b>);</i><i id="L77"></i><i id="L78">    <b class=k>let</b> summary = session_summary(</i><i id="L79">        usage,</i><i id="L80">        Some(conversation),</i><i id="L81">        Some(<b class=s>"my-session"</b>.to_string()),</i><i id="L82">        Some(&amp;rollout_path),</i><i id="L83">    )</i><i id="L84">    .expect(<b class=s>"summary"</b>);</i><i id="L85">    <b class=m>assert_eq!</b>(</i><i id="L86">        summary.resume_hint,</i><i id="L87">        Some(</i><i id="L88">            <b class=s>"codex resume, then select my-session (123e4567-e89b-12d3-a456-426614174000)"</b></i><i id="L89">                .to_string()</i><i id="L90">        )</i><i id="L91">    );</i><i id="L92">}</i></pre></div>
+</main>
+<script src="../../../../../assets/app.js"></script>
+</body>
+</html>

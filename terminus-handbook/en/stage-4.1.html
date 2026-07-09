@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-4.1 · Loop Entry Gates</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=en"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=en" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>Home</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>State-flow registers</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>Configuration Crystallization</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>Environment Setup</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>Run Onset</a></div><details class="s-node" open><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>Iteration Loop</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link cur" href="stage-4.1.html"><span class="s-num">4.1</span>Loop Entry Gates</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>Proactive Summarize Probe</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM Query</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>Response Parse</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>Pending Handoff Prompt → User Step (or Split)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>Error Branch</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>Command Execute → Observation → Trajectory Step</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>Completion Gate + Loop Control</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>Parser internal helpers</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>Run Teardown</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>Recording Post-process (External)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>Context Summarization</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token &amp; Cost Accounting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>Output Length Limiting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>Logging</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux internal helpers</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">Index</a><span class="sep">›</span><a href="stage-4.html">Iteration Loop</a></nav><div class="stage-head"><h1>Loop Entry Gates</h1><div class="meta"><span class="chip mono">stage-4.1</span><span class="chip">2 functions</span></div></div>
+<h2 class="sec">Opening Explanation</h2>
+<p>This stage exists to do two things at the very top of every loop iteration: stamp the iteration with the current episode number, and decide whether the agent is still allowed to continue because its terminal is still alive. That sounds small, but it protects the rest of the loop from running on a dead terminal and gives later telemetry a stable, user-facing iteration count. It sits right at loop entry because both facts matter before anything else happens. The rest of the pipeline should only run if there is still a live tmux session (a terminal you can drive remotely). If that session is gone, there is nothing useful left to observe, plan, or act on.</p>
+<h2 class="sec">Main Flow</h2>
+
+<ol><li>The loop first updates the episode counter.<p><code>self._n_episodes = episode + 1</code> turns the internal zero-based loop index into a 1-based count people can read in logs and metadata. This stage does it early so the iteration is already stamped even if the loop stops immediately after. That gives downstream reporting a consistent “which attempt was this?” value.</p></li><li>Then it checks whether the terminal still exists.<p><code>is_session_alive()</code> (asks whether the tmux session is still running) is the real gate here. Its job is not to produce LLM context or agent state. Its job is to answer a simple control question: can the agent safely keep going?</p></li><li>The result becomes a continue-or-exit decision.<p>If the session is alive, the loop continues to <code>stage-4.2 Proactive Summarize Probe</code>. If it is dead, this stage logs that the session ended and terminates the loop/run from inside the loop body. No later stage in this iteration runs.</p></li></ol>
+<p>This is basically a guardrail. Without it, later stages would try to reason about or act on a terminal that no longer exists.</p>
+<h2 class="sec"> State Flow</h2>
+<ul><li>writes: <a class="reg" href="registers.html#reg-n-episodes"><code>reg-n-episodes</code></a> — written at the start of each iteration to store the 1-based episode count for user-facing telemetry; this stamp happens before the liveness gate so the attempted iteration is still counted consistently</li><li>reads: no tracked registers — this stage does not consume any tracked register as input</li><li>clears: no tracked registers — this stage leaves all tracked state unchanged except for the episode-count write</li><li>triggers downstream: <code>stage-4.2 Proactive Summarize Probe</code> — continue to next stage if the tmux session is alive; otherwise terminate the loop/run and skip all downstream stages</li></ul>
+<p>Session liveness is checked from external runtime/session state, not from a tracked register, and it does not write any tracked register besides <a class="reg" href="registers.html#reg-n-episodes"><code>reg-n-episodes</code></a>.</p>
+<h2 class="sec">Pipeline Hand-Off</h2>
+<p>Upstream hands this stage a fresh loop iteration. This stage produces two outputs: an updated episode register for later metadata, and a control-flow decision about whether the loop may continue. If the terminal is alive, downstream stages inherit a stamped iteration and keep running; if not, no downstream stage runs at all.</p><div class="files-bar"><h2 class="sec">Functions<span class="pill">2</span></h2><span class="spacer"></span><button class="tool" data-x="expand">Expand all</button><button class="tool" data-x="collapse">Collapse all</button></div><details class="file" id="fn-tmuxsession_is_session_alive"><summary><span class="chev"></span><code class="fpath">TmuxSession.is_session_alive</code><a class="fn-range" href="../code/tmux_session.py.html#L518-L524" title="tmux_session.py:518-524">tmux_session.py:518–524 ↗</a></summary><div class="file-body"><p class="fn-sub">tmux session liveness probe</p>
+<blockquote><p><strong>Stage context</strong>: This function supplies the loop-entry liveness check for stage <a href="stage-4.1.html">[stage-4.1</a>](<a href="stage-4.1.html">stage-4.1</a>.html). <code>Terminus2._run_agent_loop</code> calls it at the start of each iteration, after updating the user-facing episode counter, to decide whether the loop should continue. In this stage, it is the gate that can end the loop early when the backing tmux session no longer exists.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>TmuxSession.is_session_alive</code> checks whether the tmux session named by <code>self._session_name</code> still exists in <code>self.environment</code> for <code>self._user</code>. It returns <code>True</code> when the probe command succeeds and <code>False</code> when it does not. The method does not change instance state; its only external action is invoking <code>self.environment.exec(...)</code> with a tmux existence check.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>async def is_session_alive(self) -&gt; bool</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — bound <code>TmuxSession</code> instance that provides environment, session name, and user</li><li>reads: <code>self.environment</code>, <code>self._session_name</code>, <code>self._user</code></li><li>returns: A boolean: <code>True</code> if <code>self.environment.exec(...)</code> reports <code>return_code == 0</code> for <code>tmux has-session -t &lt;session&gt;</code>, otherwise <code>False</code>.</li><li>effects: Runs <code>tmux has-session -t &lt;session&gt;</code> through <code>self.environment.exec(...)</code> as <code>self._user</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Build the probe command from <code>self._session_name</code> as <code>tmux has-session -t &lt;session&gt;</code>.</li><li>Call <code>await self.environment.exec(...)</code> with that command and <code>user=self._user</code>, and capture the result object in <code>result</code>.</li><li>Convert the probe outcome to a boolean by testing <code>result.return_code == 0</code> and return that value.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    async def is_session_alive(self) -&gt; bool:
+        """Check if the tmux session is still alive."""
+        result = await self.environment.exec(
+            command="tmux has-session -t {}".format(self._session_name),
+            user=self._user,
+        )
+        return result.return_code == 0</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It treats tmux's exit status as the single source of truth by checking <code>result.return_code == 0</code>. That avoids parsing command output, which would add format assumptions that <code>tmux has-session</code> does not require.</li><li>It delegates execution to <code>self.environment.exec(...)</code> and passes <code>user=self._user</code> instead of running locally or assuming a default user. That keeps the liveness check aligned with the same execution context that owns the tmux session.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>Terminus2._run_agent_loop</code> at stage <a href="stage-4.1.html">[stage-4.1</a>](<a href="stage-4.1.html">stage-4.1</a>.html) uses the returned boolean as the loop-entry gate</li><li><strong>Core callees</strong>: <code>self.environment.exec</code>; external command <code>tmux has-session</code></li><li><strong>Config / state sources</strong>: <code>self._session_name</code> supplies the tmux target name; <code>self._user</code> selects the execution user; <code>self.environment</code> provides the command-execution backend</li><li><strong>Results to</strong>: Returns a boolean to <code>Terminus2._run_agent_loop</code>; Feeds the <a href="stage-4.1.html">stage-4.1</a> branch that logs "Session has ended" and returns from the loop on <code>False</code></li></ul></div></details><details class="file" id="fn-terminus2_run_agent_loop"><summary><span class="chev"></span><code class="fpath">Terminus2._run_agent_loop</code><a class="fn-range" href="../code/terminus_2.py.html#L1260-L1281" title="terminus_2.py:1260-1281">terminus_2.py:1260–1281 ↗</a></summary><div class="file-body"><p class="fn-sub">loop setup and per-iteration liveness gate</p>
+<blockquote><p><strong>Stage context</strong>: This region opens <code>Terminus2._run_agent_loop</code> and performs the stage's two entry-gate duties before later loop work can proceed. It runs once at loop startup to validate required objects and reset run-level accounting on <code>self._context</code>, then runs at the top of each iteration to publish the 1-based episode counter and stop immediately if the tmux session is already gone. Its liveness check delegates to the sibling <code>TmuxSession.is_session_alive</code> translation.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>This region verifies that <code>self._context</code> and <code>self._session</code> are present, seeds the working <code>prompt</code> from <code>initial_prompt</code>, and resets aggregate token and cost fields on <code>self._context</code>. It then enters the episode loop, writes <code>self._n_episodes</code> as a 1-based counter for the current iteration, and probes <code>self._session.is_session_alive()</code>. If the session is dead at iteration start, it logs a debug message and returns from <code>_run_agent_loop</code> immediately.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, initial_prompt: str) -&gt; None</code></p>
+<ul><li>params: <code>self</code>: <code>Terminus2</code> — agent runner instance that owns context, session, counters, and logger; <code>initial_prompt</code>: <code>str</code> — starting prompt text copied into the loop's working <code>prompt</code></li><li>reads: <code>self._context</code>, <code>self._session</code>, <code>self._max_episodes</code>, <code>self.logger</code></li><li>returns: Returns <code>None</code>; its real product is initialized run context plus either entry into the episode loop or an early loop exit when the session is dead.</li><li>effects: writes local <code>prompt = initial_prompt</code> for later loop use; sets <code>self._context.n_input_tokens = 0</code>; sets <code>self._context.n_output_tokens = 0</code>; sets <code>self._context.n_cache_tokens = 0</code>; sets <code>self._context.cost_usd = None</code>; writes <code>self._n_episodes = episode + 1</code> each iteration; awaits <code>self._session.is_session_alive()</code>; emits <code>self.logger.debug(...)</code> before early return when the session is not alive; raises <code>RuntimeError</code> if <code>self._context</code> is <code>None</code>; raises <code>RuntimeError</code> if <code>self._session</code> is <code>None</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Check <code>self._context</code>; if it is <code>None</code>, raise <code>RuntimeError</code> because the loop requires a bound run context.</li><li>Copy <code>initial_prompt</code> into local <code>prompt</code>, then reset shared run totals on <code>self._context</code>: <code>n_input_tokens</code>, <code>n_output_tokens</code>, <code>n_cache_tokens</code>, and <code>cost_usd</code>.</li><li>Check <code>self._session</code>; if it is <code>None</code>, raise <code>RuntimeError</code> because the loop cannot interact with the terminal session without it.</li><li>Start <code>for episode in range(self._max_episodes)</code> and publish the user-facing iteration number with <code>self._n_episodes = episode + 1</code>.</li><li>At the top of each iteration, await <code>self._session.is_session_alive()</code>; if it returns <code>False</code>, log <code>Session has ended, breaking out of agent loop</code> and <code>return</code> from <code>_run_agent_loop</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>        if self._context is None:
+            raise RuntimeError("Agent context is not set. This should never happen.")
+
+        prompt = initial_prompt
+
+        self._context.n_input_tokens = 0
+        self._context.n_output_tokens = 0
+        self._context.n_cache_tokens = 0
+        self._context.cost_usd = None
+
+        if self._session is None:
+            raise RuntimeError("Session is not set. This should never happen.")
+
+        # Step ID offset accounts for initial steps in the trajectory:
+        # Step 1: system message (includes task instruction)
+        # Steps 2+: agent episodes (starting from episode 0)
+
+        for episode in range(self._max_episodes):
+            self._n_episodes = episode + 1
+            if not await self._session.is_session_alive():
+                self.logger.debug("Session has ended, breaking out of agent loop")
+                return</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The region fails fast on missing <code>self._context</code> and <code>self._session</code> with <code>RuntimeError</code> instead of trying to recover. That keeps later loop code from running against impossible state and makes these invariants explicit.</li><li>It resets <code>self._context</code> token and cost aggregates here, at loop entry, so per-run accounting starts from a known baseline. Deferring that reset to later stages would mix setup concerns with per-episode work and risk carrying stale totals across runs.</li><li>It stores <code>self._n_episodes</code> as <code>episode + 1</code>, not the zero-based loop index. That matches user-facing telemetry expectations, while the loop still uses Python's natural zero-based <code>range(self._max_episodes)</code> internally.</li><li>It checks session liveness at the start of every iteration and returns immediately on failure. This centralizes the only non-completion early-exit path inside the loop; letting later stages discover a dead session would spread shutdown handling across unrelated code.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>Terminus2.run</code>, via its call into <code>Terminus2._run_agent_loop</code></li><li><strong>Core callees</strong>: <code>TmuxSession.is_session_alive</code>; <code>self.logger.debug</code></li><li><strong>Config / state sources</strong>: <code>initial_prompt</code> argument; <code>self._context</code>; <code>self._session</code>; <code>self._max_episodes</code></li><li><strong>Results to</strong>: later regions of <code>Terminus2._run_agent_loop</code>, which consume local <code>prompt</code> and the initialized context totals; <a href="stage-5.html">[stage-5</a>](<a href="stage-5.html">stage-5</a>.html) metadata surfacing through <code>self._n_episodes</code> and <code>self._context</code> aggregate fields; <code>Terminus2.run</code> finally-path, which still executes after this region returns early; debug logs that record session-ended loop termination</li><li><strong>Related siblings</strong>: <code>TmuxSession.is_session_alive</code> supplies the session-exists probe used by this gate.</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-n-episodes"><code>reg-n-episodes</code></a> — set to 1-based count each iteration</li></ul></div>
+</div></details><nav class="pn"><a class="pn-prev" href="stage-4.html"><span>← Previous</span><strong>Iteration Loop</strong></a><a class="pn-next" href="stage-4.2.html"><span>Next →</span><strong>Proactive Summarize Probe</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>app-server/src/models.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">app-server/src/models.rs</code>
+<span class="code-meta">71 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=k>use</b> std::sync::Arc;</i><i id="L2"></i><i id="L3"><b class=k>use</b> codex_app_server_protocol::Model;</i><i id="L4"><b class=k>use</b> codex_app_server_protocol::ModelServiceTier;</i><i id="L5"><b class=k>use</b> codex_app_server_protocol::ModelUpgradeInfo;</i><i id="L6"><b class=k>use</b> codex_app_server_protocol::ReasoningEffortOption;</i><i id="L7"><b class=k>use</b> codex_core::ThreadManager;</i><i id="L8"><b class=k>use</b> codex_models_manager::manager::RefreshStrategy;</i><i id="L9"><b class=k>use</b> codex_protocol::openai_models::ModelPreset;</i><i id="L10"><b class=k>use</b> codex_protocol::openai_models::ReasoningEffortPreset;</i><i id="L11"></i><i id="L12"><b class=k>pub</b> <b class=k>async</b> <b class=k>fn</b> supported_models(</i><i id="L13">    thread_manager: Arc&lt;ThreadManager&gt;,</i><i id="L14">    include_hidden: bool,</i><i id="L15">) -&gt; Vec&lt;Model&gt; {</i><i id="L16">    thread_manager</i><i id="L17">        .list_models(RefreshStrategy::OnlineIfUncached)</i><i id="L18">        .<b class=k>await</b></i><i id="L19">        .into_iter()</i><i id="L20">        .filter(|preset| include_hidden || preset.show_in_picker)</i><i id="L21">        .map(model_from_preset)</i><i id="L22">        .collect()</i><i id="L23">}</i><i id="L24"></i><i id="L25"><b class=k>fn</b> model_from_preset(preset: ModelPreset) -&gt; Model {</i><i id="L26">    Model {</i><i id="L27">        id: preset.id.to_string(),</i><i id="L28">        model: preset.model.to_string(),</i><i id="L29">        upgrade: preset.upgrade.as_ref().map(|upgrade| upgrade.id.clone()),</i><i id="L30">        upgrade_info: preset.upgrade.as_ref().map(|upgrade| ModelUpgradeInfo {</i><i id="L31">            model: upgrade.id.clone(),</i><i id="L32">            upgrade_copy: upgrade.upgrade_copy.clone(),</i><i id="L33">            model_link: upgrade.model_link.clone(),</i><i id="L34">            migration_markdown: upgrade.migration_markdown.clone(),</i><i id="L35">        }),</i><i id="L36">        availability_nux: preset.availability_nux.map(Into::into),</i><i id="L37">        display_name: preset.display_name.to_string(),</i><i id="L38">        description: preset.description.to_string(),</i><i id="L39">        hidden: !preset.show_in_picker,</i><i id="L40">        supported_reasoning_efforts: reasoning_efforts_from_preset(</i><i id="L41">            preset.supported_reasoning_efforts,</i><i id="L42">        ),</i><i id="L43">        default_reasoning_effort: preset.default_reasoning_effort,</i><i id="L44">        input_modalities: preset.input_modalities,</i><i id="L45">        supports_personality: preset.supports_personality,</i><i id="L46">        additional_speed_tiers: preset.additional_speed_tiers,</i><i id="L47">        service_tiers: preset</i><i id="L48">            .service_tiers</i><i id="L49">            .into_iter()</i><i id="L50">            .map(|service_tier| ModelServiceTier {</i><i id="L51">                id: service_tier.id,</i><i id="L52">                name: service_tier.name,</i><i id="L53">                description: service_tier.description,</i><i id="L54">            })</i><i id="L55">            .collect(),</i><i id="L56">        default_service_tier: preset.default_service_tier,</i><i id="L57">        is_default: preset.is_default,</i><i id="L58">    }</i><i id="L59">}</i><i id="L60"></i><i id="L61"><b class=k>fn</b> reasoning_efforts_from_preset(</i><i id="L62">    efforts: Vec&lt;ReasoningEffortPreset&gt;,</i><i id="L63">) -&gt; Vec&lt;ReasoningEffortOption&gt; {</i><i id="L64">    efforts</i><i id="L65">        .into_iter()</i><i id="L66">        .map(|preset| ReasoningEffortOption {</i><i id="L67">            reasoning_effort: preset.effort,</i><i id="L68">            description: preset.description,</i><i id="L69">        })</i><i id="L70">        .collect()</i><i id="L71">}</i></pre></div>
+</main>
+<script src="../../../assets/app.js"></script>
+</body>
+</html>

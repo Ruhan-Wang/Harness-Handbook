@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>plugin/src/lib.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">plugin/src/lib.rs</code>
+<span class="code-meta">100 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=c>//! Shared plugin package models, source providers, identifiers, and telemetry summaries.</b></i><i id="L2"></i><i id="L3"><b class=k>use</b> std::collections::HashSet;</i><i id="L4"></i><i id="L5"><b class=k>pub</b> <b class=k>use</b> codex_utils_plugins::mention_syntax;</i><i id="L6"><b class=k>pub</b> <b class=k>use</b> codex_utils_plugins::plugin_namespace_for_skill_path;</i><i id="L7"></i><i id="L8"><b class=k>mod</b> load_outcome;</i><i id="L9"><b class=k>pub</b> <b class=k>mod</b> manifest;</i><i id="L10"><b class=k>mod</b> plugin_id;</i><i id="L11"><b class=k>mod</b> provider;</i><i id="L12"></i><i id="L13"><b class=k>use</b> codex_config::HookEventsToml;</i><i id="L14"><b class=k>use</b> codex_utils_absolute_path::AbsolutePathBuf;</i><i id="L15"><b class=k>pub</b> <b class=k>use</b> load_outcome::EffectiveSkillRoots;</i><i id="L16"><b class=k>pub</b> <b class=k>use</b> load_outcome::LoadedPlugin;</i><i id="L17"><b class=k>pub</b> <b class=k>use</b> load_outcome::PluginLoadOutcome;</i><i id="L18"><b class=k>pub</b> <b class=k>use</b> load_outcome::prompt_safe_plugin_description;</i><i id="L19"><b class=k>pub</b> <b class=k>use</b> plugin_id::PluginId;</i><i id="L20"><b class=k>pub</b> <b class=k>use</b> plugin_id::PluginIdError;</i><i id="L21"><b class=k>pub</b> <b class=k>use</b> plugin_id::validate_plugin_segment;</i><i id="L22"><b class=k>pub</b> <b class=k>use</b> provider::PluginProvider;</i><i id="L23"><b class=k>pub</b> <b class=k>use</b> provider::PluginResourceLocator;</i><i id="L24"><b class=k>pub</b> <b class=k>use</b> provider::ResolvedPlugin;</i><i id="L25"><b class=k>pub</b> <b class=k>use</b> provider::ResolvedPluginError;</i><i id="L26"><b class=k>pub</b> <b class=k>use</b> provider::ResolvedPluginLocation;</i><i id="L27"></i><i id="L28"><b class=m>#[derive(Debug, Clone, PartialEq, Eq, Hash)]</b></i><i id="L29"><b class=k>pub</b> <b class=k>struct</b> AppConnectorId(<b class=k>pub</b> String);</i><i id="L30"></i><i id="L31"><b class=m>#[derive(Debug, Clone, PartialEq, Eq)]</b></i><i id="L32"><b class=k>pub</b> <b class=k>struct</b> AppDeclaration {</i><i id="L33">    <b class=k>pub</b> name: String,</i><i id="L34">    <b class=k>pub</b> connector_id: AppConnectorId,</i><i id="L35">    <b class=k>pub</b> category: Option&lt;String&gt;,</i><i id="L36">}</i><i id="L37"></i><i id="L38"><b class=k>pub</b> <b class=k>fn</b> app_connector_ids_from_declarations&lt;<b class=m>'a</b>&gt;(</i><i id="L39">    app_declarations: <b class=k>impl</b> IntoIterator&lt;Item = &amp;<b class=m>'a</b> AppDeclaration&gt;,</i><i id="L40">) -&gt; Vec&lt;AppConnectorId&gt; {</i><i id="L41">    <b class=k>let</b> <b class=k>mut</b> connector_ids = Vec::new();</i><i id="L42">    <b class=k>let</b> <b class=k>mut</b> seen_connector_ids = HashSet::new();</i><i id="L43">    <b class=k>for</b> app <b class=k>in</b> app_declarations {</i><i id="L44">        <b class=k>if</b> seen_connector_ids.insert(&amp;app.connector_id) {</i><i id="L45">            connector_ids.push(app.connector_id.clone());</i><i id="L46">        }</i><i id="L47">    }</i><i id="L48">    connector_ids</i><i id="L49">}</i><i id="L50"></i><i id="L51"><b class=m>#[derive(Debug, Clone, Default, PartialEq, Eq)]</b></i><i id="L52"><b class=k>pub</b> <b class=k>struct</b> PluginCapabilitySummary {</i><i id="L53">    <b class=k>pub</b> config_name: String,</i><i id="L54">    <b class=k>pub</b> display_name: String,</i><i id="L55">    <b class=k>pub</b> description: Option&lt;String&gt;,</i><i id="L56">    <b class=k>pub</b> has_skills: bool,</i><i id="L57">    <b class=k>pub</b> mcp_server_names: Vec&lt;String&gt;,</i><i id="L58">    <b class=k>pub</b> app_connector_ids: Vec&lt;AppConnectorId&gt;,</i><i id="L59">}</i><i id="L60"></i><i id="L61"><b class=m>#[derive(Debug, Clone, PartialEq, Eq)]</b></i><i id="L62"><b class=k>pub</b> <b class=k>struct</b> PluginHookSource {</i><i id="L63">    <b class=k>pub</b> plugin_id: PluginId,</i><i id="L64">    <b class=k>pub</b> plugin_root: AbsolutePathBuf,</i><i id="L65">    <b class=k>pub</b> plugin_data_root: AbsolutePathBuf,</i><i id="L66">    <b class=k>pub</b> source_path: AbsolutePathBuf,</i><i id="L67">    <b class=k>pub</b> source_relative_path: String,</i><i id="L68">    <b class=k>pub</b> hooks: HookEventsToml,</i><i id="L69">}</i><i id="L70"></i><i id="L71"><b class=m>#[derive(Debug, Clone, PartialEq, Eq)]</b></i><i id="L72"><b class=k>pub</b> <b class=k>struct</b> PluginTelemetryMetadata {</i><i id="L73">    <b class=k>pub</b> plugin_id: PluginId,</i><i id="L74">    <b class=c>/// Optional backend identifier for remote plugins, used when analytics</b></i><i id="L75">    <b class=c>/// should report the remote id instead of the local plugin cache id.</b></i><i id="L76">    <b class=k>pub</b> remote_plugin_id: Option&lt;String&gt;,</i><i id="L77">    <b class=k>pub</b> capability_summary: Option&lt;PluginCapabilitySummary&gt;,</i><i id="L78">}</i><i id="L79"></i><i id="L80"><b class=k>impl</b> PluginTelemetryMetadata {</i><i id="L81">    <b class=k>pub</b> <b class=k>fn</b> from_plugin_id(plugin_id: &amp;PluginId) -&gt; <b class=k>Self</b> {</i><i id="L82">        <b class=k>Self</b> {</i><i id="L83">            plugin_id: plugin_id.clone(),</i><i id="L84">            remote_plugin_id: None,</i><i id="L85">            capability_summary: None,</i><i id="L86">        }</i><i id="L87">    }</i><i id="L88">}</i><i id="L89"></i><i id="L90"><b class=k>impl</b> PluginCapabilitySummary {</i><i id="L91">    <b class=k>pub</b> <b class=k>fn</b> telemetry_metadata(&amp;<b class=k>self</b>) -&gt; Option&lt;PluginTelemetryMetadata&gt; {</i><i id="L92">        PluginId::parse(&amp;<b class=k>self</b>.config_name)</i><i id="L93">            .ok()</i><i id="L94">            .map(|plugin_id| PluginTelemetryMetadata {</i><i id="L95">                plugin_id,</i><i id="L96">                remote_plugin_id: None,</i><i id="L97">                capability_summary: Some(<b class=k>self</b>.clone()),</i><i id="L98">            })</i><i id="L99">    }</i><i id="L100">}</i></pre></div>
+</main>
+<script src="../../../assets/app.js"></script>
+</body>
+</html>

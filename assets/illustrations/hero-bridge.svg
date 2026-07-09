@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Standalone light-theme export. Generated from the theme-aware version in script.js — keep in sync. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 348" role="img" aria-label="A behavior request, mapped through the handbook to the implementation sites in code">
+<style>text{font-family:Inter,"Source Sans 3",system-ui,sans-serif}</style>
+  <!-- left: the behavior -->
+  <text x="135" y="86" font-size="11" font-weight="650" fill="#9a4a0b" text-anchor="middle" letter-spacing=".12em">THE BEHAVIOR YOU WANT</text>
+  <rect x="20" y="102" width="230" height="94" rx="10" fill="#f9efe3" stroke="color-mix(in srgb, #bd5f16 34%, #e6e2d8)"></rect>
+  <text x="135" y="141" font-size="14.5" fill="#4a463f" text-anchor="middle" font-style="italic">“Ask the user before</text>
+  <text x="135" y="163" font-size="14.5" fill="#4a463f" text-anchor="middle" font-style="italic">deleting files.”</text>
+  <text x="135" y="226" font-size="12.5" fill="#6f6a61" text-anchor="middle">Expressed in plain language</text>
+  <text x="135" y="244" font-size="12.5" fill="#6f6a61" text-anchor="middle">by the user.</text>
+
+  <!-- middle: the handbook -->
+  <text x="480" y="86" font-size="11" font-weight="650" fill="#1c5cab" text-anchor="middle" letter-spacing=".12em">THE HANDBOOK</text>
+  <rect x="365" y="102" width="230" height="206" rx="12" fill="none" stroke="color-mix(in srgb, #2a78d6 40%, #e6e2d8)" stroke-width="1.4"></rect>
+  
+        <rect x="379" y="116" width="202" height="52" rx="8" fill="#fdfcfa" stroke="#e6e2d8"></rect>
+        <rect x="391" y="129" width="26" height="26" rx="6" fill="#eaf1fb"></rect>
+        <text x="404" y="147" font-size="11.5" font-weight="650" fill="#1c5cab" text-anchor="middle">L1</text>
+        <text x="429" y="140" font-size="13" font-weight="600" fill="#201d18">System overview</text>
+        <text x="429" y="157" font-size="11.5" fill="#6f6a61">execution flow</text>
+        <path d="M475 172 l5 5 5 -5" fill="none" stroke="#8d887e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+        <rect x="379" y="180" width="202" height="52" rx="8" fill="#fdfcfa" stroke="#e6e2d8"></rect>
+        <rect x="391" y="193" width="26" height="26" rx="6" fill="#eaf1fb"></rect>
+        <text x="404" y="211" font-size="11.5" font-weight="650" fill="#1c5cab" text-anchor="middle">L2</text>
+        <text x="429" y="204" font-size="13" font-weight="600" fill="#201d18">Behavior-unit overview</text>
+        <text x="429" y="221" font-size="11.5" fill="#6f6a61">relevant behavior units</text>
+        <path d="M475 236 l5 5 5 -5" fill="none" stroke="#8d887e" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"></path>
+        <rect x="379" y="244" width="202" height="52" rx="8" fill="#fdfcfa" stroke="#e6e2d8"></rect>
+        <rect x="391" y="257" width="26" height="26" rx="6" fill="#eaf1fb"></rect>
+        <text x="404" y="275" font-size="11.5" font-weight="650" fill="#1c5cab" text-anchor="middle">L3</text>
+        <text x="429" y="268" font-size="13" font-weight="600" fill="#201d18">Behavior-unit detail</text>
+        <text x="429" y="285" font-size="11.5" fill="#6f6a61">implementation evidence</text>
+        
+
+  <!-- right: the code -->
+  <text x="820" y="86" font-size="11" font-weight="650" fill="#57534a" text-anchor="middle" letter-spacing=".12em">WHERE IT LIVES IN CODE</text>
+  
+        <g opacity="1">
+          <rect x="700" y="104" width="240" height="30" rx="6" fill="#fdfcfa" stroke="#e6e2d8"></rect>
+          <circle cx="716" cy="119" r="3.6" fill="#bd5f16"></circle>
+          <text x="728" y="123.5" font-size="12" fill="#4a463f" font-family="'IBM Plex Mono', ui-monospace, monospace">prompts/system.md</text>
+        </g>
+        <g opacity="1">
+          <rect x="700" y="141" width="240" height="30" rx="6" fill="#fdfcfa" stroke="#e6e2d8"></rect>
+          <circle cx="716" cy="156" r="3.6" fill="#bd5f16"></circle>
+          <text x="728" y="160.5" font-size="12" fill="#4a463f" font-family="'IBM Plex Mono', ui-monospace, monospace">tools/wrapper.py</text>
+        </g>
+        <g opacity="1">
+          <rect x="700" y="178" width="240" height="30" rx="6" fill="#fdfcfa" stroke="#e6e2d8"></rect>
+          <circle cx="716" cy="193" r="3.6" fill="#bd5f16"></circle>
+          <text x="728" y="197.5" font-size="12" fill="#4a463f" font-family="'IBM Plex Mono', ui-monospace, monospace">state/manager.py</text>
+        </g>
+        <g opacity="1">
+          <rect x="700" y="215" width="240" height="30" rx="6" fill="#fdfcfa" stroke="#e6e2d8"></rect>
+          <circle cx="716" cy="230" r="3.6" fill="#bd5f16"></circle>
+          <text x="728" y="234.5" font-size="12" fill="#4a463f" font-family="'IBM Plex Mono', ui-monospace, monospace">config/flags.py</text>
+        </g>
+        <g opacity="1">
+          <rect x="700" y="252" width="240" height="30" rx="6" fill="#fdfcfa" stroke="#e6e2d8"></rect>
+          <circle cx="716" cy="267" r="3.6" fill="#bd5f16"></circle>
+          <text x="728" y="271.5" font-size="12" fill="#4a463f" font-family="'IBM Plex Mono', ui-monospace, monospace">telemetry/events.py</text>
+        </g>
+        <g opacity="0.5">
+          <rect x="700" y="289" width="240" height="30" rx="6" fill="#fdfcfa" stroke="#e6e2d8"></rect>
+          
+          <text x="716" y="308.5" font-size="12" fill="#6f6a61" font-family="'IBM Plex Mono', ui-monospace, monospace">memory/store.py</text>
+        </g>
+  <text x="820" y="336" font-size="12.5" fill="#6f6a61" text-anchor="middle">five sites — found before editing begins</text>
+
+  <!-- connectors -->
+  <path d="M250 149 C 307.5 149, 307.5 205, 358 205" stroke="#bd5f16" stroke-width="1.5" fill="none" opacity="0.85"></path><polygon points="357,200.8 365,205 357,209.2" fill="#bd5f16" opacity="0.85"></polygon>
+  <path d="M600 212 C 650 212, 650 119, 693 119" stroke="#2a78d6" stroke-width="1.5" fill="none" opacity="0.5"></path><polygon points="692,114.8 700,119 692,123.2" fill="#2a78d6" opacity="0.5"></polygon><path d="M600 212 C 650 212, 650 156, 693 156" stroke="#2a78d6" stroke-width="1.5" fill="none" opacity="0.5"></path><polygon points="692,151.8 700,156 692,160.2" fill="#2a78d6" opacity="0.5"></polygon><path d="M600 212 C 650 212, 650 193, 693 193" stroke="#2a78d6" stroke-width="1.5" fill="none" opacity="0.5"></path><polygon points="692,188.8 700,193 692,197.2" fill="#2a78d6" opacity="0.5"></polygon><path d="M600 212 C 650 212, 650 230, 693 230" stroke="#2a78d6" stroke-width="1.5" fill="none" opacity="0.5"></path><polygon points="692,225.8 700,230 692,234.2" fill="#2a78d6" opacity="0.5"></polygon><path d="M600 212 C 650 212, 650 267, 693 267" stroke="#2a78d6" stroke-width="1.5" fill="none" opacity="0.5"></path><polygon points="692,262.8 700,267 692,271.2" fill="#2a78d6" opacity="0.5"></polygon>
+</svg>

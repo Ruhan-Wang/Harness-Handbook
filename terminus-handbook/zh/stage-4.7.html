@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-4.7 · 命令执行 → 观察 → 轨迹步骤</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=zh"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 手册</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=zh" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>返回主页</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>状态流寄存器</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>配置固化</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>环境搭建</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>运行起点</a></div><details class="s-node" open><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>迭代主循环</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>循环入口门控</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>主动摘要探测</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM 调用</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>响应解析</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>待交接提示 → 用户步骤(或切分)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>错误分支</a></div><div class="s-leaf"><a class="s-link cur" href="stage-4.7.html"><span class="s-num">4.7</span>命令执行 → 观察 → 轨迹步骤</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>完成门控与循环控制</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>解析器内部辅助</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>运行收尾</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>录制后处理(外部)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>上下文摘要</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token 与成本核算</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>输出长度限制</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>日志</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux 内部辅助</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">索引</a><span class="sep">›</span><a href="stage-4.html">迭代主循环</a></nav><div class="stage-head"><h1>命令执行 → 观察 → 轨迹步骤</h1><div class="meta"><span class="chip mono">stage-4.7</span><span class="chip">Command Execute → Observation → Trajectory Step</span><span class="chip">2 个函数</span></div></div><p>这个 Stage 在解决一个核心问题：把“Agent 刚刚说要做的事”真正送进终端，拿回结果，再整理成系统能继续推进的一步记录。它是主路径的落地点。前面 Stage 只是在判断“该走正常分支还是错误分支”，这里才真正产生一次可观察的行动结果，并把这次结果写进轨迹（trajectory，指整轮运行的步骤记录）里，供后面的完成判断和继续循环使用。</p>
+<h2 class="sec">主流程</h2>
+
+<ol><li>先把命令送进终端，拿回这次动作的真实反馈。 <p><code>_execute_commands()</code>（把一组按键发给会话）负责把解析好的命令逐条发给 <code>session</code>。这里的 <code>session</code> 可以理解为可远程控制的终端会话。 这一步为什么单独存在？因为 Agent 的回答本身不算完成工作，只有终端真的跑了，系统才有新的外部事实。 产出有两个：是否超时，以及终端输出。</p></li><li>再把终端输出整理成“观察”。 <p>这里的“观察”就是下一轮给 LLM 看的材料。不是所有原始输出都原样给。这个 Stage 会分三种情况：</p>
+<ul><li>如果已经进入“二次确认完成”状态，而且这次又说完成，那就把原始输出直接交出去，准备真的结束。</li><li>如果这是第一次声称任务完成，就<strong>先不立即结束</strong>，而是写入 <code>reg-pending-completion=True</code>，并生成一条“请再确认一次”的提示。</li><li>普通情况就走正常观察：把终端输出截短，必要时在前面加 warning。 </li></ul>
+<p>这里为什么要这样设计？因为“我做完了”是最容易误判的地方。两步确认能防止 Agent 因为一时乐观而过早退出。</p></li><li>同时把这一步整理成可追踪的工具调用记录。 <p>在非 raw 模式下，系统会把每条命令记成一个 <code>ToolCall</code>（工具调用记录，可以理解为“这一步调用了什么工具、带了什么参数”），函数名是 <code>bash_command</code>。 如果 Agent 这轮声称完成，还会额外记一个 <code>mark_task_complete</code>。 这样做的意义不是“为了好看”，而是为了让轨迹既能反映自然语言消息，也能反映系统实际做了哪些动作。后面排查问题、回放过程、做评估都靠这个。</p></li><li>把这一轮正式追加到轨迹里。 <p>这一步会把 Agent 消息、观察结果、工具调用、以及基于调用前快照算出的指标，一起写成一个 step。 为什么要在这里落盘前先成 step？因为系统需要一个统一的“事实单位”：一轮说了什么、做了什么、看到了什么，都得绑在一起，后续阶段才能据此判断是否继续。</p></li><li>立刻把轨迹写到磁盘。 <p><code>_dump_trajectory()</code>（把当前轨迹存成 JSON 文件）会在这一步后马上落盘。 这样做不是多余保险，而是抗中断设计：如果运行到一半崩了，至少已经完成的步骤不会丢。对长任务尤其重要。</p></li></ol>
+<ul><li>写: <a class="reg" href="registers.html#reg-pending-completion"><code>reg-pending-completion</code></a> — 当 Agent 第一次声称 <code>is_task_complete</code> 时写成 True，用来强制下一轮再确认一次，避免误报完成；普通情况会写成 False，表示没有挂起的完成确认</li><li>写: <a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — 在本 Stage 末尾追加一个新的 trajectory step，因为这一步已经有了“命令、输出、观察、记录”这一整套完整事实</li><li>读: <a class="reg" href="registers.html#reg-pending-completion"><code>reg-pending-completion</code></a> — 先取快照 <code>was_pending_completion</code>，判断当前这次“我完成了”到底是第一次声称，还是已经过了一轮确认、可以真的收尾</li><li>清: <a class="reg" href="registers.html#reg-pending-completion"><code>reg-pending-completion</code></a> — 在普通分支下写回 False，相当于把“等待确认完成”的状态撤掉，避免后续轮次误用旧状态</li><li>触发下游: <code>stage-4.10 Completion Gate + Loop Control</code> — 当本 Stage 已生成 observation 并写入 step 后进入；下游会根据这次是否完成、是否还在待确认状态来决定退出还是继续循环</li></ul>
+<h2 class="sec">与前后 Stage 的衔接</h2>
+<p>上游 <code>stage-4.8 Error Branch</code> 已经把异常路径分流掉了，所以来到这里时，系统拿到的是正常解析出的命令和当前 Agent 消息。这个 Stage 把它们变成“真实终端结果 + 观察 + 轨迹 step”，下游 <code>stage-4.10</code> 再根据这里写下的完成确认状态和最新 step，决定任务是真结束，还是继续下一轮。</p><div class="files-bar"><h2 class="sec">函数细节<span class="pill">2</span></h2><span class="spacer"></span><button class="tool" data-x="expand">全部展开</button><button class="tool" data-x="collapse">全部折叠</button></div><details class="file" id="fn-terminus2_run_agent_loop"><summary><span class="chev"></span><code class="fpath">Terminus2._run_agent_loop</code><a class="fn-range" href="../code/terminus_2.py.html#L1422-L1547" title="terminus_2.py:1422-1547">terminus_2.py:1422–1547 ↗</a></summary><div class="file-body"><p class="fn-sub">执行结果封装为观测与轨迹步</p>
+<blockquote><p><strong>stage 上下文</strong>: 该片段位于 <a href="stage-4.9.html">stage-4.9</a> 的主体后半段，承接前面已解析出的命令与完成信号，在命令执行后把终端输出整理成下一轮发送给模型的 observation。它同时把本轮代理消息、伪工具调用、观测结果与 token/cost 统计打包为一条 agent 轨迹步。作为本 stage 的首个已翻译单元，它对应“执行命令之后，形成可记录的单步试验事实”这一职责。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>本段先调用 <code>self._execute_commands(commands, self._session)</code> 取得 <code>terminal_output</code>，再依据 <code>is_task_complete</code>、<code>self._pending_completion</code> 与 <code>feedback</code> 生成发送回模型的 <code>observation</code>。随后它用 <code>chat</code> 当前累计值减去调用前基线，计算本步消耗，并把解析出的命令与任务完成声明转写为 <code>ToolCall</code> 记录；若开启 <code>self._save_raw_content_in_trajectory</code>，则只记录观测、不生成工具调用。最终产出不是返回值，而是对 <code>self._pending_completion</code>、可选的 <code>self._last_response_model_name</code> 的写入，以及向 <code>self._trajectory_steps</code> 追加一条 <code>Step</code>。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self) -&gt; None</code></p>
+<ul><li>参数: <code>commands</code>: <code>list[?]</code> — 本轮已解析出的命令序列；既传给 <code>_execute_commands(...)</code>，也决定是否生成 <code>bash_command</code> 型 <code>ToolCall</code>; <code>is_task_complete</code>: <code>bool</code> — 代理是否声称任务完成；控制完成确认分支、<code>self._pending_completion</code> 写入以及是否生成 <code>mark_task_complete</code> 调用; <code>feedback</code>: <code>?</code> — 上一轮反馈文本；仅当其真值成立且包含 <code>"WARNINGS:"</code> 时被前缀进 observation; <code>episode</code>: <code>?</code> — 用于构造 <code>tool_call_id</code>，如 <code>call_{episode}_{i+1}</code> 与 <code>call_{episode}_task_complete</code>; <code>message_content</code>: <code>?</code> — 写入轨迹 <code>Step.message</code> 的代理消息正文; <code>chat.total_cache_tokens</code>: <code>number</code> — 与 <code>tokens_before_cache</code> 做差，得到本步缓存命中 token 数; <code>chat.total_cost</code>: <code>number</code> — 与 <code>cost_before</code> 做差，得到本步成本; <code>chat.total_input_tokens</code>: <code>number</code> — 与 <code>tokens_before_input</code> 做差，得到本步 prompt token 数; <code>chat.total_output_tokens</code>: <code>number</code> — 与 <code>tokens_before_output</code> 做差，得到本步 completion token 数; <code>tokens_before_cache</code>: <code>number</code> — 本次 LLM 调用前的缓存 token 基线; <code>cost_before</code>: <code>number</code> — 本次 LLM 调用前的成本基线; <code>tokens_before_input</code>: <code>number</code> — 本次 LLM 调用前的输入 token 基线; <code>tokens_before_output</code>: <code>number</code> — 本次 LLM 调用前的输出 token 基线; <code>llm_response.model_name</code>: <code>str | None</code> — 若存在则更新 <code>self._last_response_model_name</code>，并优先写入 <code>Step.model_name</code>; <code>llm_response.reasoning_content</code>: <code>?</code> — 写入轨迹步的 <code>reasoning_content</code>; <code>llm_response.prompt_token_ids</code>: <code>?</code> — 写入 <code>Metrics.prompt_token_ids</code>; <code>llm_response.completion_token_ids</code>: <code>?</code> — 写入 <code>Metrics.completion_token_ids</code>; <code>llm_response.logprobs</code>: <code>?</code> — 写入 <code>Metrics.logprobs</code></li><li>读状态: <code>self._session</code>, <code>self._pending_completion</code>, <code>self._save_raw_content_in_trajectory</code>, <code>self._trajectory_steps</code>, <code>self._model_name</code></li><li>返回: 无返回值；对外可见产出是派生出的 <code>observation</code> / <code>tool_calls</code> / <code>metrics</code> 被封装进一条新 <code>Step</code> 追加到 <code>self._trajectory_steps</code>，并伴随对完成确认状态与最近模型名的状态写入。</li><li>副作用: 调用 <code>await self._execute_commands(commands, self._session)</code> 执行命令并取得终端输出; 把 <code>self._pending_completion</code> 维持原值、设为 <code>True</code> 或设为 <code>False</code>; 把当前 <code>self._pending_completion</code> 快照到局部变量 <code>was_pending_completion</code>（本片段内未再使用）; 当 <code>llm_response.model_name</code> 为真值时写入 <code>self._last_response_model_name</code>; 向 <code>self._trajectory_steps</code> 追加一条 <code>Step</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先以 <code>commands</code> 和 <code>self._session</code> 调用 <code>self._execute_commands(...)</code>，得到 <code>timeout_occurred, terminal_output</code>；随后立即把当前 <code>self._pending_completion</code> 复制到局部变量 <code>was_pending_completion</code>。</li><li>构造 observation：若 <code>is_task_complete</code> 为真且 <code>self._pending_completion</code> 已经为真，则直接使用原始 <code>terminal_output</code>；若 <code>is_task_complete</code> 为真但此前未 pending，则把 <code>self._pending_completion</code> 设为 <code>True</code>，并改用 <code>self._get_completion_confirmation_message(terminal_output)</code>；若 <code>is_task_complete</code> 为假，则把 <code>self._pending_completion</code> 设为 <code>False</code>，再根据 <code>feedback</code> 是否含 <code>"WARNINGS:"</code> 选择在 <code>self._limit_output_length(terminal_output)</code> 前附加警告前缀或仅保留截断后的输出。</li><li>从 <code>chat</code> 的累计计数减去 <code>tokens_before_cache</code>、<code>cost_before</code>，得到 <code>cache_tokens_used</code> 与 <code>step_cost</code>，供稍后写入 <code>Metrics</code>。</li><li>初始化 <code>tool_calls=None</code> 与空的 <code>observation_results</code>；若 <code>self._save_raw_content_in_trajectory</code> 为假，则在非 raw 模式下为每个 <code>commands</code> 元素生成一个 <code>function_name="bash_command"</code> 的 <code>ToolCall</code>，参数只保留 <code>cmd.keystrokes</code> 与 <code>cmd.duration_sec</code>。</li><li>继续在非 raw 模式下按精确分支追加 <code>ObservationResult(content=observation)</code>：有命令时，在所有命令型 <code>ToolCall</code> 创建完后追加一次；若 <code>is_task_complete</code> 为真，则额外追加一个 <code>mark_task_complete</code> 调用，并且仅在“没有命令”时补加 observation result；若 <code>is_task_complete</code> 为假且也没有命令，则仅追加 observation result。最后把 <code>tool_calls</code> 设为 <code>tool_calls_list or None</code>。</li><li>若 <code>self._save_raw_content_in_trajectory</code> 为真，则不生成任何 <code>ToolCall</code>，保持 <code>tool_calls</code> 为 <code>None</code>，但仍然无条件追加一个 <code>ObservationResult(content=observation)</code>。</li><li>构建并追加 <code>Step</code>：若 <code>llm_response.model_name</code> 存在则先更新 <code>self._last_response_model_name</code>，然后以当前轨迹长度生成 <code>step_id</code>，填入时间戳、<code>source="agent"</code>、模型名、<code>message_content</code>、<code>llm_response.reasoning_content</code>、前述 <code>tool_calls</code> 与 <code>Observation(results=observation_results)</code>，以及由 <code>chat</code> 基线差分得到的 <code>Metrics</code>；其中 <code>cached_tokens</code> 与 <code>cost_usd</code> 仅在差值大于 0 时写入，否则写 <code>None</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>            timeout_occurred, terminal_output = await self._execute_commands(
+                commands,
+                self._session,
+            )
+
+            # Capture the pending completion state before potentially modifying it
+            was_pending_completion = self._pending_completion
+
+            # Construct the observation (what gets sent back to the LLM)
+            if is_task_complete:
+                if self._pending_completion:
+                    observation = terminal_output
+                else:
+                    self._pending_completion = True
+                    observation = self._get_completion_confirmation_message(
+                        terminal_output
+                    )
+            else:
+                self._pending_completion = False
+                if feedback and "WARNINGS:" in feedback:
+                    observation = (
+                        f"Previous response had warnings:\n{feedback}\n\n"
+                        f"{self._limit_output_length(terminal_output)}"
+                    )
+                else:
+                    observation = self._limit_output_length(terminal_output)
+
+            # Record the step in trajectory
+            cache_tokens_used = chat.total_cache_tokens - tokens_before_cache
+            step_cost = chat.total_cost - cost_before
+
+            # Create tool_calls array from commands and task completion
+            # Note: Although Terminus 2 doesn't offer native tool calling (it uses text-based command parsing),
+            # we represent parsed commands as tool calls for better trajectory analysis and compatibility with tooling.
+            # However, when raw_content mode is enabled, we skip tool_calls generation to preserve the raw LLM response.
+            tool_calls: list[ToolCall] | None = None
+            observation_results: list[ObservationResult] = []
+
+            if not self._save_raw_content_in_trajectory:
+                # Only create tool_calls when NOT in raw_content mode
+                tool_calls_list: list[ToolCall] = []
+
+                if commands:
+                    for i, cmd in enumerate(commands):
+                        tool_call_id = f"call_{episode}_{i + 1}"
+                        tool_calls_list.append(
+                            ToolCall(
+                                tool_call_id=tool_call_id,
+                                function_name="bash_command",
+                                arguments={
+                                    "keystrokes": cmd.keystrokes,
+                                    "duration": cmd.duration_sec,
+                                },
+                            )
+                        )
+
+                    # Add observation result after all tool calls are created
+                    # Note: All commands share the same terminal output in this architecture,
+                    # so we omit source_call_id to indicate the observation applies to the entire step.
+                    observation_results.append(
+                        ObservationResult(
+                            content=observation,
+                        )
+                    )
+
+                # Add task_complete as a tool call if the agent marked the task complete
+                if is_task_complete:
+                    task_complete_call_id = f"call_{episode}_task_complete"
+                    tool_calls_list.append(
+                        ToolCall(
+                            tool_call_id=task_complete_call_id,
+                            function_name="mark_task_complete",
+                            arguments={},
+                        )
+                    )
+                    # If there are no commands, we still need to add an observation result
+                    if not commands:
+                        observation_results.append(
+                            ObservationResult(
+                                content=observation,
+                            )
+                        )
+                elif not commands:
+                    # No commands and no task completion, just the observation
+                    observation_results.append(
+                        ObservationResult(
+                            content=observation,
+                        )
+                    )
+
+                tool_calls = tool_calls_list or None
+            else:
+                # In raw_content mode, just add observation without tool_calls
+                observation_results.append(
+                    ObservationResult(
+                        content=observation,
+                    )
+                )
+
+            # Build the step object using Pydantic models
+            if llm_response.model_name:
+                self._last_response_model_name = llm_response.model_name
+            self._trajectory_steps.append(
+                Step(
+                    step_id=len(self._trajectory_steps) + 1,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    source="agent",
+                    model_name=llm_response.model_name or self._model_name,
+                    message=message_content,
+                    reasoning_content=llm_response.reasoning_content,
+                    tool_calls=tool_calls,
+                    observation=Observation(results=observation_results),
+                    metrics=Metrics(
+                        prompt_tokens=chat.total_input_tokens - tokens_before_input,
+                        completion_tokens=chat.total_output_tokens
+                        - tokens_before_output,
+                        cached_tokens=cache_tokens_used
+                        if cache_tokens_used &gt; 0
+                        else None,
+                        cost_usd=step_cost if step_cost &gt; 0 else None,
+                        prompt_token_ids=llm_response.prompt_token_ids,
+                        completion_token_ids=llm_response.completion_token_ids,
+                        logprobs=llm_response.logprobs,
+                    ),
+                )
+            )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>完成声明采用两段式确认：第一次遇到 <code>is_task_complete</code> 且 <code>self._pending_completion</code> 仍为假时，不直接把原始输出送回，而是切换到 <code>self._get_completion_confirmation_message(...)</code> 并把 pending 置真；只有再次进入完成分支且 pending 已真时，observation 才回落为原始 <code>terminal_output</code>。这体现出对“代理误报完成”的显式缓冲。</li><li>非完成路径会无条件把 <code>self._pending_completion</code> 设为 <code>False</code>，说明该确认状态不是粘性的；只要代理本轮没有再次声明完成，就立即清除先前的待确认状态。</li><li>轨迹层把文本解析出的命令重写为 <code>ToolCall(function_name="bash_command", arguments={...})</code>，但在 <code>self._save_raw_content_in_trajectory</code> 为真时完全跳过此转换，仅保留 <code>ObservationResult</code>。这一分支是显式的记录策略取舍：分析友好的结构化轨迹与原始响应保真不能同时兼得。</li><li><code>ObservationResult</code> 的追加位置不是统一出口，而是随 <code>commands</code> / <code>is_task_complete</code> 组合精细分支：代码刻意避免在有命令时为每条命令分别绑定输出，因为注释已说明该架构下所有命令共享同一份 <code>terminal_output</code>，因此 observation 只按“整步”记录一次。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2._run_agent_loop 的当前迭代主体（同一方法内前序代码）</li><li><strong>核心被调用</strong>: self._execute_commands; self._get_completion_confirmation_message; self._limit_output_length; ToolCall; ObservationResult; Observation; Metrics; Step</li><li><strong>配置/状态来源</strong>: self._pending_completion; self._save_raw_content_in_trajectory; self._trajectory_steps; self._model_name; self._session</li><li><strong>结果去向</strong>: self._pending_completion; self._last_response_model_name; self._trajectory_steps</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-pending-completion"><code>reg-pending-completion</code></a> — 读取当前完成确认状态以分支</li><li><a class="reg" href="registers.html#reg-pending-completion"><code>reg-pending-completion</code></a> — 首次完成置真，非完成路径置假</li><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — 读取长度以计算新 step_id</li><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — 追加一条 agent 轨迹步</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_execute_commands"><summary><span class="chev"></span><code class="fpath">Terminus2._execute_commands</code><a class="fn-range" href="../code/terminus_2.py.html#L1221-L1251" title="terminus_2.py:1221-1251">terminus_2.py:1221–1251 ↗</a></summary><div class="file-body"><p class="fn-sub">批量终端命令执行与超时收口</p>
+<blockquote><p><strong>stage 上下文</strong>: 它位于 <a href="stage-4.9.html">stage-4.9</a> 的命令执行子步骤，负责把前面已解析好的 <code>Command</code> 列表真正送入活动中的 <code>TmuxSession</code>。触发条件是 <code>_run_agent_loop</code> 已拿到模型响应并完成命令解析，准备进入“执行→观测”环节。与同 stage 的后续兄弟逻辑相比，这里只产出原始执行结果 <code>(timeout_occurred, terminal_output)</code>，不负责 <code>observation</code>、<code>ToolCall</code> 或轨迹写入；那些由 <code>_run_agent_loop</code> 在拿到本函数返回值后继续完成。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>本函数顺序执行 <code>commands</code> 中的每条终端命令，对每条命令调用 <code>session.send_keys(...)</code>，并把命令自带的 <code>duration_sec</code> 作为最小等待时长。若某条命令触发 <code>TimeoutError</code>，函数立即停止后续执行，返回 <code>True</code> 与一段格式化后的超时文本；该文本包含超时命令、等待秒数，以及经 <code>self._limit_output_length(...)</code> 截断的当前终端输出。若整批命令都未超时，则返回 <code>False</code> 和最后一次 <code>session.get_incremental_output()</code> 的截断结果。本函数不写入任何实例状态，真正的下游用途是供 <code>_run_agent_loop</code> 继续构造 observation 与轨迹步。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, commands: list[Command], session: TmuxSession) -&gt; tuple[bool, str]</code></p>
+<ul><li>参数: <code>commands</code>: <code>list[Command]</code> — 已从模型回复解析出的命令批次；每项提供 <code>keystrokes</code> 与 <code>duration_sec</code>; <code>session</code>: <code>TmuxSession</code> — 当前活动终端会话；负责发送按键并读取增量输出</li><li>读状态: <code>self._timeout_template</code>, <code>self._limit_output_length</code></li><li>返回: 返回 <code>(timeout_occurred, terminal_output)</code>：前者表示本批命令是否在执行中遇到 <code>TimeoutError</code>，后者是供上层直接当作执行观测基础的字符串；超时时为模板化消息，正常时为当前终端增量输出的截断版本。</li><li>副作用: 向 <code>session</code> 发送命令按键序列; 从 <code>session</code> 读取增量终端输出</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>按 <code>for command in commands</code> 的顺序遍历整批命令，逐条处理，不做并发调度或重排。</li><li>对每条命令调用 <code>await session.send_keys(command.keystrokes, block=False, min_timeout_sec=command.duration_sec)</code>，把命令文本和该命令声明的持续时间直接交给会话层执行。</li><li>如果某次 <code>send_keys(...)</code> 抛出 <code>TimeoutError</code>，立即进入 <code>except</code> 分支：先用 <code>await session.get_incremental_output()</code> 读取当前终端状态，再经 <code>self._limit_output_length(...)</code> 截断，并填入 <code>self._timeout_template.format(...)</code> 生成统一的超时反馈文本。</li><li>发生超时时立刻 <code>return True, &lt;formatted_message&gt;</code>，因此后续命令不会继续执行，本批次也不会再读取“正常结束”输出。</li><li>如果循环完整结束而没有超时，则在末尾调用一次 <code>await session.get_incremental_output()</code> 取得本批执行后的最新增量输出，并经 <code>self._limit_output_length(...)</code> 截断。</li><li>最后返回 <code>False, &lt;limited_output&gt;</code>，把“未超时”和终端输出一起交给上层 <code>_run_agent_loop</code> 继续做 observation 构造。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    async def _execute_commands(
+        self,
+        commands: list[Command],
+        session: TmuxSession,
+    ) -&gt; tuple[bool, str]:
+        """Execute a batch of commands in the terminal.
+
+        Args:
+            commands: List of commands to execute
+            session: TmuxSession instance
+
+        Returns:
+            Tuple of (timeout_occurred, terminal_output)
+        """
+        for command in commands:
+            try:
+                await session.send_keys(
+                    command.keystrokes,
+                    block=False,
+                    min_timeout_sec=command.duration_sec,
+                )
+            except TimeoutError:
+                return True, self._timeout_template.format(
+                    timeout_sec=command.duration_sec,
+                    command=command.keystrokes,
+                    terminal_state=self._limit_output_length(
+                        await session.get_incremental_output()
+                    ),
+                )
+
+        return False, self._limit_output_length(await session.get_incremental_output())</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>超时被转换为普通字符串返回，而不是继续向上抛异常：代码在 <code>except TimeoutError</code> 中直接生成模板化文本并返回 <code>(True, ...)</code>。这样上层循环可以把超时当作一种可消费的执行观测，而不是把整轮 agent 控制流打断。</li><li>一旦某条命令超时就停止整批执行：<code>except</code> 内的立即 <code>return</code> 明确选择“首个超时即收口”。这种取舍避免在终端已进入不确定状态时继续发送后续命令，降低连锁污染后续观察的风险。</li><li>无论超时还是正常结束，都统一经过 <code>self._limit_output_length(...)</code> 裁剪终端文本。该做法把输出长度控制前移到执行层，保证下游 <code>_run_agent_loop</code> 收到的是有界文本，避免超长终端内容直接扩散到 observation 与轨迹。</li><li>命令执行使用 <code>block=False</code>，但仍给出 <code>min_timeout_sec=command.duration_sec</code>：这里隐含的取舍是让会话层按“非阻塞发送 + 至少等待指定时长”的契约工作，从而由 <code>Command</code> 自身携带每条命令的观察窗口，而不是在本函数里自行实现睡眠或轮询逻辑。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2._run_agent_loop</li><li><strong>核心被调用</strong>: TmuxSession.send_keys; TmuxSession.get_incremental_output; self._limit_output_length; self._timeout_template.format</li><li><strong>配置/状态来源</strong>: commands[<em>].keystrokes; commands[</em>].duration_sec; self._timeout_template; session</li><li><strong>结果去向</strong>: 返回给 Terminus2._run_agent_loop 的 <code>timeout_occurred</code> 分支判断; 返回给 Terminus2._run_agent_loop 的 <code>terminal_output</code> 作为 observation 原料; <a href="stage-4.9.html">stage-4.9</a> 后续的完成确认/普通观测分支; 后续轨迹步记录中的终端观测文本</li><li><strong>同类 sibling</strong>: 与同 stage 的 <code>_run_agent_loop</code> 后半段形成前后衔接：本函数只负责拿到执行结果，兄弟逻辑再基于 <code>is_task_complete</code> 与 <code>self._pending_completion</code> 生成最终 observation、ToolCall 和 Step。</li></ul></div></details><nav class="pn"><a class="pn-prev" href="stage-4.6.html"><span>← 上一阶段</span><strong>错误分支</strong></a><a class="pn-next" href="stage-4.8.html"><span>下一阶段 →</span><strong>完成门控与循环控制</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

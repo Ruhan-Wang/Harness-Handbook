@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-4.6 · Error Branch</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=en"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=en" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>Home</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>State-flow registers</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>Configuration Crystallization</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>Environment Setup</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>Run Onset</a></div><details class="s-node" open><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>Iteration Loop</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>Loop Entry Gates</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>Proactive Summarize Probe</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM Query</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>Response Parse</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>Pending Handoff Prompt → User Step (or Split)</a></div><div class="s-leaf"><a class="s-link cur" href="stage-4.6.html"><span class="s-num">4.6</span>Error Branch</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>Command Execute → Observation → Trajectory Step</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>Completion Gate + Loop Control</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>Parser internal helpers</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>Run Teardown</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>Recording Post-process (External)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>Context Summarization</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token &amp; Cost Accounting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>Output Length Limiting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>Logging</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux internal helpers</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">Index</a><span class="sep">›</span><a href="stage-4.html">Iteration Loop</a></nav><div class="stage-head"><h1>Error Branch</h1><div class="meta"><span class="chip mono">stage-4.6</span><span class="chip">2 functions</span></div></div>
+<h2 class="sec">Opening Explanation</h2>
+<p>This stage exists to catch a bad LLM reply before the agent acts on it. Sometimes the model returns output that cannot be parsed into the expected shape, so the system does not have a safe command list, plan, or handoff to trust. Instead of guessing, Terminus 2 stops the normal action path and turns the parse failure into a repair prompt for the next LLM turn. That is the whole job here: detect “we could not understand your answer,” record that failed turn in the trajectory, and ask for a corrected reply. It sits between “we got an LLM response” and “go run commands,” because this is the last safe place to prevent malformed output from becoming real terminal actions.</p>
+<h2 class="sec">Main Flow</h2>
+
+<ol><li>The stage checks whether parser feedback says the last LLM answer was invalid. <p>In practice, it looks for an <code>"ERROR:"</code> signal in <code>feedback</code>. That means the model answered, but not in a form the agent can safely use.</p></li><li>If there was a parse error, the stage rebuilds <code>prompt</code> into a repair message. <p>The new prompt basically says: your previous response had formatting or parsing problems, here is the error, please try again. <code>_get_error_response_type()</code> (figures out the human-readable label for the expected response shape) is used so the retry message names the kind of answer the parser wanted. That gives the model a more precise correction target.</p></li><li>The stage still records this failed turn as part of the run history. <p>That matters because the agent should remember that the model did answer, even if the answer was unusable. The stored step uses the raw LLM text as the agent message, not a cleaned analysis or plan, because parsing never succeeded. It also attaches the repair prompt as an observation result, plus per-step metrics like token cache use and cost.</p></li><li>Then the stage stops this iteration early. <p>It does <strong>not</strong> run commands. It does <strong>not</strong> check for completion. It does <strong>not</strong> enter the normal loop tail. The only next move is: go back around and ask the LLM again with the error-repair prompt.</p></li><li>Why this design matters: it keeps malformed model output in the “conversation repair” lane instead of the “real-world action” lane. <p>Without this branch, the agent would either crash, lose the failure context, or worse, try to act on half-parsed output.</p></li></ol>
+<h2 class="sec"> State Flow</h2>
+<ul><li>writes: 无 — this stage is not associated with any explicit skeleton register in the provided input</li><li>reads: 无 — no explicit skeleton register is named for this stage in the provided input</li><li>clears: 无 — no explicit skeleton register is cleared here in the provided input</li><li>triggers downstream: <a href="stage-4.9.html">stage-4.9</a> Command Execute → Observation → Trajectory Step — <strong>not triggered</strong> when parser feedback contains <code>"ERROR:"</code>; this stage <code>continue</code>s and skips command execution for the iteration</li></ul>
+<h2 class="sec">Pipeline Hand-Off</h2>
+<p>Upstream, this stage receives an LLM reply plus parser feedback saying that reply could not be understood. It produces a retry prompt and a recorded error step, then sends the loop back to another LLM attempt instead of handing anything to command execution.</p><div class="files-bar"><h2 class="sec">Functions<span class="pill">2</span></h2><span class="spacer"></span><button class="tool" data-x="expand">Expand all</button><button class="tool" data-x="collapse">Collapse all</button></div><details class="file" id="fn-terminus2_run_agent_loop"><summary><span class="chev"></span><code class="fpath">Terminus2._run_agent_loop</code><a class="fn-range" href="../code/terminus_2.py.html#L1378-L1420" title="terminus_2.py:1378-1420">terminus_2.py:1378–1420 ↗</a></summary><div class="file-body"><p class="fn-sub">Parser-error repair prompt and trajectory logging</p>
+<blockquote><p><strong>Stage context</strong>: This region handles the <code>if feedback and "ERROR:" in feedback</code> branch inside <code>Terminus2._run_agent_loop</code>. It runs after an LLM response produced parser feedback, rebuilds <code>prompt</code> for a repair attempt, records the failed raw response as a <code>Step</code>, and ends this loop iteration with <code>continue</code>. This is the first translated region for this stage, so it stands alone here.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>When <code>feedback</code> contains <code>"ERROR:"</code>, this branch replaces the next-iteration <code>prompt</code> with a parser-repair message that embeds <code>feedback</code> and the label from <code>self._get_error_response_type()</code>. It computes per-step token and cost deltas from <code>chat.total_*</code> counters and the <code>tokens_before_*</code> / <code>cost_before</code> snapshots, then appends one agent <code>Step</code> to <code>self._trajectory_steps</code> using the raw <code>llm_response.content</code>, a corrective <code>ObservationResult(content=prompt)</code>, and <code>Metrics</code> built from the deltas and token/logprob fields on <code>llm_response</code>. It may also copy <code>llm_response.model_name</code> into <code>self._last_response_model_name</code>, and it returns no value because it exits this loop pass via <code>continue</code>.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self) -&gt; None</code></p>
+<ul><li>params: <code>self</code>: <code>Terminus2</code> — Owns loop state, model defaults, and trajectory storage; <code>feedback</code>: <code>?</code> — Parser feedback string tested for <code>"ERROR:"</code>; <code>chat</code>: <code>?</code> — Source of cumulative token and cost counters: <code>total_cache_tokens</code>, <code>total_cost</code>, <code>total_input_tokens</code>, <code>total_output_tokens</code>; <code>tokens_before_cache</code>: <code>?</code> — Earlier cache-token snapshot used to compute this step's delta; <code>cost_before</code>: <code>?</code> — Earlier cost snapshot used to compute this step's delta; <code>tokens_before_input</code>: <code>?</code> — Earlier prompt-token snapshot used to compute this step's delta; <code>tokens_before_output</code>: <code>?</code> — Earlier completion-token snapshot used to compute this step's delta; <code>llm_response</code>: <code>?</code> — Raw model response; supplies content, reasoning, model name, token ids, and logprobs</li><li>reads: <code>self._get_error_response_type</code>, <code>self._trajectory_steps</code>, <code>self._model_name</code></li><li>returns: None; the branch's product is a rewritten local <code>prompt</code>, an optional write to <code>self._last_response_model_name</code>, and one appended <code>Step</code> in <code>self._trajectory_steps</code>, then <code>continue</code> skips the rest of the current loop iteration.</li><li>effects: Writes local <code>prompt</code> to a parser-repair message; May write <code>self._last_response_model_name</code> when <code>llm_response.model_name</code> is truthy; Appends one <code>Step(...)</code> to <code>self._trajectory_steps</code>; Calls <code>datetime.now(timezone.utc).isoformat()</code> to stamp the recorded step; Ends the current loop iteration with <code>continue</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Check <code>feedback</code> and enter this branch only when it is truthy and contains <code>"ERROR:"</code>.</li><li>Rebuild local <code>prompt</code> from <code>feedback</code> plus <code>self._get_error_response_type()</code>, using the fixed text <code>"Previous response had parsing errors:"</code> and <code>"Please fix these issues and provide a proper ..."</code>.</li><li>Compute <code>cache_tokens_used = chat.total_cache_tokens - tokens_before_cache</code> and <code>step_cost = chat.total_cost - cost_before</code>.</li><li>If <code>llm_response.model_name</code> is truthy, copy it into <code>self._last_response_model_name</code>.</li><li>Append one <code>Step</code> to <code>self._trajectory_steps</code> with <code>step_id=len(self._trajectory_steps) + 1</code>, <code>timestamp=datetime.now(timezone.utc).isoformat()</code>, <code>source="agent"</code>, <code>model_name=llm_response.model_name or self._model_name</code>, <code>message=llm_response.content</code>, <code>reasoning_content=llm_response.reasoning_content</code>, and <code>observation.results=[ObservationResult(content=prompt)]</code>.</li><li>Build <code>Step.metrics</code> from counter deltas and response metadata: prompt/completion token deltas from <code>chat.total_input_tokens</code> and <code>chat.total_output_tokens</code>, <code>cached_tokens</code> only when <code>cache_tokens_used &gt; 0</code>, <code>cost_usd</code> only when <code>step_cost &gt; 0</code>, plus <code>llm_response.prompt_token_ids</code>, <code>completion_token_ids</code>, and <code>logprobs</code>.</li><li>Execute <code>continue</code> to skip the remainder of the current loop iteration.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>            if feedback and "ERROR:" in feedback:
+                prompt = (
+                    f"Previous response had parsing errors:\n{feedback}\n\n"
+                    f"Please fix these issues and provide a proper "
+                    f"{self._get_error_response_type()}."
+                )
+                # For error cases, we still want to record the step
+                # Use the raw response as the message since parsing failed
+                cache_tokens_used = chat.total_cache_tokens - tokens_before_cache
+                step_cost = chat.total_cost - cost_before
+
+                if llm_response.model_name:
+                    self._last_response_model_name = llm_response.model_name
+                self._trajectory_steps.append(
+                    Step(
+                        step_id=len(self._trajectory_steps) + 1,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        source="agent",
+                        model_name=llm_response.model_name or self._model_name,
+                        message=llm_response.content,
+                        reasoning_content=llm_response.reasoning_content,
+                        observation=Observation(
+                            results=[
+                                ObservationResult(
+                                    content=prompt,
+                                )
+                            ]
+                        ),
+                        metrics=Metrics(
+                            prompt_tokens=chat.total_input_tokens - tokens_before_input,
+                            completion_tokens=chat.total_output_tokens
+                            - tokens_before_output,
+                            cached_tokens=cache_tokens_used
+                            if cache_tokens_used &gt; 0
+                            else None,
+                            cost_usd=step_cost if step_cost &gt; 0 else None,
+                            prompt_token_ids=llm_response.prompt_token_ids,
+                            completion_token_ids=llm_response.completion_token_ids,
+                            logprobs=llm_response.logprobs,
+                        ),
+                    )
+                )
+                continue</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The recorded <code>Step.message</code> uses <code>llm_response.content</code> rather than any parsed structure. The nearby comment anchors this choice: parsing failed, so the branch preserves the raw model output in the trajectory.</li><li>The branch updates <code>self._last_response_model_name</code> only when <code>llm_response.model_name</code> is truthy, but the stored <code>Step.model_name</code> still falls back to <code>self._model_name</code>. That split avoids overwriting the remembered last-response model with an empty value while still guaranteeing a model name in the trajectory record.</li><li>The metrics writer suppresses non-positive <code>cached_tokens</code> and <code>cost_usd</code> by storing <code>None</code> unless the computed delta is greater than zero. This keeps the <code>Metrics</code> payload from claiming cache use or cost for a step when the counter difference is zero or negative.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Terminus2._run_agent_loop</li><li><strong>Core callees</strong>: self._get_error_response_type(); datetime.now(timezone.utc).isoformat(); Step(...); Observation(...); ObservationResult(...); Metrics(...)</li><li><strong>Config / state sources</strong>: <code>feedback</code> branch condition; <code>chat.total_cache_tokens</code>, <code>chat.total_cost</code>, <code>chat.total_input_tokens</code>, <code>chat.total_output_tokens</code>; <code>tokens_before_cache</code>, <code>cost_before</code>, <code>tokens_before_input</code>, <code>tokens_before_output</code>; <code>llm_response.model_name</code>, <code>llm_response.content</code>, <code>llm_response.reasoning_content</code>; <code>llm_response.prompt_token_ids</code>, <code>llm_response.completion_token_ids</code>, <code>llm_response.logprobs</code>; <code>self._model_name</code> fallback</li><li><strong>Results to</strong>: local <code>prompt</code>; <code>self._last_response_model_name</code>; <code>self._trajectory_steps</code>; current loop control via <code>continue</code></li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — append parser-error agent step with observation</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_get_error_response_type"><summary><span class="chev"></span><code class="fpath">Terminus2._get_error_response_type</code><a class="fn-range" href="../code/terminus_2.py.html#L472-L484" title="terminus_2.py:472-484">terminus_2.py:472–484 ↗</a></summary><div class="file-body"><p class="fn-sub">Parser-name to error-label mapper</p>
+<blockquote><p><strong>Stage context</strong>: This helper supplies the short response-type label used by the stage's parser-error path. Within the provided stage materials, the sibling entry for <code>Terminus2._run_agent_loop</code> states that the error branch calls <code>self._get_error_response_type()</code> while rebuilding the repair prompt after a parse failure.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>This function maps <code>self._parser_name</code> to the human-readable label used in error text. It returns <code>"JSON response"</code> for <code>"json"</code> and <code>"response"</code> for <code>"xml"</code>. It does not write any state. If <code>self._parser_name</code> matches neither branch, it raises <code>ValueError</code> whose message includes the unsupported parser name and instructs the caller to use <code>'json'</code> or <code>'xml'</code>.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self) -&gt; str</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — Instance providing <code>_parser_name</code></li><li>reads: <code>self._parser_name</code></li><li>returns: A short error-message label: <code>"JSON response"</code> when <code>self._parser_name == "json"</code>, or <code>"response"</code> when <code>self._parser_name == "xml"</code>; otherwise it raises <code>ValueError</code> with a message that embeds <code>self._parser_name</code> and says to use <code>'json'</code> or <code>'xml'</code>.</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Check <code>self._parser_name</code> against the first supported value, <code>"json"</code>, and return the literal label <code>"JSON response"</code> when it matches.</li><li>Otherwise check <code>self._parser_name</code> against the second supported value, <code>"xml"</code>, and return the literal label <code>"response"</code> when it matches.</li><li>If neither condition matches, take the <code>else</code> branch and raise <code>ValueError</code> with <code>f"Unknown parser_name: {self._parser_name}. Use 'json' or 'xml'."</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _get_error_response_type(self) -&gt; str:
+        """Return the response type name for error messages.
+
+        Examples: 'JSON response', 'response'
+        """
+        if self._parser_name == "json":
+            return "JSON response"
+        elif self._parser_name == "xml":
+            return "response"
+        else:
+            raise ValueError(
+                f"Unknown parser_name: {self._parser_name}. Use 'json' or 'xml'."
+            )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The mapping is explicit and closed: the code recognizes only two parser names, <code>"json"</code> and <code>"xml"</code>, instead of falling back to a default label for unknown values.</li><li>The XML branch returns the generic string <code>"response"</code> rather than a parser-specific label such as <code>"XML response"</code>; this wording is an observed code choice in the <code>elif self._parser_name == "xml"</code> branch.</li><li>The function fails fast on unsupported configuration. The <code>else</code> branch raises <code>ValueError</code> immediately, and its message both echoes the bad <code>self._parser_name</code> value and names the allowed values <code>'json'</code> and <code>'xml'</code>.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Terminus2._run_agent_loop</li><li><strong>Core callees</strong>: ValueError</li><li><strong>Config / state sources</strong>: self._parser_name</li><li><strong>Results to</strong>: Parser-error prompt text built in <code>Terminus2._run_agent_loop</code>; Exception path for unsupported parser configuration</li><li><strong>Related siblings</strong>: Terminus2._run_agent_loop: uses this label when the parser-error branch rebuilds the repair prompt</li></ul></div></details><nav class="pn"><a class="pn-prev" href="stage-4.5.html"><span>← Previous</span><strong>Pending Handoff Prompt → User Step (or Split)</strong></a><a class="pn-next" href="stage-4.7.html"><span>Next →</span><strong>Command Execute → Observation → Trajectory Step</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,631 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>side-S1 · 上下文摘要</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=zh"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 手册</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=zh" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>返回主页</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>状态流寄存器</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>配置固化</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>环境搭建</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>运行起点</a></div><details class="s-node"><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>迭代主循环</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>循环入口门控</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>主动摘要探测</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM 调用</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>响应解析</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>待交接提示 → 用户步骤(或切分)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>错误分支</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>命令执行 → 观察 → 轨迹步骤</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>完成门控与循环控制</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>解析器内部辅助</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>运行收尾</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>录制后处理(外部)</a></div><div class="s-leaf"><a class="s-link cur" href="side-S1.html"><span class="s-num">S1</span>上下文摘要</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token 与成本核算</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>输出长度限制</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>日志</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux 内部辅助</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">索引</a></nav><div class="stage-head"><h1>上下文摘要</h1><div class="meta"><span class="chip mono">side-S1</span><span class="chip">Context Summarization</span><span class="chip">7 个函数</span></div></div><p>这个 Stage 在解决<strong>上下文装不下</strong>的问题：当主 Agent（主执行体）聊天历史太长时，它把“已经发生了什么”压成一份可交接的短材料，让后面的回合还能继续稳定地问答。它本质上是一个<strong>上下文压缩 / 交接构造阶段</strong>。无论是提前发现 token（上下文容量单位）快不够，还是 LLM 调用时真的报超长，最后都会收束到同一条 <code>_summarize()</code> 路径。它不负责把交接内容塞回主对话；它只负责把交接包准备好。</p>
+<ol><li>先判断：是不是该“收历史”了。 <p>入口有两条，但目的相同。</p>
+<ul><li>一条是<strong>主动</strong>路径：剩余 token 太少时，提前触发。这样做是为了别等到真正报错才补救。 </li><li>一条是<strong>被动</strong>路径：<code>_query_llm</code> 里真的遇到 <code>ContextLengthExceededError</code>（上下文超长错误）后，先腾出一点空间，再立刻进入 <code>_summarize()</code>。腾空间属于异常恢复；<strong>总结交接</strong>才是这个 Stage 的核心工作。</li></ul></li><li><code>_summarize()</code>（把长历史压成可继续工作的交接材料）统一处理两条入口。 <p>这里为什么不只做一句短摘要？因为系统后面还要继续干活，不只是“知道个大概”。它需要一份能接棒的材料：做过什么、还卡在哪、现在到哪一步了。 所以这里不是单次总结，而是用三个 subagent（被主 Agent 调用的小 Agent）做一轮“总结 + 追问 + 补答”，尽量把交接信息补齐。</p></li><li>第一个 subagent 先写主摘要。 <p>它看已经保留下来的聊天历史，产出一份叙述：主要动作、关键信息、难点、当前状态。 这一步的意义是先把“故事主线”抽出来，不然后面只会拿到一堆零散对话。</p></li><li>第二个 subagent 专门挑缺口。 <p>它不继承前一个 subagent 的长历史，只看<strong>原始任务 + 刚写出的摘要 + 当前终端画面</strong>。 这样设计是为了站在“接手的人”视角提问：如果只拿到这份摘要，现在还缺哪些关键信息？ 它的作用不是生成答案，而是逼系统发现摘要遗漏。</p></li><li>第三个 subagent 回答这些问题。 <p>它重新看聊天历史，再结合前面那份摘要和问题，把缺的细节补上。 于是最后得到的不是一段模糊摘要，而是一份更像“交接说明”的 handoff prompt（交接提示词）。</p></li><li><code>_run_subagent()</code>（跑一个 subagent，并顺手记下它自己的过程）负责把这三个 subagent 统一跑起来。 <p>为什么要单独留痕？因为总结本身也是系统行为。以后看轨迹时，不能只看到“突然出现一份 handoff”，还要知道它是怎么来的。 所以每个 subagent 的过程都会通过 <code>_save_subagent_trajectory()</code>（把 subagent 轨迹单独存档）留下引用，供后面挂到主轨迹上。</p></li><li>最后，这个 Stage 会把主对话改写成一个更短的新起点，并把 handoff 单独交出去。 <p>这样做的工程原因很直接：如果只是把摘要继续附加到原来的长历史后面，token 压力很快又会回来；而把后续工作改为从“短起点 + 交接材料”继续，才能真正把上下文负担降下来，让后面的轮次更稳。</p></li></ol>
+<ul><li>写: <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — 在 <code>_summarize()</code> 完成三段式交接构造后写入；无论入口是 token 预警还是超长异常，都会落到这里，用来把这次压缩后的交接内容交给下游</li><li>写: <a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a> — 在三个 subagent 都跑完后写入；保存它们各自轨迹的引用，原因是后面需要把“这次总结是怎么做出来的”挂回主轨迹</li><li>写: <a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — 每次进入 <code>_summarize()</code> 并完成一次总结仪式时递增；用来记录本次运行里做过多少次上下文压缩</li><li>触发下游: <a href="stage-4.5.html">[stage-4.5</a>](<a href="stage-4.5.html">stage-4.5</a>.html) — 当本阶段已经产出 subagent 轨迹引用后，后续会去把这些引用记到主轨迹</li><li>触发下游: <a href="stage-4.6.html">[stage-4.6</a>](<a href="stage-4.6.html">stage-4.6</a>.html) — 当本阶段已经产出 handoff prompt 后，后续会决定怎样把这份交接内容接回主流程</li></ul>
+<p>上游真正给本 Stage 的，不是业务数据，而是一个信号：<strong>上下文空间紧张了</strong>，或者已经<strong>因为太长而报错</strong>。本 Stage 把这个信号变成两样可消费产物：一份 handoff prompt，以及一组 subagent 轨迹引用。再往后，<a href="stage-4.5.html">[stage-4.5</a>](<a href="stage-4.5.html">stage-4.5</a>.html) 负责挂轨迹，<a href="stage-4.6.html">[stage-4.6</a>](<a href="stage-4.6.html">stage-4.6</a>.html) 负责把 handoff 接回主对话。</p><div class="files-bar"><h2 class="sec">函数细节<span class="pill">7</span></h2><span class="spacer"></span><button class="tool" data-x="expand">全部展开</button><button class="tool" data-x="collapse">全部折叠</button></div><details class="file" id="fn-terminus2_summarize"><summary><span class="chev"></span><code class="fpath">Terminus2._summarize</code><a class="fn-range" href="../code/terminus_2.py.html#L740-L954" title="terminus_2.py:740-954">terminus_2.py:740–954 ↗</a></summary><div class="file-body"><p class="fn-sub">三子代理上下文压缩与交接构造器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数是 <a href="side-S1.html">side-S1</a>「Context Summarization」的核心执行体，负责把当前对话压缩成可交接给后续 agent 的 handoff prompt。它可由两条触发路径进入：<a href="stage-4.2.html">stage-4.2</a> 的主动总结检查，或 <a href="stage-4.3.html">stage-4.3</a> 在上下文超限后的回退流程。与同 stage 的其它兄弟逻辑相比，本函数真正执行三次 subagent 调用、重写 chat 历史，并产出后续 <a href="stage-4.5.html">stage-4.5</a> / 4.6 要消费的总结结果。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数读取 <code>chat.messages</code>、<code>original_instruction</code> 与当前 <code>session</code> 终端画面，串联执行“生成总结—提出缺口问题—基于更全上下文回答问题”三步子代理流程。若聊天历史为空，则直接返回原始任务与 <code>None</code>；否则递增 <code>self._summarization_count</code>，收集 3 个 <code>SubagentTrajectoryRef</code>，并把 <code>chat._messages</code> 改写为新的 3 条消息上下文。最终返回值是供后续主 agent 继续工作的 <code>handoff_prompt</code>，其正文来自第三个子代理给出的回答。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, chat: Chat, original_instruction: str, session: TmuxSession) -&gt; tuple[str, list[SubagentTrajectoryRef] | None]</code></p>
+<ul><li>参数: <code>chat</code>: <code>Chat</code> — 当前主对话对象；提供待压缩的 <code>messages</code>，并在结束时被原地替换为精简历史; <code>original_instruction</code>: <code>str</code> — 最初用户任务描述；用于三步子代理提示词与空历史时的直接返回; <code>session</code>: <code>TmuxSession</code> — 当前终端会话；用于捕获 <code>current_screen</code> 供提问子代理感知现状</li><li>读状态: <code>self._session_id</code>, <code>self._summarization_count</code>, <code>self._model_name</code></li><li>返回: 返回 <code>(handoff_prompt, subagent_trajectory_refs)</code>；若 <code>chat.messages</code> 为空，则返回 <code>(original_instruction, None)</code>。正常路径下，<code>handoff_prompt</code> 为第三个子代理回答问题后的交接提示，<code>subagent_trajectory_refs</code> 为三个子代理各自的轨迹引用。</li><li>副作用: 递增 <code>self._summarization_count</code>; 通过 <code>_run_subagent</code> 触发三次子代理执行，并间接写出各自 trajectory 文件; 调用 <code>session.capture_pane(capture_entire=False)</code> 读取当前 tmux 屏幕; 原地改写 <code>chat._messages</code> 为 <code>[system, question_prompt, model_questions]</code>; 调用 <code>chat.reset_response_chain()</code> 重置对话响应链</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先检查 <code>len(chat.messages)</code>；若当前聊天历史为空，则不做总结流程，直接返回 <code>original_instruction</code> 与 <code>None</code>。</li><li>进入正常路径后递增 <code>self._summarization_count</code>，计算 <code>steps_to_include = 1 + (len(chat.messages) - 1) // 2</code>，并用 <code>_prepare_copied_trajectory_steps(...)</code> 生成与当前保留下来的 <code>chat.messages</code> 对齐的复制轨迹步骤，供第一个总结子代理使用。</li><li>构造 <code>summary_prompt</code>，调用 <code>_run_subagent(...)</code> 执行“Summary Generation”；其输入消息历史就是当前已 unwind 后的 <code>chat.messages</code>，输出 <code>summary_response</code> 与对应 <code>summary_trajectory_ref</code>，后者被加入 <code>subagent_trajectory_refs</code>。</li><li>调用 <code>session.capture_pane(capture_entire=False)</code> 获取 <code>current_screen</code>，把原始任务、上一步总结文本和终端画面拼成 <code>question_prompt</code>，再以空 <code>message_history=[]</code> 调用 <code>_run_subagent(...)</code> 执行“Question Asking”，得到 <code>model_questions</code> 及第二个轨迹引用。</li><li>为第三个“Answer Providing”子代理重新准备复制轨迹步骤，并额外追加两条 <code>is_copied_context=True</code> 的 <code>Step</code>：一条表示 <code>summary_prompt</code>，一条表示 <code>summary_response</code>，使其轨迹显式包含总结调用本身；随后构造 <code>answers_message_history = chat.messages + [summary_prompt, summary_response]</code> 与 <code>answer_request_prompt</code>，调用 <code>_run_subagent(...)</code> 获取回答内容及第三个轨迹引用。</li><li>流程结束时，把 <code>chat._messages</code> 重写为原系统消息、<code>question_prompt</code>、<code>model_questions</code> 这三条消息，并执行 <code>chat.reset_response_chain()</code>；最后把第三个子代理的回答包装成 <code>handoff_prompt</code> 返回，同时返回三个 <code>SubagentTrajectoryRef</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    async def _summarize(
+        self, chat: Chat, original_instruction: str, session: TmuxSession
+    ) -&gt; tuple[str, list[SubagentTrajectoryRef] | None]:
+        """Create a summary of the agent's work to pass to a new agent instance.
+
+        This method implements a three-step context summarization process using separate
+        subagents to compress conversation history while preserving critical information:
+
+        **Step 1: Summary Generation (SUBAGENT 1)**
+        - Message history: Unwound chat.messages (limited context after token freeing)
+        - Prompt: Generate comprehensive summary of all work completed so far
+        - Response: summary_response.content (detailed narrative of progress)
+
+        **Step 2: Question Asking (SUBAGENT 2)**
+        - Message history: [] (fresh start, no conversation context)
+        - Prompt: Given the original task, summary from Step 1, and current terminal screen,
+        generate questions about information missing from the summary.
+        - Response: model_questions (list of clarifying questions)
+
+        **Step 3: Answer Providing (SUBAGENT 3)**
+        - Message history: chat.messages + [summary_prompt, summary_response] (extended context)
+        - Prompt: Given the questions from Step 2, answer the questions based on full conversation history.
+        - Response: answers_response.content (detailed answers)
+
+        **Final handoff:**
+        - Chat history replaced with: [system, question_prompt (which includes summary from step 1), model_questions]
+        - Result: Compressed context that preserves critical task-specific information, allowing
+        the main agent to continue working on the task without losing context.
+
+        **Why three steps?** This question-answer approach ensures the summarization doesn't
+        lose important details - the questions subagent identifies gaps, and the answers
+        subagent (with full context) fills them in.
+
+        Args:
+            chat: Chat object containing conversation history (may be unwound)
+            original_instruction: The original task instruction from user
+            session: TmuxSession for capturing current terminal state
+
+        Returns:
+            tuple: (handoff_prompt, subagent_trajectory_refs)
+                - handoff_prompt: The prompt to continue with (includes answers + instructions)
+                - subagent_trajectory_refs: List of 3 SubagentTrajectoryRef objects, or None if summarization failed
+        """
+        if len(chat.messages) == 0:
+            return original_instruction, None
+
+        # Increment summarization count
+        self._summarization_count += 1
+        subagent_trajectory_refs = []
+
+        # ===== SUBAGENT 1: Summary Generation =====
+        summary_session_id = (
+            f"{self._session_id}-summarization-{self._summarization_count}-summary"
+        )
+
+        # Trajectory needs to reflect what is sent to LLM: essentially the previous chat
+        # history, minus the messages that were removed to free up tokens.
+        # Calculate how many trajectory steps to include based on remaining chat messages:
+        # - Chat has: [system, agent1, user1, agent2, user2, ...]
+        # - Trajectory has: [step1_system, step2_agent, step3_agent, ...]
+        # - Formula: steps_to_include = 1 + (num_messages - 1) // 2
+        steps_to_include = 1 + (len(chat.messages) - 1) // 2
+        summary_steps, step_id_counter = self._prepare_copied_trajectory_steps(
+            steps_to_include
+        )
+
+        summary_prompt = f"""You are about to hand off your work to another AI agent.
+            Please provide a comprehensive summary of what you have
+            accomplished so far on this task:
+
+Original Task: {original_instruction}
+
+Based on the conversation history, please provide a detailed summary covering:
+1. **Major Actions Completed** - List each significant command you executed
+            and what you learned from it.
+2. **Important Information Learned** - A summary of crucial findings, file
+            locations, configurations, error messages, or system state discovered.
+3. **Challenging Problems Addressed** - Any significant issues you
+            encountered and how you resolved them.
+4. **Current Status** - Exactly where you are in the task completion process.
+
+
+Be comprehensive and detailed. The next agent needs to understand everything
+            that has happened so far in order to continue."""
+
+        summary_response, summary_trajectory_ref = await self._run_subagent(
+            prompt=summary_prompt,
+            message_history=chat.messages,
+            steps=summary_steps,
+            session_id=summary_session_id,
+            agent_name="terminus-2-summarization-summary",
+            filename_suffix="summary",
+            summary_text=f"Context summarization {self._summarization_count}: Step 1 - Summary generation",
+            subagent_name_for_logging="summary generation LLM call",
+        )
+        subagent_trajectory_refs.append(summary_trajectory_ref)
+
+        # ===== SUBAGENT 2: Question Asking =====
+        current_screen = await session.capture_pane(capture_entire=False)
+        questions_session_id = (
+            f"{self._session_id}-summarization-{self._summarization_count}-questions"
+        )
+        questions_steps = []
+
+        question_prompt = f"""You are picking up work from a previous AI agent on this task:
+
+**Original Task:** {original_instruction}
+
+**Summary from Previous Agent:**
+{summary_response.content}
+
+**Current Terminal Screen:**
+{current_screen}
+
+Please begin by asking several questions (at least five, more if necessary)
+about the current state of the solution that are not answered in the summary
+from the prior agent. After you ask these questions you will be on your own,
+so ask everything you need to know."""
+
+        questions_response, questions_trajectory_ref = await self._run_subagent(
+            prompt=question_prompt,
+            message_history=[],
+            steps=questions_steps,
+            session_id=questions_session_id,
+            agent_name="terminus-2-summarization-questions",
+            filename_suffix="questions",
+            summary_text=f"Context summarization {self._summarization_count}: Step 2 - Question asking",
+            subagent_name_for_logging="questions subagent",
+        )
+        model_questions = questions_response.content
+        subagent_trajectory_refs.append(questions_trajectory_ref)
+
+        # ===== SUBAGENT 3: Answer Providing =====
+        answers_session_id = (
+            f"{self._session_id}-summarization-{self._summarization_count}-answers"
+        )
+
+        # Reuse the actual trajectory steps (same as summary subagent)
+        # At this point, chat.messages has the same unwound history as in summary subagent
+        answers_steps, step_id_counter = self._prepare_copied_trajectory_steps(
+            steps_to_include
+        )
+
+        # Add the summary prompt and response steps that are part of the message history
+        # Mark these as copied context since they were already part of the summary subagent trajectory
+        answers_steps.append(
+            Step(
+                step_id=step_id_counter,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                source="user",
+                message=summary_prompt,
+                is_copied_context=True,
+            )
+        )
+        step_id_counter += 1
+
+        answers_steps.append(
+            Step(
+                step_id=step_id_counter,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                source="agent",
+                model_name=summary_response.model_name or self._model_name,
+                message=summary_response.content,
+                reasoning_content=summary_response.reasoning_content,
+                is_copied_context=True,
+                extra={
+                    "note": "Copied from summary subagent - metrics already recorded there"
+                },
+            )
+        )
+        step_id_counter += 1
+
+        answer_request_prompt = (
+            "The next agent has a few questions for you, please answer each of them one by one in detail:\n\n"
+            + model_questions
+        )
+
+        # The answer subagent should see: unwound chat history + summary prompt + summary response
+        answers_message_history = chat.messages + [
+            {"role": "user", "content": summary_prompt},
+            {"role": "assistant", "content": summary_response.content},
+        ]
+
+        answers_response, answers_trajectory_ref = await self._run_subagent(
+            prompt=answer_request_prompt,
+            message_history=answers_message_history,
+            steps=answers_steps,
+            session_id=answers_session_id,
+            agent_name="terminus-2-summarization-answers",
+            filename_suffix="answers",
+            summary_text=f"Context summarization {self._summarization_count}: Step 3 - Answer providing",
+            subagent_name_for_logging="answers subagent",
+        )
+        subagent_trajectory_refs.append(answers_trajectory_ref)
+
+        # Update chat history with the handoff context
+        # Note: We only include questions, not answers. The answers will be provided
+        # via the handoff_prompt to the next agent iteration.
+        chat._messages = [
+            chat.messages[0],
+            {"role": "user", "content": question_prompt},
+            {"role": "assistant", "content": model_questions},
+        ]
+        chat.reset_response_chain()
+
+        handoff_prompt = (
+            "Here are the answers the other agent provided.\n\n"
+            + answers_response.content
+            + "\n\n"
+            + "Continue working on this task from where the previous agent left off."
+            " You can no longer ask questions. Please follow the spec to interact with "
+            "the terminal."
+        )
+
+        return handoff_prompt, subagent_trajectory_refs</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>空历史分支选择直接返回 <code>(original_instruction, None)</code>，而不是强行运行总结子代理；这是对“无可压缩上下文”场景的显式短路，避免无意义的 LLM 开销，也避免制造空洞的 summary 结果。</li><li>第一个和第三个子代理都不直接复用完整主轨迹，而是通过 <code>steps_to_include</code> 与 <code>_prepare_copied_trajectory_steps(...)</code> 重建“与当前 <code>chat.messages</code> 一致”的复制轨迹；这是因为前置流程可能已 unwind 掉部分消息，若仍保留完整轨迹，会让子代理实际看到的上下文与保存下来的 trajectory 不一致。</li><li>第二个提问子代理刻意使用空 <code>message_history=[]</code>，只给它原任务、总结文本和当前终端屏幕，而不给完整对话；这样它的职责被限制为识别总结缺口，而不是从原始上下文里自行补全答案，否则“提问—补缺”这一步会失去诊断价值。</li><li>第三个回答子代理获得比第二个子代理更宽的上下文：不仅有 <code>chat.messages</code>，还额外附加 <code>summary_prompt</code> 与 <code>summary_response</code>；这体现了不对称设计——提问方负责发现遗漏，回答方负责利用更全材料补洞，从而降低总结遗漏造成的信息损失。</li><li>最终写回 <code>chat._messages</code> 时只保留问题链路，不把答案直接并入对话历史；答案被放入返回的 <code>handoff_prompt</code>。这将“后续主 agent 继续对话的最小上下文”和“本次交接补充说明”分离，既压缩主聊天窗口，又保留可在下一阶段注入的 handoff 内容。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2._check_proactive_summarization 触发主动总结时调用; Terminus2._query_llm 的 <code>ContextLengthExceededError</code> 回退路径调用; <a href="side-S1.html">side-S1</a> 的两条入口路径最终都汇入本函数; 需要在主 agent 继续前压缩上下文的内部控制流</li><li><strong>核心被调用</strong>: self._prepare_copied_trajectory_steps; self._run_subagent; session.capture_pane; chat.reset_response_chain; Step(...); datetime.now(timezone.utc).isoformat</li><li><strong>配置/状态来源</strong>: self._session_id：用于构造三个子代理的 <code>session_id</code>; self._summarization_count：用于编号本次总结并生成日志/会话标识; self._model_name：作为复制的 summary 响应步骤的兜底 <code>model_name</code>; chat.messages：作为当前可压缩上下文与步骤裁剪依据; original_instruction：作为三步提示词的共同任务锚点</li><li><strong>结果去向</strong>: 返回的 <code>handoff_prompt</code> 进入 <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a>，供 <a href="stage-4.6.html">stage-4.6</a> 消费; 返回的 <code>subagent_trajectory_refs</code> 进入 <a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a>，供 <a href="stage-4.5.html">stage-4.5</a> 记录; 递增后的 <code>self._summarization_count</code> 对应 <a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a>，最终在 <a href="stage-5.html">stage-5</a> surfaced 到 metadata; 被改写的 <code>chat._messages</code> 直接更新 live conversation history，对应 <a class="reg" href="registers.html#reg-chat-messages"><code>reg-chat-messages</code></a>; 三个 <code>_run_subagent</code> 调用各自产生的轨迹文件与子代理引用，后续并入 trial 轨迹体系</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — 正常总结路径先递增计数</li><li><a class="reg" href="registers.html#reg-chat-messages"><code>reg-chat-messages</code></a> — 结束时替换为三消息历史</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_prepare_copied_trajectory_steps"><summary><span class="chev"></span><code class="fpath">Terminus2._prepare_copied_trajectory_steps</code><a class="fn-range" href="../code/terminus_2.py.html#L1689-L1703" title="terminus_2.py:1689-1703">terminus_2.py:1689–1703 ↗</a></summary><div class="file-body"><p class="fn-sub">子代理轨迹前缀清洗准备器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数属于 <a href="side-S1.html">side-S1</a> 的支撑性准备逻辑，不直接执行总结三子代理，而是为它们提供可复用的主轨迹快照。它在 <code>_summarize</code> 组装子代理上下文时被调用，用主运行的部分 <code>self._trajectory_steps</code> 生成一份可安全转交的前缀历史。与兄弟函数 <code>_summarize</code> 相比，这里不改写聊天消息，也不写入 handoff 结果，只负责整理轨迹输入材料。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收 <code>steps_to_include</code>，从 <code>self._trajectory_steps</code> 取出对应前缀并生成深拷贝，随后对这份副本执行指标字段清洗。返回值是二元组：清洗后的 <code>copied_steps</code> 与基于其长度推得的 <code>next_step_id</code>。函数本身不修改实例状态，作用是为后续子代理轨迹续写提供一份干净且与主轨迹隔离的历史基线。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, steps_to_include: int) -&gt; tuple[list[Step], int]</code></p>
+<ul><li>参数: <code>steps_to_include</code>: <code>int</code> — 指定从主轨迹 <code>self._trajectory_steps</code> 前缀中纳入多少个步骤</li><li>读状态: <code>self._trajectory_steps</code></li><li>返回: 返回 <code>(copied_steps, next_step_id)</code>：前者是去除 metrics 后的轨迹副本列表，后者是该副本之后可继续分配的下一个步骤编号。</li><li>副作用: 无实例状态写入；仅对局部变量 <code>copied_steps</code> 调用清洗逻辑</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>按 <code>steps_to_include</code> 截取 <code>self._trajectory_steps</code> 的前缀，并用 <code>copy.deepcopy(...)</code> 生成独立副本 <code>copied_steps</code>。</li><li>将 <code>copied_steps</code> 传给 <code>self._remove_metrics_from_copied_steps(...)</code>，去掉副本中的 metrics 类字段，使其适合作为子代理历史。</li><li>以 <code>len(copied_steps) + 1</code> 计算 <code>next_step_id</code>，表示子代理若在这份副本后续写，其首个新步骤应使用的编号。</li><li>返回清洗后的 <code>copied_steps</code> 与 <code>next_step_id</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _prepare_copied_trajectory_steps(
+        self, steps_to_include: int
+    ) -&gt; tuple[list[Step], int]:
+        """Prepare trajectory steps for subagent by copying and removing metrics.
+
+        Args:
+            steps_to_include: Number of steps to include from main trajectory
+
+        Returns:
+            Tuple of (copied_steps, next_step_id)
+        """
+        copied_steps = copy.deepcopy(self._trajectory_steps[:steps_to_include])
+        self._remove_metrics_from_copied_steps(copied_steps)
+        next_step_id = len(copied_steps) + 1
+        return copied_steps, next_step_id</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>这里显式使用 <code>copy.deepcopy</code>，体现的取舍是“隔离后续编辑”优先于复制成本：子代理后续若追加或改写这份历史，不会反向污染主运行的 <code>self._trajectory_steps</code>。</li><li>函数在复用轨迹前先调用 <code>_remove_metrics_from_copied_steps</code>，说明被转交给子代理的历史刻意排除了计量噪声；若直接复用原始步骤，子代理上下文会混入与任务语义无关的成本/指标信息。</li><li><code>next_step_id</code> 不读取外部计数器，而是由 <code>len(copied_steps) + 1</code> 直接推导，保证编号与“实际纳入的副本长度”一致；即使只复制主轨迹前缀而非全部步骤，后续编号仍能局部自洽。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2._summarize（为总结相关子代理准备可复用轨迹前缀）</li><li><strong>核心被调用</strong>: copy.deepcopy; Terminus2._remove_metrics_from_copied_steps</li><li><strong>配置/状态来源</strong>: self._trajectory_steps（主运行当前累计的轨迹步骤）</li><li><strong>结果去向</strong>: _summarize 内部后续子代理上下文构造; 子代理轨迹续写时的初始 step 编号确定</li><li><strong>同类 sibling</strong>: Terminus2._summarize：后者负责执行三子代理总结流程并改写 <code>chat._messages</code>；本函数仅提供其中可传递的轨迹副本与编号基线。</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — 读取主轨迹前缀供子代理复用</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_remove_metrics_from_copied_steps"><summary><span class="chev"></span><code class="fpath">Terminus2._remove_metrics_from_copied_steps</code><a class="fn-range" href="../code/terminus_2.py.html#L1670-L1687" title="terminus_2.py:1670-1687">terminus_2.py:1670–1687 ↗</a></summary><div class="file-body"><p class="fn-sub">复制轨迹步的指标清洗器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 <a href="side-S1.html">side-S1</a> 相关代码中，但从源码本身可见，它只处理传入的 <code>steps</code> 列表内容，不读取 <code>self</code> 或 stage 级上下文状态。其职责是把这些 <code>Step</code> 统一标记为复制上下文，并在已有指标时删除指标、补写说明，以便后续消费者看到的是去重后的轨迹副本。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收 <code>list[Step]</code>，逐个遍历其中元素，并原地修改每个 <code>Step</code> 实例；列表本身不增删、不重排。对所有步骤都会写入 <code>step.is_copied_context = True</code>；仅当 <code>step.metrics</code> 为真值时，才会把 <code>step.metrics</code> 置为 <code>None</code>，并确保 <code>step.extra</code> 可写后写入说明文字。函数返回 <code>None</code>，真正产出是这些传入对象上的就地清洗结果。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(steps: list[Step]) -&gt; None</code></p>
+<ul><li>参数: <code>steps</code>: <code>list[Step]</code> — 要逐项遍历的轨迹步骤列表；函数只迭代该列表，但会原地修改其中每个 <code>Step</code> 对象</li><li>返回: 返回 <code>None</code>；实际结果是传入列表内各 <code>Step</code> 的字段被原地改写</li><li>副作用: 对每个 <code>Step</code> 写入 <code>step.is_copied_context = True</code>; 当 <code>step.metrics</code> 为真值时，将 <code>step.metrics</code> 清空为 <code>None</code>; 当 <code>step.metrics</code> 为真值且 <code>step.extra is None</code> 时，创建空字典并赋给 <code>step.extra</code>; 当 <code>step.metrics</code> 为真值时，写入并覆盖 <code>step.extra["note"]</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>遍历参数 <code>steps</code> 中的每个 <code>step</code>，不修改列表结构，只处理其中对象。</li><li>对每个 <code>step</code>，无条件设置 <code>step.is_copied_context = True</code>，把该步骤标记为复制来的上下文。</li><li>检查 <code>step.metrics</code> 是否为真值；只有进入该分支时，才执行指标清洗逻辑。</li><li>在指标分支内，将 <code>step.metrics</code> 直接置为 <code>None</code>，对应注释中的目的“避免 duplication”。</li><li>若此时 <code>step.extra is None</code>，先创建空字典赋回 <code>step.extra</code>，以保证后续可写入附加说明。</li><li>向 <code>step.extra["note"]</code> 写入固定说明字符串：<code>Metrics omitted to avoid duplication - already recorded in parent trajectory</code>；这一赋值是直接覆盖式的，即若原先已有 <code>note</code> 也会被替换。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _remove_metrics_from_copied_steps(steps: list[Step]) -&gt; None:
+        """Remove metrics from copied trajectory steps and mark as copied context.
+
+        Args:
+            steps: List of trajectory steps to modify in-place
+        """
+        for step in steps:
+            # Mark all copied steps with is_copied_context=True
+            step.is_copied_context = True
+
+            # Remove metrics to avoid duplication
+            if step.metrics:
+                step.metrics = None
+                if step.extra is None:
+                    step.extra = {}
+                step.extra["note"] = (
+                    "Metrics omitted to avoid duplication - already recorded in parent trajectory"
+                )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数把“复制上下文标记”做成无条件动作，而把“删除 metrics”做成条件动作：前者确保所有传入步骤都带有来源标识，后者只在确有 <code>step.metrics</code> 时触发，避免对本就无指标的步骤做额外说明写入。</li><li>清洗 metrics 后同时补写 <code>step.extra["note"]</code>，说明删除原因是“避免 duplication，且这些指标已记录在 parent trajectory”。这不是单纯丢弃数据，而是保留一个可追溯的人工说明，减少下游把 <code>metrics=None</code> 误解为缺失采集的风险。</li><li>对 <code>step.extra</code> 采用显式 <code>None</code> 检查并在需要时补空字典，是为了兼容 <code>extra</code> 尚未初始化的步骤对象；否则后续下标写入会失败。</li><li>指标分支内对 <code>step.extra["note"]</code> 采取无条件覆盖，而不是保留旧值或追加内容；该取舍让“为何移除 metrics”拥有统一且确定的最终表述，但代价是若原先已有 <code>note</code>，其内容会被覆盖。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未知（提供的源码片段未显示调用点）</li><li><strong>核心被调用</strong>: 无显式函数调用; 使用 <code>steps</code> 的迭代协议进行 <code>for step in steps</code> 遍历</li><li><strong>配置/状态来源</strong>: 无; 输入仅来自形参 <code>steps</code> 及各 <code>Step</code> 当前字段值（<code>metrics</code>、<code>extra</code>）</li><li><strong>结果去向</strong>: 返回值为 <code>None</code>; 结果留存在传入列表内各 <code>Step</code> 的 <code>is_copied_context</code>、<code>metrics</code>、<code>extra["note"]</code> 字段上</li><li><strong>同类 sibling</strong>: 与 <code>Terminus2._prepare_copied_trajectory_steps</code> 主题相邻：后者按其名称看负责准备复制步骤，本函数则专注于已传入步骤对象的原地清洗；但当前片段未直接展示两者调用关系。</li></ul></div></details><details class="file" id="fn-terminus2_run_subagent"><summary><span class="chev"></span><code class="fpath">Terminus2._run_subagent</code><a class="fn-range" href="../code/terminus_2.py.html#L661-L738" title="terminus_2.py:661-738">terminus_2.py:661–738 ↗</a></summary><div class="file-body"><p class="fn-sub">统一执行单个子代理轮次的助手</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 <a href="side-S1.html">side-S1</a> 的子代理执行层，负责把一次“子代理提示词 → LLM 响应 → 轨迹落盘”的重复流程封装为统一入口。它本身不决定何时总结，也不构造三段式总结流程；其职责是为上层提供一致的计时、指标、轨迹与返回值形态。与同 stage 的 <code>_prepare_copied_trajectory_steps</code>、<code>_remove_metrics_from_copied_steps</code> 相比，本函数是真正发起子代理 LLM 调用并产出子轨迹引用的执行单元。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收子代理提示词 <code>prompt</code>、上下文消息 <code>message_history</code>、可变轨迹列表 <code>steps</code> 以及一组命名/落盘参数，完整执行一次子代理 LLM 交互。它先把提示词作为新的 <code>Step</code> 追加到 <code>steps</code>，随后调用 <code>self._llm.call(...)</code> 获得 <code>response</code>，读取其中的 <code>response.usage</code> 同时用于子代理指标更新与后续轨迹保存。函数返回二元组 <code>(response, trajectory_ref)</code>；除返回值外，还会就地扩充 <code>steps</code>，并经辅助方法产生计时记录、子代理指标累积、rollout 明细收集与轨迹持久化等副作用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, prompt: str, message_history: list[dict], steps: list[Step], session_id: str, agent_name: str, filename_suffix: str, summary_text: str, subagent_name_for_logging: str = "subagent") -&gt; tuple[LLMResponse, SubagentTrajectoryRef]</code></p>
+<ul><li>参数: <code>prompt</code>: <code>str</code> — 要发送给子代理 LLM 的本轮提示词，同时被写入轨迹中的 user 步; <code>message_history</code>: <code>list[dict]</code> — 提供给 <code>self._llm.call(...)</code> 的历史消息上下文; <code>steps</code>: <code>list[Step]</code> — 子代理轨迹步骤列表；函数会原地追加 prompt 步与响应步; <code>session_id</code>: <code>str</code> — 传给 <code>_save_subagent_trajectory(...)</code> 的会话标识; <code>agent_name</code>: <code>str</code> — 传给 <code>_save_subagent_trajectory(...)</code> 的子代理名称; <code>filename_suffix</code>: <code>str</code> — 传给 <code>_save_subagent_trajectory(...)</code> 的轨迹文件名后缀; <code>summary_text</code>: <code>str</code> — 传给 <code>_save_subagent_trajectory(...)</code> 的人类可读摘要; <code>subagent_name_for_logging</code>: <code>str</code> — 传给 <code>_append_subagent_response_step(...)</code> 的日志用名称</li><li>读状态: <code>self._llm</code>, <code>self._llm_call_kwargs</code>, <code>datetime.now(timezone.utc)</code>, <code>time.time()</code>, <code>response.usage</code></li><li>返回: 返回 <code>(LLMResponse, SubagentTrajectoryRef)</code>：前者是本次 <code>self._llm.call(...)</code> 的原始响应对象，后者是 <code>_save_subagent_trajectory(...)</code> 返回的子代理轨迹引用。</li><li>副作用: 原地修改传入的 <code>steps</code>：先追加一个 <code>source="user"</code> 的 prompt 步，再通过 <code>_append_subagent_response_step(...)</code> 追加响应步; 通过 <code>_track_api_request_time(...)</code> 记录一次 API 请求耗时; 通过 <code>_update_subagent_metrics(response.usage)</code> 间接更新子代理指标累积; 通过 <code>_collect_subagent_rollout_detail(response)</code> 收集本次响应的 rollout 细节; 通过 <code>_save_subagent_trajectory(...)</code> 持久化子代理轨迹</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先以 <code>len(steps) + 1</code> 计算 <code>prompt_step_id</code>，并使用 <code>datetime.now(timezone.utc).isoformat()</code> 生成时间戳，向 <code>steps</code> 追加一个 <code>Step(step_id=..., source="user", message=prompt)</code>；随后把响应步编号预定为 <code>response_step_id = prompt_step_id + 1</code>。</li><li>调用前用 <code>time.time()</code> 记录 <code>start_time</code>，然后执行 <code>await self._llm.call(prompt=prompt, message_history=message_history, **self._llm_call_kwargs)</code> 获取 <code>response</code>。</li><li>LLM 调用返回后，立即把先前的 <code>start_time</code> 交给 <code>_track_api_request_time(start_time)</code>，把这次调用耗时纳入统一计时记录。</li><li>从响应对象提取 <code>usage_info = response.usage</code>；该值随后被一份多用：先传给 <code>_update_subagent_metrics(usage_info)</code> 更新子代理资源消耗统计。</li><li>再调用 <code>_append_subagent_response_step(steps, response_step_id, response, usage_info, subagent_name_for_logging)</code>，把模型响应及其 usage 信息写成新的轨迹步骤，继续原地扩充 <code>steps</code>。</li><li>随后调用 <code>_collect_subagent_rollout_detail(response)</code> 收集响应相关的 rollout 明细，再以关键字参数形式调用 <code>_save_subagent_trajectory(session_id=..., agent_name=..., steps=steps, usage_info=usage_info, filename_suffix=filename_suffix, summary_text=summary_text)</code> 持久化轨迹并取得 <code>trajectory_ref</code>。</li><li>最后返回 <code>(response, trajectory_ref)</code>，把本次子代理的原始响应对象与保存后的轨迹引用一并交还调用方。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    async def _run_subagent(
+        self,
+        prompt: str,
+        message_history: list[dict],
+        steps: list[Step],
+        session_id: str,
+        agent_name: str,
+        filename_suffix: str,
+        summary_text: str,
+        subagent_name_for_logging: str = "subagent",
+    ) -&gt; tuple[LLMResponse, SubagentTrajectoryRef]:
+        """Run a subagent and return its response and trajectory reference.
+
+        This helper encapsulates the common pattern of:
+        1. Appending the prompt step to the trajectory
+        2. Calling the LLM with the prompt and message history
+        3. Tracking API request time
+        4. Updating subagent metrics
+        5. Appending the response step to the trajectory
+        6. Collecting rollout details
+        7. Saving the subagent trajectory
+
+        Args:
+            prompt: The prompt to send to the LLM
+            message_history: The message history to provide context
+            steps: The trajectory steps (will be modified to include prompt and response steps)
+            session_id: Session ID for the subagent
+            agent_name: Name of the subagent (e.g., "terminus-2-summarization-summary")
+            filename_suffix: Suffix for trajectory filename (e.g., "summary", "questions", "answers")
+            summary_text: Human-readable summary for the trajectory ref
+            subagent_name_for_logging: Name used in logging messages
+
+        Returns:
+            tuple: (LLM response, SubagentTrajectoryRef)
+        """
+        # Append the prompt step
+        prompt_step_id = len(steps) + 1
+        steps.append(
+            Step(
+                step_id=prompt_step_id,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                source="user",
+                message=prompt,
+            )
+        )
+        response_step_id = prompt_step_id + 1
+
+        start_time = time.time()
+        response: LLMResponse = await self._llm.call(
+            prompt=prompt,
+            message_history=message_history,
+            **self._llm_call_kwargs,
+        )
+        self._track_api_request_time(start_time)
+
+        usage_info = response.usage
+        self._update_subagent_metrics(usage_info)
+
+        self._append_subagent_response_step(
+            steps,
+            response_step_id,
+            response,
+            usage_info,
+            subagent_name_for_logging,
+        )
+
+        self._collect_subagent_rollout_detail(response)
+
+        trajectory_ref = self._save_subagent_trajectory(
+            session_id=session_id,
+            agent_name=agent_name,
+            steps=steps,
+            usage_info=usage_info,
+            filename_suffix=filename_suffix,
+            summary_text=summary_text,
+        )
+
+        return response, trajectory_ref</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>该函数把“追加 prompt 步 → 发起 LLM 调用 → 记时/计量 → 追加响应步 → 保存轨迹”收束到单一辅助入口，目的是让不同子代理复用同一套会计与轨迹书写顺序；这在代码中体现为对 <code>_track_api_request_time</code>、<code>_update_subagent_metrics</code>、<code>_append_subagent_response_step</code>、<code>_collect_subagent_rollout_detail</code>、<code>_save_subagent_trajectory</code> 的固定串联调用。</li><li>提示词步骤是在 <code>self._llm.call(...)</code> 之前先追加到内存中的 <code>steps</code>，说明实现选择优先保留“尝试发问”的过程顺序；但本函数没有 <code>try/except</code>，且真正持久化发生在 <code>_save_subagent_trajectory(...)</code> 末尾，因此若 LLM 调用中途抛错，代码只保证 <code>steps</code> 已被就地修改，不保证这次尝试一定落盘。</li><li><code>usage_info = response.usage</code> 被显式提取为局部变量，并同时传给 <code>_update_subagent_metrics(...)</code> 与 <code>_save_subagent_trajectory(...)</code>，这是避免两处各自从 <code>response</code> 重新取值的写法，也使“统计口径”和“落盘口径”共享同一份 usage 数据源。</li><li>轨迹保存函数采用全关键字参数调用 <code>_save_subagent_trajectory(session_id=..., agent_name=..., ...)</code>，使会话标识、代理名、步骤集、usage、文件名后缀和摘要文本之间的对应关系在调用点上可直接辨认，降低多字符串参数并列时的位置误配风险。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2._summarize（该 stage 中负责串联多个子代理调用的上层函数）</li><li><strong>核心被调用</strong>: self._llm.call; self._track_api_request_time; self._update_subagent_metrics; self._append_subagent_response_step; self._collect_subagent_rollout_detail; self._save_subagent_trajectory; Step</li><li><strong>配置/状态来源</strong>: self._llm; self._llm_call_kwargs; datetime.now(timezone.utc); time.time()</li><li><strong>结果去向</strong>: 返回给调用方的 <code>LLMResponse</code>; 返回给调用方的 <code>SubagentTrajectoryRef</code>; 传入的 <code>steps</code> 列表被继续扩充后供后续保存与上层使用; 子代理轨迹持久化产物由 <code>_save_subagent_trajectory(...)</code> 产生; 子代理计时与指标累计经辅助方法写入实例级状态</li><li><strong>同类 sibling</strong>: Terminus2._summarize：上层负责编排多个子代理，本函数只负责单次子代理执行; Terminus2._prepare_copied_trajectory_steps：为子代理准备可安全续写的步骤副本，本函数消费这类 <code>steps</code> 并继续追加内容; Terminus2._remove_metrics_from_copied_steps：清洗复制来的历史指标，本函数随后为新响应重新记录 usage/指标</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-subagent-metrics"><code>reg-subagent-metrics</code></a> — 经 <code>_update_subagent_metrics</code> 间接累计 usage</li><li><a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — 经 <code>_track_api_request_time</code> 间接记录耗时</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_collect_subagent_rollout_detail"><summary><span class="chev"></span><code class="fpath">Terminus2._collect_subagent_rollout_detail</code><a class="fn-range" href="../code/terminus_2.py.html#L594-L616" title="terminus_2.py:594-616">terminus_2.py:594–616 ↗</a></summary><div class="file-body"><p class="fn-sub">子代理 rollout 明细归档器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 <a href="side-S1.html">side-S1</a> 的上下文总结子流程内部，不直接参与三步总结内容生成，而是为子代理 LLM 调用补充可选的 rollout 级观测数据。它由兄弟函数 <code>_run_subagent</code> 在拿到子代理 <code>response</code> 后调用，与 <code>_save_subagent_trajectory</code>、<code>_append_subagent_response_step</code> 一样属于总结流程的配套记账逻辑。相较于 <code>_summarize</code> 负责改写 <code>chat._messages</code> 和产出 handoff prompt，本函数只处理子代理响应中的调试/分析明细。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收一个子代理 <code>LLMResponse</code>，从中抽取 <code>prompt_token_ids</code>、<code>completion_token_ids</code>、<code>logprobs</code> 与 <code>extra</code> 这些可选 rollout 字段。若实例开关 <code>self._collect_rollout_details</code> 关闭，则立即返回；若开启，则把存在的字段规范化组装为一个 <code>RolloutDetail</code> 字典，并在字典非空时追加到 <code>self._subagent_rollout_details</code>。函数本身返回 <code>None</code>，真正产出是对已缓存子代理 rollout 明细列表的追加写入。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, response: LLMResponse) -&gt; None</code></p>
+<ul><li>参数: <code>response</code>: <code>LLMResponse</code> — 子代理一次 LLM 调用返回的响应对象，提供 token ids、logprobs 与 extra 元数据来源</li><li>读状态: <code>self._collect_rollout_details</code>, <code>self._subagent_rollout_details</code></li><li>返回: 返回 None；真正结果是在满足条件时向 <code>self._subagent_rollout_details</code> 追加一条 <code>RolloutDetail</code> 记录。</li><li>副作用: 当 <code>self._collect_rollout_details</code> 为真且响应中至少有一个相关字段时，写入 <code>self._subagent_rollout_details.append(rollout_detail)</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先检查实例开关 <code>self._collect_rollout_details</code>；若为假，直接返回，不做任何提取或写入。</li><li>初始化空的 <code>rollout_detail: RolloutDetail = {}</code>，作为本次子代理响应的待收集明细容器。</li><li>按字段顺序检查 <code>response.prompt_token_ids</code>、<code>response.completion_token_ids</code>、<code>response.logprobs</code>；每个字段只有在显式不是 <code>None</code> 时才写入 <code>rollout_detail</code>，且统一包成单元素列表。</li><li>若 <code>response.extra</code> 不是 <code>None</code>，则把其中每个 <code>key: value</code> 转换成 <code>key: [value]</code> 的形式后整体写入 <code>rollout_detail["extra"]</code>。</li><li>最后检查 <code>rollout_detail</code> 是否非空；只有至少收集到一个字段时，才将其追加到 <code>self._subagent_rollout_details</code>，否则静默结束。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _collect_subagent_rollout_detail(self, response: LLMResponse) -&gt; None:
+        """Collect rollout details from a subagent LLM response.
+
+        Args:
+            response: The LLM response containing token IDs and logprobs
+        """
+        if not self._collect_rollout_details:
+            return
+
+        rollout_detail: RolloutDetail = {}
+        if response.prompt_token_ids is not None:
+            rollout_detail["prompt_token_ids"] = [response.prompt_token_ids]
+        if response.completion_token_ids is not None:
+            rollout_detail["completion_token_ids"] = [response.completion_token_ids]
+        if response.logprobs is not None:
+            rollout_detail["logprobs"] = [response.logprobs]
+        if response.extra is not None:
+            rollout_detail["extra"] = {
+                key: [value] for key, value in response.extra.items()
+            }
+
+        if rollout_detail:
+            self._subagent_rollout_details.append(rollout_detail)</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数把总开关 <code>self._collect_rollout_details</code> 放在最前面短路返回，体现的是“默认不承担额外采集成本”的取舍；否则即便调用方总是传入 <code>response</code>，这里也会持续构造明细对象并占用存储。</li><li>各字段都使用 <code>is not None</code> 而不是一般真值判断，说明设计上要区分“字段为空/零值但有效”与“字段缺失”；这样不会误丢空列表、空结构等可能有意义的 rollout 数据。</li><li>无论是 <code>prompt_token_ids</code>、<code>completion_token_ids</code>、<code>logprobs</code>，还是 <code>extra</code> 的各个 value，都会被包成单元素列表，这一选择保留了 rollout-oriented 的统一模式，使子代理单次响应与其他可能的多样本/多步明细结构保持形状一致。</li><li>函数仅在 <code>rollout_detail</code> 非空时才追加到 <code>self._subagent_rollout_details</code>，避免写入无信息的空字典；这比无条件追加更利于后续消费方把列表长度理解为“确实采集到明细的响应次数”。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2._run_subagent</li><li><strong>核心被调用</strong>: list.append（用于 <code>self._subagent_rollout_details.append(...)</code>）; dict.items（遍历 <code>response.extra.items()</code> 生成规范化副本）</li><li><strong>配置/状态来源</strong>: self._collect_rollout_details（控制是否启用采集）; response.prompt_token_ids; response.completion_token_ids; response.logprobs; response.extra</li><li><strong>结果去向</strong>: self._subagent_rollout_details（缓存子代理 rollout 明细）; 后续与子代理轨迹/调试信息相关的消费路径; <a href="side-S1.html">side-S1</a> 子代理执行的附属记账结果; 与 <code>_run_subagent</code> 产出的其他副作用并列保存</li><li><strong>同类 sibling</strong>: Terminus2._run_subagent：负责发起子代理 LLM 调用并在收到 <code>response</code> 后调用本函数收集 rollout 明细。; Terminus2._summarize：负责 orchestrate 三个子代理，本函数只服务于其中每次 <code>_run_subagent</code> 的附属数据采集，不参与 handoff prompt 生成。</li></ul></div></details><details class="file" id="fn-terminus2_save_subagent_trajectory"><summary><span class="chev"></span><code class="fpath">Terminus2._save_subagent_trajectory</code><a class="fn-range" href="../code/terminus_2.py.html#L1757-L1822" title="terminus_2.py:1757-1822">terminus_2.py:1757–1822 ↗</a></summary><div class="file-body"><p class="fn-sub">子代理轨迹落盘与引用生成器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 summarization 侧流程的收尾位置，职责是把某个子代理已经形成的 <code>steps</code> 与用量信息封装成可持久化的 <code>Trajectory</code>。它不参与三步总结仪式本身的推理，只负责为该仪式产出一个独立轨迹文件与对应的 <code>SubagentTrajectoryRef</code>。相较同 stage 的 <code>_run_subagent</code>，这里聚焦的是落盘与引用构造，而不是发起 LLM 调用。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收子代理的 <code>session_id</code>、<code>agent_name</code>、<code>steps</code>、<code>usage_info</code>、文件名后缀和摘要文本，先从 <code>usage_info</code> 推导 token/cost 汇总，再据此构造一个 <code>Trajectory</code> 对象。随后它尝试把该轨迹写入 <code>self.logs_dir</code> 下的 summarization 专用 JSON 文件，并无论写入是否成功都返回一个 <code>SubagentTrajectoryRef</code>。可见副作用仅为文件写入与日志记录，不修改任何实例内寄存状态。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, session_id: str, agent_name: str, steps: list[Step], usage_info, filename_suffix: str, summary_text: str) -&gt; SubagentTrajectoryRef</code></p>
+<ul><li>参数: <code>session_id</code>: <code>str</code> — 写入子代理 <code>Trajectory.session_id</code>，并同步写入返回引用的 <code>session_id</code>; <code>agent_name</code>: <code>str</code> — 写入 <code>Agent.name</code>，标识当前保存的是哪个子代理轨迹; <code>steps</code>: <code>list[Step]</code> — 作为轨迹正文写入 <code>Trajectory.steps</code>; <code>usage_info</code>: <code>?</code> — 交给 <code>_extract_usage_metrics(...)</code> 推导 prompt/completion/cached/cost 汇总; <code>filename_suffix</code>: <code>str</code> — 参与生成轨迹文件名 <code>trajectory.summarization-{count}-{suffix}.json</code>，也用于日志文案; <code>summary_text</code>: <code>str</code> — 写入返回的 <code>SubagentTrajectoryRef.extra['summary']</code></li><li>读状态: <code>self._model_name</code>, <code>self._session_id</code>, <code>self._summarization_count</code>, <code>self.logs_dir</code>, <code>self.logger</code>, <code>self.version()</code>, <code>self._extract_usage_metrics</code></li><li>返回: 返回一个 <code>SubagentTrajectoryRef</code>：其中 <code>session_id</code> 取自入参，<code>trajectory_path</code> 为生成出的文件名，<code>extra.summary</code> 为入参 <code>summary_text</code>。另外，轨迹内的 <code>Agent.version</code> 来自 <code>self.version() or "unknown"</code>。</li><li>副作用: 尝试向 <code>self.logs_dir / f"trajectory.summarization-{self._summarization_count}-{filename_suffix}.json"</code> 写入 JSON 轨迹文件; 写入成功时调用 <code>self.logger.debug(...)</code> 记录保存位置; 写入失败时调用 <code>self.logger.error(...)</code> 记录异常</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先调用 <code>self._extract_usage_metrics(usage_info)</code>，把输入用量信息拆成 <code>total_prompt</code>、<code>total_completion</code>、<code>total_cached</code> 和 <code>total_cost</code> 四个汇总值。</li><li>基于这些汇总值与入参构造 <code>Trajectory</code>：其中 <code>Agent.name</code> 来自 <code>agent_name</code>，<code>Agent.version</code> 取 <code>self.version() or "unknown"</code>，<code>Agent.model_name</code> 取 <code>self._model_name</code>，<code>Agent.extra</code> 固定写入 <code>parent_session_id=self._session_id</code> 与 <code>summarization_index=self._summarization_count</code>。</li><li>同时构造 <code>FinalMetrics</code>：prompt/completion/cached token 直接填入；<code>total_cost_usd</code> 仅在 <code>total_cost &gt; 0</code> 时保留原值，否则显式写为 <code>None</code>。</li><li>根据 <code>self.logs_dir</code>、<code>self._summarization_count</code> 与 <code>filename_suffix</code> 生成目标路径 <code>trajectory.summarization-...json</code>，随后在 <code>try</code> 块中用 <code>open(..., "w")</code> 和 <code>format_trajectory_json(trajectory.to_json_dict())</code> 执行落盘。</li><li>若落盘成功，则通过 <code>self.logger.debug(...)</code> 记录“哪类子代理轨迹已保存到哪个路径”；若抛出异常，则在 <code>except</code> 中通过 <code>self.logger.error(...)</code> 记录失败原因。</li><li>最后无条件返回 <code>SubagentTrajectoryRef(session_id=session_id, trajectory_path=str(trajectory_path.name), extra={"summary": summary_text})</code>；返回值只引用目标文件名，不检查文件是否实际存在。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _save_subagent_trajectory(
+        self,
+        session_id: str,
+        agent_name: str,
+        steps: list[Step],
+        usage_info,
+        filename_suffix: str,
+        summary_text: str,
+    ) -&gt; SubagentTrajectoryRef:
+        """Save a subagent trajectory to disk and return its reference.
+
+        Args:
+            session_id: Session ID for the subagent
+            agent_name: Name of the subagent (e.g., "terminus-2-summarization-summary")
+            steps: List of trajectory steps
+            usage_info: Usage information from LLM response
+            filename_suffix: Suffix for trajectory filename (e.g., "summary", "questions", "answers")
+            summary_text: Human-readable summary for the trajectory ref extra field
+
+        Returns:
+            SubagentTrajectoryRef for inclusion in parent trajectory
+        """
+        total_prompt, total_completion, total_cached, total_cost = (
+            self._extract_usage_metrics(usage_info)
+        )
+
+        trajectory = Trajectory(
+            session_id=session_id,
+            agent=Agent(
+                name=agent_name,
+                version=self.version() or "unknown",
+                model_name=self._model_name,
+                extra={
+                    "parent_session_id": self._session_id,
+                    "summarization_index": self._summarization_count,
+                },
+            ),
+            steps=steps,
+            final_metrics=FinalMetrics(
+                total_prompt_tokens=total_prompt,
+                total_completion_tokens=total_completion,
+                total_cached_tokens=total_cached,
+                total_cost_usd=total_cost if total_cost &gt; 0 else None,
+            ),
+        )
+
+        trajectory_path = (
+            self.logs_dir
+            / f"trajectory.summarization-{self._summarization_count}-{filename_suffix}.json"
+        )
+        try:
+            with open(trajectory_path, "w") as f:
+                f.write(format_trajectory_json(trajectory.to_json_dict()))
+            self.logger.debug(
+                f"{filename_suffix.capitalize()} subagent trajectory saved to {trajectory_path}"
+            )
+        except Exception as save_error:
+            self.logger.error(
+                f"Failed to save {filename_suffix} subagent trajectory: {save_error}"
+            )
+
+        return SubagentTrajectoryRef(
+            session_id=session_id,
+            trajectory_path=str(trajectory_path.name),
+            extra={"summary": summary_text},
+        )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>选择在本函数内立即把 <code>usage_info</code> 归约为 <code>FinalMetrics</code>，而不是把原始用量对象直接塞进轨迹；这样保存产物只暴露统一的汇总字段，代价是更细粒度的原始结构不会被保留在该文件对象中。</li><li>选择把 <code>Agent.version</code> 写成 <code>self.version() or "unknown"</code>，即当 <code>self.version()</code> 返回假值时回落到字符串常量；这是代码中明确的容错分支，避免轨迹里出现空版本值。</li><li>选择把 <code>total_cost_usd</code> 在 <code>total_cost &lt;= 0</code> 时改写为 <code>None</code>，而不是原样写入 0 或负值；这是字段层面的显式规范化，代码只证明了这种值映射行为。</li><li>选择将文件写入包在 <code>try/except Exception</code> 中，并在失败后继续返回 <code>SubagentTrajectoryRef</code>；这一取舍说明“生成引用对象”与“写盘成功”被解耦，调用方不会因为保存失败而拿不到引用结构。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未在本函数源码中直接体现; 该方法作为实例私有辅助函数被外部同类方法调用，具体调用点不在此代码段内</li><li><strong>核心被调用</strong>: self._extract_usage_metrics; self.version; format_trajectory_json; trajectory.to_json_dict; open; self.logger.debug; self.logger.error</li><li><strong>配置/状态来源</strong>: self._model_name：填入 <code>Agent.model_name</code>; self._session_id：填入 <code>Agent.extra.parent_session_id</code>; self._summarization_count：填入 <code>Agent.extra.summarization_index</code> 并参与文件名构造; self.logs_dir：决定轨迹落盘目录; self.version()：决定 <code>Agent.version</code>，假值时回落到 <code>"unknown"</code></li><li><strong>结果去向</strong>: 返回给调用方的 <code>SubagentTrajectoryRef</code>; 写入 <code>self.logs_dir</code> 下的 summarization 轨迹 JSON 文件; 调试日志中的成功记录; 错误日志中的失败记录</li><li><strong>同类 sibling</strong>: Terminus2._run_subagent：后者负责拿到 <code>steps</code> 与 LLM 响应，本函数只负责把这些结果封装并落盘; Terminus2._prepare_copied_trajectory_steps：后者准备可复用的历史步骤，本函数消费现成 <code>steps</code> 生成独立轨迹文件; Terminus2._collect_subagent_rollout_detail：后者收集 rollout 明细，本函数收集并保存的是汇总后的轨迹与 final metrics</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — 读取计数写入文件名与Agent.extra.summarization_index</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_convert_chat_messages_to_steps"><summary><span class="chev"></span><code class="fpath">Terminus2._convert_chat_messages_to_steps</code><a class="fn-range" href="../code/terminus_2.py.html#L1824-L1882" title="terminus_2.py:1824-1882">terminus_2.py:1824–1882 ↗</a></summary><div class="file-body"><p class="fn-sub">聊天消息到轨迹步骤的转换器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该单元把 <code>chat_messages</code> 形式的消息列表改写为 <code>Step</code> 对象列表，属于一种表示层转换。源码本身未显式体现 stage 内触发条件；从函数体可见，它只依赖传入参数与少量模型名状态，独立完成转换并返回结果。它与同类轨迹处理函数的关系，在本片段中唯一可证的是：产物类型同为 <code>Step</code>。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收 <code>list[dict]</code> 形式的聊天消息，逐条读取必需键 <code>msg["role"]</code> 与 <code>msg["content"]</code>，构造新的 <code>Step</code> 列表并返回。遇到 <code>role == "assistant"</code> 时，会把步骤来源改写为 <code>"agent"</code>，并为该步骤补上 <code>model_name=self._last_response_model_name or self._model_name</code>；其他角色则直接沿用原 <code>role</code>，且不写入 <code>model_name</code>。若 <code>mark_as_copied</code> 为真，函数会把本轮生成的每个步骤都标记为 <code>is_copied_context=True</code>。最后仅在 <code>if additional_user_message:</code> 成立时，才额外追加一条新的 <code>user</code> 步骤，且该条不会经过 copied 标记逻辑。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, chat_messages: list[dict], additional_user_message: str | None = None, mark_as_copied: bool = False) -&gt; list[Step]</code></p>
+<ul><li>参数: <code>chat_messages</code>: <code>list[dict]</code> — 输入消息序列；每个元素都要可用 <code>msg["role"]</code> 与 <code>msg["content"]</code> 直接取值; <code>additional_user_message</code>: <code>str | None</code> — 可选附加用户消息；仅在 truthy 时追加为最后一条 <code>Step</code>; <code>mark_as_copied</code>: <code>bool</code> — 控制是否给循环中生成的每个步骤写入 <code>is_copied_context=True</code></li><li>读状态: <code>self._last_response_model_name</code>, <code>self._model_name</code></li><li>返回: 返回新构造的 <code>list[Step]</code>。列表包含对 <code>chat_messages</code> 的逐条转换结果，以及在 <code>if additional_user_message:</code> 为真时追加的一条最终 <code>user</code> 步骤。</li><li>副作用: 不修改 <code>self</code> 上的实例状态; 会修改本函数内部新建的 <code>Step</code> 对象字段，例如 <code>model_name</code> 与 <code>is_copied_context</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>初始化空列表 <code>steps = []</code> 与起始编号 <code>step_id = 1</code>。</li><li>遍历 <code>chat_messages</code>；对每个 <code>msg</code> 直接读取 <code>msg["role"]</code> 和 <code>msg["content"]</code>，代码中没有缺键容错分支。</li><li>若 <code>role == "assistant"</code>，则把 <code>source</code> 设为 <code>"agent"</code>，并创建带 <code>model_name=self._last_response_model_name or self._model_name</code> 的 <code>Step</code>；否则把 <code>source</code> 直接设为原 <code>role</code>，创建不含 <code>model_name</code> 参数的 <code>Step</code>。</li><li>若 <code>mark_as_copied</code> 为真，则对刚创建的该条 <code>Step</code> 写入 <code>step.is_copied_context = True</code>。</li><li>把该 <code>Step</code> 追加到 <code>steps</code>，并将 <code>step_id</code> 递增 1。</li><li>循环结束后，执行 <code>if additional_user_message:</code> 判断；条件成立时，再追加一条 <code>source="user"</code>、<code>message=additional_user_message</code> 的新 <code>Step</code>，其 <code>step_id</code> 使用当前值。</li><li>返回 <code>steps</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _convert_chat_messages_to_steps(
+        self,
+        chat_messages: list[dict],
+        additional_user_message: str | None = None,
+        mark_as_copied: bool = False,
+    ) -&gt; list[Step]:
+        """Convert chat messages to trajectory steps.
+
+        Args:
+            chat_messages: List of chat messages with 'role' and 'content' fields
+            additional_user_message: Optional additional user message to append as final step
+            mark_as_copied: If True, mark all steps with is_copied_context=True (for continuation trajectories)
+
+        Returns:
+            List of Step objects representing the chat history
+        """
+        steps = []
+        step_id = 1
+
+        for msg in chat_messages:
+            role = msg["role"]
+            content = msg["content"]
+
+            # Map chat role to trajectory source
+            if role == "assistant":
+                source = "agent"
+                step = Step(
+                    step_id=step_id,
+                    source=source,
+                    message=content,
+                    model_name=self._last_response_model_name or self._model_name,
+                )
+            else:
+                source = role
+                step = Step(
+                    step_id=step_id,
+                    source=source,
+                    message=content,
+                )
+
+            # Mark as copied context if this is for a continuation trajectory
+            if mark_as_copied:
+                step.is_copied_context = True
+
+            steps.append(step)
+            step_id += 1
+
+        # Add the additional user message if provided
+        # Note: The additional user message is NOT marked as copied since it's the new handoff prompt
+        if additional_user_message:
+            steps.append(
+                Step(
+                    step_id=step_id,
+                    source="user",
+                    message=additional_user_message,
+                )
+            )
+
+        return steps</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数显式把聊天角色 <code>"assistant"</code> 重映射为轨迹来源 <code>"agent"</code>，说明聊天协议中的角色命名与 <code>Step.source</code> 的目标命名并不完全相同；代码只对这一种角色做特殊处理，其他角色保持原值。</li><li>assistant 分支使用 <code>self._last_response_model_name or self._model_name</code> 作为模型名回退链，体现出“优先使用最近一次响应模型名，缺失时退回默认模型名”的选择；这避免了 assistant 步骤在前者为空时没有 <code>model_name</code>。</li><li>只有 assistant 派生的 <code>Step</code> 会写入 <code>model_name</code>，而非 assistant 步骤不会补该字段；这是构造参数层面的刻意区分，而不是统一赋默认值。</li><li>copied 标记只作用于循环中由 <code>chat_messages</code> 转换出的步骤；内联注释明确说明，额外追加的用户消息即使存在也不标记为 copied。</li><li>附加用户步骤采用 <code>if additional_user_message:</code> 的 truthy 判断，而不是显式检查 <code>is not None</code>；因此空字符串等假值不会被追加，这是一种比类型注解更收紧的实际行为。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 源码片段未展示直接调用方；本函数被定义为 <code>Terminus2</code> 的实例方法</li><li><strong>核心被调用</strong>: Step(...) 构造函数</li><li><strong>配置/状态来源</strong>: self._last_response_model_name; self._model_name; 参数 <code>chat_messages</code>; 参数 <code>additional_user_message</code>; 参数 <code>mark_as_copied</code></li><li><strong>结果去向</strong>: 返回给调用者的 <code>list[Step]</code>; 列表中每个元素都是新建的 <code>Step</code> 实例</li></ul></div></details><nav class="pn"><a class="pn-prev" href="stage-6.html"><span>← 上一阶段</span><strong>录制后处理(外部)</strong></a><a class="pn-next" href="crosscut-X1.html"><span>下一阶段 →</span><strong>Token 与成本核算</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

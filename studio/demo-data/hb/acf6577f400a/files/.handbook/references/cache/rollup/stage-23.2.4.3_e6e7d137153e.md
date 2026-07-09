@@ -1,0 +1,7 @@
+This stage sits on the outbound edge of the runtime, between conversation state and the provider API. Its job is to decide exactly which model Codex should call and to assemble the precise request that model sees: instructions, context, tools, schemas, permissions, and layout.
+
+Several suites verify prompt composition itself. additional_context, prompt_debug_tests, model_visible_layout, prompt_caching, and token_budget check how extra context is injected, rendered across turns and resumes, compacted, annotated, and reused for cache-stable prefixes. agents_md, hierarchical_agents, skills, collaboration_instructions, permissions_messages, and personality cover instruction sources layered into the prompt: repository and hierarchical AGENTS.md files, local skills, collaboration-mode guidance, permission-profile messaging, and personality-specific developer updates, including remote metadata templates.
+
+Provider-shaping tests ensure outbound payloads match API expectations. json_result validates JSON-schema forwarding and response parsing, while web_search checks translation of configuration into tool entries.
+
+The runtime model-selection side is covered by remote_models, model_runtime_selectors, auto_review, and model_switching. Together they verify remote catalog merging, selector overrides, special review-model routing, and safe rewriting of history and request fields when models or service tiers change.

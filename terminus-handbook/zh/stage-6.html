@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-6 · 录制后处理(外部)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=zh"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 手册</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=zh" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>返回主页</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>状态流寄存器</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>配置固化</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>环境搭建</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>运行起点</a></div><details class="s-node"><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>迭代主循环</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>循环入口门控</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>主动摘要探测</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM 调用</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>响应解析</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>待交接提示 → 用户步骤(或切分)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>错误分支</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>命令执行 → 观察 → 轨迹步骤</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>完成门控与循环控制</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>解析器内部辅助</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>运行收尾</a></div><div class="s-leaf"><a class="s-link cur" href="stage-6.html"><span class="s-num">6</span>录制后处理(外部)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>上下文摘要</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token 与成本核算</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>输出长度限制</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>日志</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux 内部辅助</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">索引</a></nav><div class="stage-head"><h1>录制后处理(外部)</h1><div class="meta"><span class="chip mono">stage-6</span><span class="chip">Recording Post-process (External)</span><span class="chip">7 个函数</span></div></div><p>这个 Stage 在解决什么问题？它负责把运行过程中记下来的 asciinema marker（录屏里的时间标签）真正写回 <code>.cast</code> 录屏文件里，让回放不只是“有画面”，还“有关键节点”。之所以单独放在这里，是因为录屏文件要等 tmux（可远程控制的终端）会话结束后才算完整，才能安全地做合并。所以它不是 Agent <code>run()</code> 内的一段，而是框架在收尾时做的外部后处理。</p>
+<h2 class="sec">主流程</h2>
+
+<ol><li>先看这次运行有没有留下 marker <p>这些 marker 不是这里产生的，而是前面运行时陆续记进 <a class="reg" href="registers.html#reg-asciinema-markers"><code>reg-asciinema-markers</code></a>。如果一个都没有，这个 Stage 基本就没有事做；录屏文件保持原样即可。</p></li><li>等录屏真正结束，再做合并 <p>触发点是 <code>TmuxSession.stop()</code>（关闭 tmux 会话并收尾），不是 Agent 主循环。这样设计是因为 asciinema 的 <code>.cast</code> 文件在录制中还在持续追加，太早改，文件可能还没写完。</p></li><li>按时间把 marker 插进录屏流里 <p><code>AsciinemaHandler.merge_markers()</code>（把内存里的 marker 合并进 <code>.cast</code> 文件）会保留原文件头，然后一行一行看录屏帧。核心规则很简单：<strong>当 marker 时间 <code>&lt;=</code> 当前帧时间时，先把这些 marker 写出去，再写这一帧</strong>。 这样做的意义是：回放时，标签会出现在它应该出现的位置之前，不会晚于对应画面。</p></li><li>处理两种边角情况 <ul><li>如果某些 marker 的时间比所有录屏帧都晚，就在最后统一补上。这个收尾由 <code>_write_remaining_markers()</code>（把还没写出的 marker 追加到末尾）负责。 </li><li>如果录屏里几乎没帧，或者文件很短，marker 也不会丢；它们仍然会在末尾被写出。</li></ul></li><li>产出一个“带标签的最终录屏” <p>这一步不改变 Agent 的决策，不回流给 LLM。它的价值主要在外部：给人看回放、做调试、对齐运行中的关键事件。 也正因为如此，它适合做“事后合并”，而不是在运行中实时往录屏里插事件——后者更容易和录制过程互相干扰，也更难保证文件顺序正确。</p></li></ol>
+<h2 class="sec"> 状态流动</h2>
+<ul><li>读: <a class="reg" href="registers.html#reg-asciinema-markers"><code>reg-asciinema-markers</code></a> — 在 tmux 会话停止、录屏文件已完整后读取；按时间顺序把运行中积累的 marker 合并进 <code>.cast</code></li><li>清: <a class="reg" href="registers.html#reg-asciinema-markers"><code>reg-asciinema-markers</code></a> — 本 Stage 不负责清；它只消费这些 marker，用于生成外部录屏文件</li></ul>
+<h2 class="sec">与前后 Stage 的衔接</h2>
+<p>上游真正交给它的不是 <a href="stage-5.html">stage-5</a>，而是更早的 <a href="stage-4.7.html">stage-4.7</a>：那里把运行中的关键时间点写进 <a class="reg" href="registers.html#reg-asciinema-markers"><code>reg-asciinema-markers</code></a>。本 Stage 在 Agent 结束之后、框架关闭 tmux 会话时读取这些标记，产出最终的带 marker 的 <code>.cast</code> 文件；它本质上是一次终态后处理，没有明确的 Agent 内部下游。</p><div class="files-bar"><h2 class="sec">函数细节<span class="pill">7</span></h2><span class="spacer"></span><button class="tool" data-x="expand">全部展开</button><button class="tool" data-x="collapse">全部折叠</button></div><details class="file" id="fn-tmuxsession_stop"><summary><span class="chev"></span><code class="fpath">TmuxSession.stop</code><a class="fn-range" href="../code/tmux_session.py.html#L496-L508" title="tmux_session.py:496-508">tmux_session.py:496–508 ↗</a></summary><div class="file-body"><p class="fn-sub">会话收尾时的录屏标记合并关口</p>
+<blockquote><p><strong>stage 上下文</strong>: 该片段位于 <a href="stage-6.html">stage-6</a>，是录屏后处理真正落地的入口分支：在 Harbor 框架调用 <code>TmuxSession.stop()</code> 之后，决定是否把运行期积累的 marker 写回 <code>.cast</code> 录屏文件。它本身不负责生成 marker，只消费先前阶段累积在 <code>self._markers</code> 中的数据，并把实际合并工作委托给 <code>AsciinemaHandler.merge_markers()</code>。由于这是本 stage 的首个已翻译单元，它承担了“是否进入后处理”的门控角色。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>这段代码检查 <code>self._markers</code> 与 <code>self._local_asciinema_recording_path</code> 是否同时存在；若两者齐备，就把已积累的标记合并进本地 asciinema 录屏文件。输入来自会话对象保存的 marker 列表和本地录屏路径，输出去向是该 <code>.cast</code> 文件本身，主要副作用是触发一次外部文件改写并记录调试日志。若任一条件不满足，则明确跳过合并，仅写出“无需合并”的调试信息。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self) -&gt; None</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — TmuxSession 实例；提供 marker 累积状态、录屏文件路径与日志器</li><li>读状态: <code>self._markers</code>, <code>self._local_asciinema_recording_path</code>, <code>self._logger</code></li><li>返回: 返回 None；真正产出是按条件将 marker 合并进本地 asciinema 录屏文件，或记录一次跳过合并的调试日志。</li><li>副作用: 调用 self._logger.debug(...) 记录合并前后或跳过的信息; 构造 AsciinemaHandler(self._markers, self._local_asciinema_recording_path); 调用 handler.merge_markers() 改写 self._local_asciinema_recording_path 指向的录屏文件</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先联合检查 <code>self._markers</code> 与 <code>self._local_asciinema_recording_path</code>；只有 marker 列表非空且本地录屏路径可用时，才进入后续合并分支。</li><li>进入合并分支后，先用 <code>self._logger.debug</code> 记录待合并的 marker 数量，即 <code>len(self._markers)</code>，用于说明即将执行的后处理工作量。</li><li>随后以 <code>self._markers</code> 和 <code>self._local_asciinema_recording_path</code> 为输入构造 <code>AsciinemaHandler</code>，把具体文件后处理职责交给专门组件。</li><li>调用 <code>handler.merge_markers()</code> 执行实际合并；成功返回后，再记录一条 debug 日志，明确目标文件就是 <code>self._local_asciinema_recording_path</code>。</li><li>若前置条件不满足，则不实例化处理器、不触碰录屏文件，只记录 <code>No markers to merge</code> 的调试信息。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>            if self._markers and self._local_asciinema_recording_path:
+                self._logger.debug(
+                    f"Merging {len(self._markers)} markers into recording"
+                )
+                handler = AsciinemaHandler(
+                    self._markers, self._local_asciinema_recording_path
+                )
+                handler.merge_markers()
+                self._logger.debug(
+                    f"Successfully merged markers into {self._local_asciinema_recording_path}"
+                )
+            else:
+                self._logger.debug("No markers to merge")</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>这里采用“双条件门控”而非仅检查 <code>self._markers</code>：代码要求 marker 存在且 <code>self._local_asciinema_recording_path</code> 也可用，避免出现“有逻辑事件但没有本地录屏文件”时仍尝试后处理的无效或错误操作。</li><li>合并逻辑没有内联在 <code>TmuxSession.stop</code> 中，而是委托给 <code>AsciinemaHandler.merge_markers()</code>；这体现了会话停止与 cast 文件重写的职责分离，减少 stop 流程对 asciinema 文件格式细节的耦合。</li><li>未满足条件时选择安静跳过并写 debug 日志，而不是抛错；这表明“没有 marker”或“没有本地录屏路径”在此处被视为合法的无工作场景，而非异常路径。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Harbor 框架在 agent 返回后调用的 <code>TmuxSession.stop()</code> 收尾流程; <a href="stage-6.html">stage-6</a> 外部录屏后处理入口</li><li><strong>核心被调用</strong>: AsciinemaHandler(...); AsciinemaHandler.merge_markers(); self._logger.debug(...)</li><li><strong>配置/状态来源</strong>: self._markers：运行期间累积的 marker 列表; self._local_asciinema_recording_path：本地下载/保存的 asciinema 录屏路径; self._logger：会话级日志输出器</li><li><strong>结果去向</strong>: self._local_asciinema_recording_path 指向的 <code>.cast</code> 录屏文件; 调试日志输出; <a href="stage-6.html">stage-6</a> 的录屏后处理完成状态</li><li><strong>同类 sibling</strong>: 同 stage 的后续/相关单元应位于 <code>AsciinemaHandler.merge_markers()</code> 及其内部行处理逻辑；本片段只负责决定是否进入这些兄弟处理步骤。</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-asciinema-markers"><code>reg-asciinema-markers</code></a> — 停止会话时消费已累积 marker</li></ul></div>
+</div></details><details class="file" id="fn-asciinemahandler_init"><summary><span class="chev"></span><code class="fpath">AsciinemaHandler.__init__</code><a class="fn-range" href="../code/asciinema_handler.py.html#L11-L20" title="asciinema_handler.py:11-20">asciinema_handler.py:11–20 ↗</a></summary><div class="file-body"><p class="fn-sub">初始化录屏处理器内部字段</p>
+<blockquote><p><strong>stage 上下文</strong>: 该单元是 <code>AsciinemaHandler</code> 的构造函数，仅负责把构造参数落入实例状态。就当前源码可见范围而言，它不执行文件处理，也不触发任何外部流程；与同 stage 中真正执行合并的兄弟函数相比，这里只完成初始化准备。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>该函数接收 <code>markers</code> 与 <code>recording_path</code> 两个参数，并把它们写入实例属性。对于 <code>markers</code>，代码在其为真值时按时间戳 <code>x[0]</code> 排序后写入 <code>self._markers</code>，否则写入空列表 <code>[]</code>；对于 <code>recording_path</code>，则直接赋给 <code>self._recording_path</code>。函数本身无返回值，副作用仅限于实例内部状态初始化。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, markers: list[tuple[float, str]], recording_path: Path) -&gt; None</code></p>
+<ul><li>参数: <code>markers</code>: <code>list[tuple[float, str]]</code> — 用于初始化 <code>self._markers</code> 的输入列表；若为真值则先按元组第 0 项排序; <code>recording_path</code>: <code>Path</code> — 用于初始化 <code>self._recording_path</code> 的路径对象</li><li>返回: None；真正产出是对 <code>self._markers</code> 与 <code>self._recording_path</code> 的赋值。</li><li>副作用: 写入 <code>self._markers</code>; 写入 <code>self._recording_path</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>检查参数 <code>markers</code> 的真值：若为真，则执行 <code>sorted(markers, key=lambda x: x[0])</code>，并将结果写入 <code>self._markers</code>；若为假，则将空列表 <code>[]</code> 写入 <code>self._markers</code>。</li><li>将传入的 <code>recording_path</code> 原样赋给 <code>self._recording_path</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def __init__(self, markers: list[tuple[float, str]], recording_path: Path):
+        """
+        Initialize the AsciinemaHandler.
+
+        Args:
+            markers: List of tuples containing (timestamp, label) for each marker
+            recording_path: Path to the asciinema recording file
+        """
+        self._markers = sorted(markers, key=lambda x: x[0]) if markers else []
+        self._recording_path = recording_path</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>对 <code>markers</code> 采用真值分支 <code>sorted(...) if markers else []</code>，这是显式的输入规范化：空输入不会保留原值，而会统一变成空列表。</li><li>排序键固定为 <code>lambda x: x[0]</code>，说明该构造函数只依据每个二元组的第 0 项决定顺序，而不关心第 1 项内容。</li><li><code>recording_path</code> 未做复制、校验或变换，而是直接赋值给实例属性；这体现了此处仅承担保存输入的职责。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: AsciinemaHandler(...) 构造调用点</li><li><strong>核心被调用</strong>: sorted</li><li><strong>配置/状态来源</strong>: 构造参数 <code>markers</code>; 构造参数 <code>recording_path</code></li><li><strong>结果去向</strong>: <code>self._markers</code>; <code>self._recording_path</code></li><li><strong>同类 sibling</strong>: TmuxSession.stop：兄弟单元负责在条件满足时触发后续处理；本函数仅完成其所需处理器实例的字段初始化。</li></ul></div></details><details class="file" id="fn-asciinemahandler_merge_markers"><summary><span class="chev"></span><code class="fpath">AsciinemaHandler.merge_markers</code><a class="fn-range" href="../code/asciinema_handler.py.html#L22-L39" title="asciinema_handler.py:22-39">asciinema_handler.py:22–39 ↗</a></summary><div class="file-body"><p class="fn-sub">录屏标记合并入口函数</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数处于录屏后处理环节，职责是决定是否对现有 asciinema 录屏文件执行标记合并。与同 stage 的 <code>AsciinemaHandler.__init__</code> 相比，后者只负责保存 <code>markers</code> 与 <code>recording_path</code>，本函数则基于这些实例状态进入“直接返回”或“生成临时文件并替换原路径”两条路径。它自身不实现逐行合并逻辑，而是把实际内容生成委托给 <code>_write_merged_recording</code>。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数读取 <code>self._markers</code> 与 <code>self._recording_path</code>，先判断是否存在待合并标记以及目标录屏文件是否存在。若任一条件不满足，则立即返回、不做任何文件改写；否则基于录屏路径派生一个 <code>.tmp</code> 路径，调用 <code>_write_merged_recording(temp_path)</code> 生成合并结果，并再以 <code>temp_path.replace(self._recording_path)</code> 用临时文件替换原录屏路径。函数返回 <code>None</code>，真正产出体现在文件系统上的“无操作”或“替换原录屏文件”两种结果。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self) -&gt; None</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — AsciinemaHandler 实例；提供待合并标记、录屏路径与实际写出辅助方法</li><li>读状态: <code>self._markers</code>, <code>self._recording_path</code>, <code>self._write_merged_recording</code></li><li>返回: 返回 None；结果分两种：若 <code>self._markers</code> 为空或 <code>self._recording_path.exists()</code> 为假，则无副作用直接结束；否则先写出临时合并文件，再调用 <code>replace</code> 以该临时路径替换原录屏路径。</li><li>副作用: 在满足条件时创建 <code>self._recording_path.with_suffix(".tmp")</code> 对应的合并输出文件; 在满足条件时调用 <code>_write_merged_recording(temp_path)</code> 产生合并后的录屏内容; 在满足条件时调用 <code>temp_path.replace(self._recording_path)</code> 替换原录屏路径</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先检查 <code>not self._markers or not self._recording_path.exists()</code>；只要待合并标记为空，或目标录屏路径当前不存在，就立即 <code>return</code>，本次调用结束。</li><li>若继续执行，则从 <code>self._recording_path</code> 派生 <code>temp_path = self._recording_path.with_suffix(".tmp")</code>，把输出目标切换到同一路径基名下的 <code>.tmp</code> 文件。</li><li>调用 <code>self._write_merged_recording(temp_path)</code>，把“如何根据现有录屏与标记写出合并结果”的工作委托给辅助方法完成。</li><li>在辅助方法返回后，调用 <code>temp_path.replace(self._recording_path)</code>，用临时路径对应的文件替换原录屏路径。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def merge_markers(self) -&gt; None:
+        """
+        Merge asciinema markers into a recording.
+
+        Inserts marker events into an asciinema recording file at specified timestamps.
+        Markers are added as special events with type 'm' in the recording format.
+        The original recording is preserved until the merge is successful.
+
+        In the future Asciinema might support adding markers via RCP:
+        https://discourse.asciinema.org/t/add-markers-with-title-from-cli/861
+        """
+        if not self._markers or not self._recording_path.exists():
+            return
+
+        # Create a temporary file in the same directory as the recording
+        temp_path = self._recording_path.with_suffix(".tmp")
+        self._write_merged_recording(temp_path)
+        temp_path.replace(self._recording_path)</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数把“是否需要合并”的判断前置为单个早退条件：<code>not self._markers or not self._recording_path.exists()</code>。这样在无标记或无目标文件时直接结束，避免进入后续文件写出流程。</li><li>该函数不直接在原录屏路径上写内容，而是先构造 <code>with_suffix(".tmp")</code> 得到临时输出路径，再在末尾调用 <code>replace(...)</code>。从可见代码看，这是一种“先产出完整合并结果、后替换原路径”的两阶段写法。</li><li>实际合并内容的生成被下沉到 <code>_write_merged_recording(temp_path)</code>，使本函数只保留入口判定与文件路径切换职责；这让控制流保持很短，但也意味着具体合并细节必须到被调辅助方法中查看。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未在此源码片段中出现；外部持有 <code>AsciinemaHandler</code> 实例的代码可调用该方法以触发合并</li><li><strong>核心被调用</strong>: self._recording_path.exists; self._recording_path.with_suffix; self._write_merged_recording; temp_path.replace</li><li><strong>配置/状态来源</strong>: self._markers：决定是否直接返回; self._recording_path：决定目标文件是否存在，并提供临时路径与替换目标</li><li><strong>结果去向</strong>: 若早退：无结果写出到外部; 若执行合并：结果先写到 <code>temp_path</code>; 若执行合并：随后由 <code>temp_path.replace(self._recording_path)</code> 反映到原录屏路径; 调用方仅收到 <code>None</code>，可观察结果主要在文件系统</li><li><strong>同类 sibling</strong>: AsciinemaHandler.__init__：负责把 <code>markers</code> 与 <code>recording_path</code> 保存到实例状态，本函数消费这些状态决定是否合并; TmuxSession.stop：兄弟条目说明其会在条件满足时触发录屏标记合并；但这一调用关系不由本函数源码自身证明</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-asciinema-markers"><code>reg-asciinema-markers</code></a> — 经 <code>self._markers</code> 间接读取已积累标记</li></ul></div>
+</div></details><details class="file" id="fn-asciinemahandler_write_merged_recording"><summary><span class="chev"></span><code class="fpath">AsciinemaHandler._write_merged_recording</code><a class="fn-range" href="../code/asciinema_handler.py.html#L41-L60" title="asciinema_handler.py:41-60">asciinema_handler.py:41–60 ↗</a></summary><div class="file-body"><p class="fn-sub">将标记写入新录屏文件的合并写出器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该方法位于 <a href="stage-6.html">stage-6</a> 的录屏后处理环节，职责是把已有录屏与已累积的 marker 数据写成一个新的 <code>.cast</code> 输出文件。它是 <code>AsciinemaHandler.merge_markers()</code> 的内部写出步骤；相较同 stage 的 <code>merge_markers</code> 负责整体替换流程，本函数只负责生成合并后的文件内容。与兄弟函数 <code>AsciinemaHandler.__init__</code> 相比，这里不初始化状态，只读取 <code>self._recording_path</code> 与 <code>self._markers</code>。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收 <code>output_path</code> 作为输出目标，读取 <code>self._recording_path</code> 指向的原始录屏文件，并把合并结果写入新文件。它先单独保留原文件首行头部，再按后续各行依次调用 <code>_process_recording_line(line, output_file, marker_index)</code>，并用其返回值更新局部 <code>marker_index</code>。循环结束后，函数把 <code>self._markers[marker_index:]</code> 这一尾部切片交给 <code>_write_remaining_markers</code> 补写到输出文件末尾；实例自身状态不被修改，真正产出是 <code>output_path</code> 上的文件内容。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, output_path: Path) -&gt; None</code></p>
+<ul><li>参数: <code>output_path</code>: <code>Path</code> — 新录屏文件的写出路径；以文本写模式 <code>"w"</code> 打开</li><li>读状态: <code>self._recording_path</code>, <code>self._markers</code></li><li>返回: 返回 <code>None</code>；实际结果是向 <code>output_path</code> 写出合并后的录屏文本内容。</li><li>副作用: 打开 <code>self._recording_path</code> 对应文件进行读取; 以文本写模式 <code>"w"</code> 打开并写入 <code>output_path</code>; 向输出文件写入原录屏头部、逐行处理后的内容，以及剩余 marker 记录; 不修改任何 <code>self</code> 属性，仅推进局部变量 <code>marker_index</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>初始化局部变量 <code>marker_index = 0</code>，作为当前已消费 marker 的位置。</li><li>同时打开 <code>self._recording_path</code> 作为输入文件、打开 <code>output_path</code> 作为输出文件，其中输出端显式使用写模式 <code>"w"</code>。</li><li>先调用 <code>input_file.readline()</code> 读取原文件首行，并立即写入 <code>output_file</code>，因此后续 <code>for line in input_file</code> 处理的是除头部之外的剩余各行。</li><li>对输入文件剩余每一行，调用 <code>self._process_recording_line(line, output_file, marker_index)</code>，并把其返回值重新赋给局部 <code>marker_index</code>。</li><li>当逐行处理结束后，取 <code>self._markers[marker_index:]</code> 这一尚未消费的 marker 切片，调用 <code>self._write_remaining_markers(output_file, self._markers[marker_index:])</code> 追加到输出末尾。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _write_merged_recording(self, output_path: Path) -&gt; None:
+        """
+        Write a new recording file with markers merged in at the correct timestamps.
+        """
+        marker_index = 0
+
+        with (
+            open(self._recording_path) as input_file,
+            open(output_path, "w") as output_file,
+        ):
+            # Preserve header
+            output_file.write(input_file.readline())
+
+            for line in input_file:
+                marker_index = self._process_recording_line(
+                    line, output_file, marker_index
+                )
+
+            # Add any remaining markers at the end
+            self._write_remaining_markers(output_file, self._markers[marker_index:])</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>首行通过 <code>readline()</code> 单独读取并原样写出，而不是让统一的逐行循环处理头部；这一写法明确把头部保留逻辑与后续事件行处理分开。</li><li>逐行调用 <code>_process_recording_line(...)</code>，并以其返回值覆盖局部 <code>marker_index</code>；这表明 marker 消费进度由辅助函数回传，而不是在本方法内直接改写 <code>self._markers</code>。</li><li>结束后显式调用 <code>_write_remaining_markers(..., self._markers[marker_index:])</code> 处理尾部切片；该补写步骤避免未在循环中处理到的剩余 marker 被遗漏。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: AsciinemaHandler.merge_markers</li><li><strong>核心被调用</strong>: open(self._recording_path); open(output_path, "w"); input_file.readline; AsciinemaHandler._process_recording_line; AsciinemaHandler._write_remaining_markers</li><li><strong>配置/状态来源</strong>: self._recording_path：提供原始录屏输入路径; self._markers：提供待补写 marker 数据，末尾通过 <code>self._markers[marker_index:]</code> 读取</li><li><strong>结果去向</strong>: output_path：接收新写出的合并录屏文件; AsciinemaHandler.merge_markers：使用本方法生成的临时/目标文件内容继续后续文件替换流程</li><li><strong>同类 sibling</strong>: AsciinemaHandler.merge_markers：负责判断是否执行合并并安排目标/临时路径，本函数只负责实际写出内容; AsciinemaHandler.__init__：负责把 <code>markers</code> 与 <code>recording_path</code> 存入实例，本函数仅读取这些状态; TmuxSession.stop：兄弟条目中负责决定是否触发 marker 合并；本函数不做该判断</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-asciinema-markers"><code>reg-asciinema-markers</code></a> — 经由 <code>self._markers[marker_index:]</code> 只读消费剩余标记</li></ul></div>
+</div></details><details class="file" id="fn-asciinemahandler_process_recording_line"><summary><span class="chev"></span><code class="fpath">AsciinemaHandler._process_recording_line</code><a class="fn-range" href="../code/asciinema_handler.py.html#L62-L90" title="asciinema_handler.py:62-90">asciinema_handler.py:62–90 ↗</a></summary><div class="file-body"><p class="fn-sub">录屏逐行合并中的单行处理器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 <a href="stage-6.html">stage-6</a> 的录屏后处理流程中，负责在遍历 <code>.cast</code> 事件行时，对单行执行“必要时插入 marker，再写回原行”的局部决策。它不独立启动流程，而是由 <code>AsciinemaHandler._write_merged_recording</code> 在逐行复制原录屏文件时调用；更上层则由 <code>AsciinemaHandler.merge_markers</code> 与框架触发的 <code>TmuxSession.stop()</code> 串接起来。与同 stage 的兄弟函数相比，<code>_write_merged_recording</code> 负责整体文件扫描与尾部补写，本函数只处理当前这一行及 <code>marker_index</code> 的推进。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收一行录屏文本 <code>line</code>、输出流 <code>output_file</code> 与当前 marker 游标 <code>marker_index</code>，尝试把时间戳不晚于该行事件时间的 marker 先写入输出，再把原始录屏行写入合并结果。它读取 <code>self._markers</code> 中待合并的标记，并通过 <code>self._write_marker(...)</code> 产生 marker 行。返回值是更新后的 <code>marker_index</code>；实例状态本身不被修改，真正产出体现为对 <code>output_file</code> 的追加写入。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, line: str, output_file: TextIO, marker_index: int) -&gt; int</code></p>
+<ul><li>参数: <code>line</code>: <code>str</code> — 当前读取到的一行 asciinema 录屏文本，来自原 <code>.cast</code> 文件的逐行遍历; <code>output_file</code>: <code>TextIO</code> — 合并后录屏文件的写入目标；marker 行与原始行都写到这里; <code>marker_index</code>: <code>int</code> — 指向 <code>self._markers</code> 中下一个待写 marker 的位置，由外层循环传入并接收更新值</li><li>读状态: <code>self._markers</code></li><li>返回: 返回更新后的 <code>marker_index</code>，供外层逐行处理时继续衔接后续 marker；真正可见结果是 <code>output_file</code> 中新增的 marker 行和原始录屏行。</li><li>副作用: 向 <code>output_file</code> 写入零个或多个 marker 行; 向 <code>output_file</code> 写入原始 <code>line</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>首先检查 <code>line.startswith("[")</code>：若当前行看起来不是 asciinema 事件数组行，则不做解析，直接把原行写入 <code>output_file</code>，并原样返回传入的 <code>marker_index</code>。</li><li>若该行以 <code>[</code> 开头，则进入 <code>try</code> 分支，使用 <code>json.loads(line)</code> 解析该行，并从 <code>data[0]</code> 读取事件时间，再用 <code>float(...)</code> 统一成可比较的 <code>timestamp</code>。</li><li>在成功取得 <code>timestamp</code> 后，循环检查 <code>marker_index &lt; len(self._markers)</code> 与 <code>self._markers[marker_index][0] &lt;= timestamp</code>；只要下一个 marker 的时间不晚于当前录屏事件，就调用 <code>self._write_marker(output_file, self._markers[marker_index])</code> 先写出该 marker，并将 <code>marker_index</code> 递增。</li><li>若解析过程中出现 <code>json.JSONDecodeError</code>、<code>ValueError</code> 或 <code>IndexError</code>，异常被捕获后不终止处理，也不改写该行内容；函数仅放弃本行的 marker 插入判断。</li><li>无论本行是否成功解析、是否插入了 marker，最后都会执行 <code>output_file.write(line)</code> 写回原始录屏行，并返回当前的 <code>marker_index</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _process_recording_line(
+        self,
+        line: str,
+        output_file: TextIO,
+        marker_index: int,
+    ) -&gt; int:
+        """Process a single line from the recording, inserting markers as needed."""
+        if not line.startswith("["):
+            output_file.write(line)
+            return marker_index
+
+        try:
+            data = json.loads(line)
+            timestamp = float(data[0])
+
+            # Insert any markers that should appear before this timestamp
+            while (
+                marker_index &lt; len(self._markers)
+                and self._markers[marker_index][0] &lt;= timestamp
+            ):
+                self._write_marker(output_file, self._markers[marker_index])
+                marker_index += 1
+
+        except (json.JSONDecodeError, ValueError, IndexError):
+            # If we can't parse the line, preserve it as-is
+            pass
+
+        output_file.write(line)
+        return marker_index</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数把“无法识别的行”视为应当保留的原始内容：既包括一开始不以 <code>[</code> 开头的行，也包括 <code>json.loads</code>、时间转换或索引提取失败的情况。这样做的取舍是优先保证录屏文件内容不丢失，即使某些行无法参与 marker 对齐，也不因为后处理而破坏原始记录。</li><li>marker 的插入条件采用 <code>self._markers[marker_index][0] &lt;= timestamp</code>，意味着与当前事件时间相同的 marker 会写在该事件行之前。这一约定保证同一时间点的标记在输出顺序上“先标记、后事件”，与 <a href="stage-6.html">stage-6</a> 对“在时间戳达到时插入 marker”的整体目标一致。</li><li>函数只返回推进后的 <code>marker_index</code>，而不修改 <code>self._markers</code> 本身。这让 marker 列表保持只读输入，跨行状态由外层 <code>_write_merged_recording</code> 显式持有，便于逐行遍历时清楚地区分‘源数据’与‘处理进度’。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: AsciinemaHandler._write_merged_recording</li><li><strong>核心被调用</strong>: json.loads; float; output_file.write; self._write_marker</li><li><strong>配置/状态来源</strong>: self._markers; line 参数中的录屏事件文本; marker_index 参数中的外层遍历进度; output_file 参数中的合并输出目标</li><li><strong>结果去向</strong>: 返回给 AsciinemaHandler._write_merged_recording 的更新后 marker_index; 写入到 output_file 的 marker 事件行; 写入到 output_file 的原始录屏行; 间接贡献于 AsciinemaHandler.merge_markers 生成的临时合并录屏文件</li><li><strong>同类 sibling</strong>: AsciinemaHandler._write_merged_recording：负责打开原始/目标文件、保留头部、逐行调用本函数并在末尾补写剩余 marker。; AsciinemaHandler.merge_markers：负责整体入口判定与临时文件替换，不处理单行内容。; TmuxSession.stop：在框架结束会话时决定是否触发整个 marker 合并流程。</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-asciinema-markers"><code>reg-asciinema-markers</code></a> — 逐行合并时按游标读取标记</li></ul></div>
+</div></details><details class="file" id="fn-asciinemahandler_write_remaining_markers"><summary><span class="chev"></span><code class="fpath">AsciinemaHandler._write_remaining_markers</code><a class="fn-range" href="../code/asciinema_handler.py.html#L98-L103" title="asciinema_handler.py:98-103">asciinema_handler.py:98–103 ↗</a></summary><div class="file-body"><p class="fn-sub">录屏尾部标记补写助手</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 <a href="stage-6.html">stage-6</a> 的 asciinema 后处理子流程中，角色是把一组尚待处理的 marker 逐个交给统一的 marker 写出逻辑。它本身不判断录屏状态、也不处理录屏行内容；与同 stage 的兄弟函数相比，这里只负责尾部补写这一件事。其触发时机与上层调用路径属于外部上下文，本函数源码自身未体现。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收 <code>output_file</code> 与 <code>markers</code> 两个参数，对 <code>markers</code> 中的每个元组执行一次 <code>self._write_marker(output_file, marker)</code>。若 <code>markers</code> 为空，则循环体不会执行，函数直接结束。返回值为 <code>None</code>；真正产出是向 <code>output_file</code> 零次或多次委托写入 marker 记录，本函数不修改任何实例属性。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, output_file: TextIO, markers: list[tuple[float, str]]) -&gt; None</code></p>
+<ul><li>参数: <code>output_file</code>: <code>TextIO</code> — marker 写出目标流，原样传给 <code>_write_marker</code>; <code>markers</code>: <code>list[tuple[float, str]]</code> — 待处理的 marker 序列；函数按其迭代顺序逐个转交</li><li>返回: 返回 <code>None</code>；实际效果是向 <code>output_file</code> 零个或多个 marker 的写出委托。</li><li>副作用: 对 <code>markers</code> 中每个元素调用一次 <code>self._write_marker(output_file, marker)</code>; 可能经由 <code>_write_marker</code> 对 <code>output_file</code> 产生零次或多次写入</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>进入函数后不做前置判断，直接对参数 <code>markers</code> 执行 <code>for marker in markers</code> 迭代。</li><li>每取得一个 <code>marker</code>，就调用一次 <code>self._write_marker(output_file, marker)</code>，把输出流与当前 marker 一并传入。</li><li>当 <code>markers</code> 遍历完成后自然结束；若输入列表为空，则不会发生任何 <code>_write_marker</code> 调用。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _write_remaining_markers(
+        self, output_file: TextIO, markers: list[tuple[float, str]]
+    ) -&gt; None:
+        """Write any remaining markers that come after all recorded events."""
+        for marker in markers:
+            self._write_marker(output_file, marker)</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数把逐项写出的具体工作完全委托给 <code>_write_marker</code>，自身只承担遍历与转交职责；这种拆分使当前函数保持极小粒度，而 marker 的具体写法集中在单一入口。</li><li>代码没有对 <code>markers</code> 为空做显式分支，而是依赖 <code>for</code> 循环的自然零次执行语义处理空输入；这样减少了额外控制流，同时明确允许“什么都不写”这一结果。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 外部上层合并流程中的某个调用点（源码片段自身未显示具体调用者）</li><li><strong>核心被调用</strong>: AsciinemaHandler._write_marker</li><li><strong>配置/状态来源</strong>: 参数 <code>markers</code>：提供待处理 marker 序列; 参数 <code>output_file</code>：提供写出目标流; 实例方法 <code>self._write_marker</code>：提供逐项写出能力</li><li><strong>结果去向</strong>: 传入的 <code>output_file</code>; 调用方可观察到的副作用：<code>_write_marker</code> 被按迭代次数调用</li><li><strong>同类 sibling</strong>: AsciinemaHandler._process_recording_line：同属 marker 合并链路，但该函数处理单条录屏行并返回更新后的游标；本函数不处理录屏行、也不返回游标，只做剩余 marker 的逐项转交。; AsciinemaHandler._write_merged_recording：兄弟函数负责整体文件读写编排；本函数只覆盖其中“把一组 marker 逐个写出”的局部职责。</li></ul></div></details><details class="file" id="fn-asciinemahandler_write_marker"><summary><span class="chev"></span><code class="fpath">AsciinemaHandler._write_marker</code><a class="fn-range" href="../code/asciinema_handler.py.html#L92-L96" title="asciinema_handler.py:92-96">asciinema_handler.py:92–96 ↗</a></summary><div class="file-body"><p class="fn-sub">将单个标记写成 JSON 行</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数是 <a href="stage-6.html">stage-6</a> 录屏后处理中的最小写出单元，职责仅限于把一个 <code>marker</code> 参数转换为一行文本并写入 <code>output_file</code>。与同 stage 的 <code>_process_recording_line</code>、<code>_write_remaining_markers</code> 相比，它不处理遍历、排序或游标推进，只负责单条 marker 的具体落盘格式。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收 <code>output_file</code> 与 <code>marker</code> 两个参数，其中 <code>marker</code> 按代码要求可解包为 <code>(marker_time, marker_label)</code>。它构造列表 <code>[marker_time, "m", marker_label]</code>，再用 <code>json.dumps(...)</code> 序列化，并把结果字符串加上换行符 <code>"\n"</code> 后写入 <code>output_file</code>。函数返回 <code>None</code>，可观察产出是一次对文件对象的 <code>write(...)</code> 调用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, output_file: TextIO, marker: tuple[float, str]) -&gt; None</code></p>
+<ul><li>参数: <code>output_file</code>: <code>TextIO</code> — 接收序列化结果的文本输出流; <code>marker</code>: <code>tuple[float, str]</code> — 必须能被解包为 <code>(marker_time, marker_label)</code> 的二元组</li><li>返回: 返回 <code>None</code>；真正产出是向 <code>output_file</code> 写入一行以换行结尾的 JSON 字符串。</li><li>副作用: 调用 <code>output_file.write(...)</code> 写出 <code>json.dumps(marker_data) + "\n"</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>将参数 <code>marker</code> 解包为 <code>marker_time, marker_label</code>。</li><li>基于这两个值构造列表 <code>marker_data = [marker_time, "m", marker_label]</code>。</li><li>对 <code>marker_data</code> 调用 <code>json.dumps(...)</code> 生成 JSON 字符串。</li><li>把该字符串与换行符 <code>"\n"</code> 拼接后传给 <code>output_file.write(...)</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _write_marker(self, output_file: TextIO, marker: tuple[float, str]) -&gt; None:
+        """Write a single marker event to the output file."""
+        marker_time, marker_label = marker
+        marker_data = [marker_time, "m", marker_label]
+        output_file.write(json.dumps(marker_data) + "\n")</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>输出结构固定为三元素列表 <code>[marker_time, "m", marker_label]</code>，其中事件标记写死为字符串字面量 <code>"m"</code>，而不是从参数或实例状态读取。</li><li>写出前先经过 <code>json.dumps(marker_data)</code>，说明输出采用 JSON 文本格式而非手工拼接字符串。</li><li>写入内容末尾显式补上 <code>"\n"</code>，因此单次调用生成的是一条换行结尾的独立文本记录。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: AsciinemaHandler._process_recording_line; AsciinemaHandler._write_remaining_markers</li><li><strong>核心被调用</strong>: json.dumps; output_file.write</li><li><strong>配置/状态来源</strong>: 参数 <code>marker</code> 提供 <code>marker_time</code> 与 <code>marker_label</code>; 参数 <code>output_file</code> 提供写出目标</li><li><strong>结果去向</strong>: <code>output_file</code> 中写入的单行 JSON 文本; 上层录屏改写流程消费该写出结果</li><li><strong>同类 sibling</strong>: AsciinemaHandler._process_recording_line：负责决定何时调用本函数写出 marker。; AsciinemaHandler._write_remaining_markers：负责对多个 marker 逐个调用本函数。; AsciinemaHandler._write_merged_recording：负责整体文件读写与尾部补写。</li></ul></div></details><nav class="pn"><a class="pn-prev" href="stage-5.html"><span>← 上一阶段</span><strong>运行收尾</strong></a><a class="pn-next" href="side-S1.html"><span>下一阶段 →</span><strong>上下文摘要</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

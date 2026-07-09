@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-4.9 · 解析器内部辅助</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=zh"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 手册</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=zh" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>返回主页</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>状态流寄存器</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>配置固化</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>环境搭建</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>运行起点</a></div><details class="s-node" open><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>迭代主循环</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>循环入口门控</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>主动摘要探测</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM 调用</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>响应解析</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>待交接提示 → 用户步骤(或切分)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>错误分支</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>命令执行 → 观察 → 轨迹步骤</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>完成门控与循环控制</a></div><div class="s-leaf"><a class="s-link cur" href="stage-4.9.html"><span class="s-num">4.9</span>解析器内部辅助</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>运行收尾</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>录制后处理(外部)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>上下文摘要</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token 与成本核算</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>输出长度限制</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>日志</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux 内部辅助</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">索引</a><span class="sep">›</span><a href="stage-4.html">迭代主循环</a></nav><div class="stage-head"><h1>解析器内部辅助</h1><div class="meta"><span class="chip mono">stage-4.9</span><span class="chip">Parser internal helpers</span><span class="chip">11 个函数</span></div></div>
+<h2 class="sec">开场解释</h2>
+<p>这个 Stage 在解决什么问题：当主循环已经拿到模型原始回复后，它要把“差一点就合法”的 XML/JSON 文本尽量救成可用结果，而不是因为一个缺标签、半截 JSON、或输出被截断就整轮失败。它的位置在解析子系统内部，属于公开解析入口后面的“修补与抢救层”。输入是上游交来的原始响应；输出是解析结果，或明确的失败结论，再加上一路累积的警告，交回外层解析边界处理。</p>
+<h2 class="sec">主流程</h2>
+
+<ol><li>先按格式做正常解析 <p>这里的第一目标不是“聪明修”，而是先判断原始回复本身能不能直接读。 因为很多回复其实已经合法，没必要动它。 这一步的产出只有两类：</p>
+<ul><li>解析成功：直接得到结果 </li><li>解析失败：进入下一层修补</li></ul></li><li>失败后，先做保守的 auto-fix（自动修补） <p>这一层处理的是常见、低风险的小毛病。 比如：</p>
+<ul><li>XML 少了外层 <code>&lt;response&gt;</code> 标签</li><li>JSON 结尾被截断，结构明显没闭合</li><li>一些格式相关的小修正 </li></ul>
+<p>之所以把这层放在前面，是因为它改动小、误修风险低。 目标不是“猜作者想说什么”，而是把明显的格式瑕疵补平，让解析器再试一次。</p></li><li>每次修补后重试，并把 warning（警告）累积起来 <p>这里的关键不是单纯“再 parse 一遍”，而是要留下痕迹：</p>
+<ul><li>修过什么 </li><li>为什么修 </li><li>这次结果是否可信但有瑕疵 </li></ul>
+<p>这就是 <code>_combine_warnings()</code> 这一类内部 helper 存在的原因。 系统不能只返回“成功了”，还要告诉外层：这个成功是不是靠修补得来的。 这样外层后面做决策时，才知道该不该更保守地看待这份结果。</p></li><li>只有前面还失败，而且看起来是“被截断”时，才做 salvage（抢救） <p><code>salvage_truncated_response()</code> 可以理解成“最后的抢救手段”。 它不是常规路径，而是兜底路径。</p>
+<p>为什么要放在 auto-fix 之后？ 因为 salvage 更激进。它面对的是输出只来了一半的情况，会尽量从残缺文本里抠出还能用的部分。 如果一上来就走这条路，很容易把本来只需小修的文本过度处理，反而引入误判。 所以顺序必须是：</p>
+<ul><li>先做保守修补 </li><li>再做激进抢救 </li></ul>
+<p>这样能把“救回成功率”和“误修风险”平衡住。</p></li><li>XML 和 JSON 各有策略，但职责相同 <p>这个 Stage 里同时有 XML plain parser 和 JSON plain parser 的内部 helper。 它们看起来处理细节不同，但职责是一致的：</p>
+<ul><li>找出最常见的坏格式 </li><li>做最小修补 </li><li>重试解析 </li><li>记录警告 </li><li>必要时对截断输出做最后抢救 </li></ul>
+<p>比如 XML 会更关心顶层标签是否完整、能不能提取 <code>&lt;response&gt;</code> 内容； JSON 会更关心括号、数组、对象是否收尾完整。 但从流水线视角看，它们都是“格式专属修补器”。</p></li><li>最后把结论交回外层解析边界 <p>这个 Stage 不负责决定“整轮 run 要不要结束”“要不要重试模型”。 它只负责把内部解析结论整理好后交出去：</p>
+<ul><li>成功的结果 </li><li>或失败结论 </li><li>以及修补/抢救过程中累积的警告 </li></ul>
+<p>外层再根据这个边界结果，决定后面的 loop 控制或 teardown（收尾）。</p></li></ol>
+<h2 class="sec"> 状态流动</h2>
+<ul><li>读: 无可见 register-id — 输入契约是“上游交来的模型原始响应文本及其目标格式（XML/JSON）”；但本题给出的 skeleton 未提供任何真实寄存器名，无法按 Tier 2 要求把它映射成已命名 register。</li><li>写: 无可见 register-id — 本 Stage 会产出“解析结果 / 失败结论 + warnings”，并在内部经历“正常解析→auto-fix→重试→必要时 salvage”的顺序；但这些状态项在输入材料中没有对应的显式 register-id。</li><li>清: 无可见 register-id — 从给出的成员列表看，这里主要是解析器内部 helper；看不出有显式清空某个共享寄存器的动作。</li><li>触发下游: 无可见 register-id — 可确定的是：本 Stage 完成后，控制权返回外层解析边界；由外层决定后续 loop / teardown 行为。由于缺少寄存器与边界代码，本稿无法按本 tier 验证更细的数据流。</li></ul>
+<h2 class="sec">与前后 Stage 的衔接</h2>
+<p>上游已经结束本轮生成，把“模型原始回复”交给解析子系统；本 Stage 负责把这份原始文本尽量变成稳定的结构化结论。它产出的是“解析结果或失败状态，加上警告”，然后返回外层解析边界，由外层决定是继续控制循环、结束，还是进入 teardown。</p><div class="files-bar"><h2 class="sec">函数细节<span class="pill">11</span></h2><span class="spacer"></span><button class="tool" data-x="expand">全部展开</button><button class="tool" data-x="collapse">全部折叠</button></div><details class="file" id="fn-terminusxmlplainparser_init"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser.__init__</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L25-L26" title="terminus_xml_plain_parser.py:25-26">terminus_xml_plain_parser.py:25–26 ↗</a></summary><div class="file-body"><p class="fn-sub">解析器实例的最小化构造入口</p>
+<blockquote><p><strong>stage 上下文</strong>: 该条目位于 parser internal helpers stage，但就给定源码可见内容而言，此函数仅执行实例属性初始化。它无条件触发于对象构造时，且本 unit 是该 stage 当前唯一已翻译条目，因此不存在可对照的兄弟实现。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>__init__(self)</code> 只接收实例自身 <code>self</code>。函数体仅把 <code>self.required_sections</code> 赋值为新列表 <code>[</code>"analysis"<code>, </code>"plan"<code>, </code>"commands"<code>]</code>，随后隐式返回 <code>None</code>。除此之外，它不读取现有实例状态，也不调用其他函数。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self)</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 当前 <code>TerminusXMLPlainParser</code> 实例</li><li>返回: 隐式返回 <code>None</code>；实际产出是把属性 <code>self.required_sections</code> 写成新列表 <code>["analysis", "plan", "commands"]</code></li><li>副作用: 写入属性 <code>self.required_sections</code> 为 <code>["analysis", "plan", "commands"]</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>进入 <code>__init__(self)</code>。</li><li>执行一次属性赋值：将 <code>self.required_sections</code> 设为字面量列表 <code>["analysis", "plan", "commands"]</code>。</li><li>函数结束，并隐式返回 <code>None</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def __init__(self):
+        self.required_sections = ["analysis", "plan", "commands"]</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>源码可直接观察到，<code>required_sections</code> 的内容采用硬编码字面量，并且顺序固定为 <code>analysis</code>、<code>plan</code>、<code>commands</code>。除此之外，给定代码未显式呈现其他可证实的设计取舍。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 对象构造路径（具体调用方未在给定源码中出现）</li><li><strong>核心被调用</strong>: 无：函数体中没有显式函数调用</li><li><strong>配置/状态来源</strong>: 无：未读取参数以外的任何配置或实例状态; 代码内字面量列表 <code>["analysis", "plan", "commands"]</code></li><li><strong>结果去向</strong>: 实例属性 <code>self.required_sections</code></li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_get_auto_fixes"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser._get_auto_fixes</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L171-L178" title="terminus_xml_plain_parser.py:171-178">terminus_xml_plain_parser.py:171–178 ↗</a></summary><div class="file-body"><p class="fn-sub">生成自动修复候选列表的辅助函数</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 parser 子系统内部辅助层，职责是把当前可用的自动修复项整理成返回值，而不直接执行修复。相较同 stage 中仅做初始化赋值的 <code>__init__</code>，这里同样保持极小职责范围：读取一个实例方法引用并构造固定列表。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_get_auto_fixes(self)</code> 不接收除 <code>self</code> 外的任何输入。函数体直接返回一个新列表，列表当前只有一个二元组：提示文本 <code>"Missing &lt;/response&gt; tag was automatically inserted"</code> 与方法引用 <code>self._fix_missing_response_tag</code>。该过程不写入任何实例状态，也没有外部副作用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self)</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 解析器实例，提供 <code>_fix_missing_response_tag</code> 方法引用</li><li>读状态: <code>self._fix_missing_response_tag</code></li><li>返回: 返回一个新列表，当前实现的精确内容为 <code>[("Missing &lt;/response&gt; tag was automatically inserted", self._fix_missing_response_tag)]</code>。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>进入函数后，不进行条件判断、循环或异常处理。</li><li>构造并返回一个列表字面量；该列表当前只包含一个二元组。</li><li>该二元组的第一个元素是固定说明字符串 <code>"Missing &lt;/response&gt; tag was automatically inserted"</code>。</li><li>该二元组的第二个元素是当前实例上的方法引用 <code>self._fix_missing_response_tag</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _get_auto_fixes(self):
+        """Return list of auto-fix functions to try in order."""
+        return [
+            (
+                "Missing &lt;/response&gt; tag was automatically inserted",
+                self._fix_missing_response_tag,
+            ),
+        ]</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>返回值采用“说明文本 + 修复函数”的二元组结构；这一点可由列表中的单个 tuple 直接定位到代码。</li><li>修复项被放在列表中而非单独返回函数引用，因此候选项的顺序由列表位置编码；当前实现中列表只有一个元素。</li><li>函数本身只负责暴露候选集合，不在此处调用 <code>self._fix_missing_response_tag</code>，从而把“列出候选项”和“执行修复”分离。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未知：该片段自身未显示调用方</li><li><strong>核心被调用</strong>: 无直接调用；仅返回方法引用 <code>self._fix_missing_response_tag</code> 而不执行它</li><li><strong>配置/状态来源</strong>: self._fix_missing_response_tag 方法属性; 函数体内硬编码字符串 <code>"Missing &lt;/response&gt; tag was automatically inserted"</code></li><li><strong>结果去向</strong>: 直接返回给本函数调用者; 返回值中的第二项携带 <code>self._fix_missing_response_tag</code> 供调用者后续使用</li><li><strong>同类 sibling</strong>: 与同 stage 的 <code>TerminusXMLPlainParser.__init__</code> 一样都很短小；<code>__init__</code> 只做实例字段初始化，而本函数只组装并返回固定候选列表。</li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_fix_missing_response_tag"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser._fix_missing_response_tag</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L187-L194" title="terminus_xml_plain_parser.py:187-194">terminus_xml_plain_parser.py:187–194 ↗</a></summary><div class="file-body"><p class="fn-sub">补齐 response 结束标签的窄修复器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该条目位于 parser 内部辅助函数集合中，职责是对一类非常具体的字符串错误进行本地修补。它与同阶段的 <code>__init__</code>、<code>_get_auto_fixes</code> 不同，不配置实例状态，也不组织修复列表；这里只根据传入的 <code>response</code> 与 <code>error</code> 计算返回值。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_fix_missing_response_tag(self, response, error)</code> 只检查 <code>error</code> 是否包含固定子串 <code>"Missing &lt;/response&gt; closing tag"</code>。若不包含，则原样返回 <code>response</code> 与 <code>False</code>；若包含，则返回 <code>response.rstrip() + "\n&lt;/response&gt;"</code> 与 <code>True</code>。函数不读取任何 <code>self</code> 属性，<code>self</code> 在函数体内实际未被使用，也没有副作用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, response: str, error: str) -&gt; tuple[str, bool]</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 实例引用；在该函数体内未被使用; <code>response</code>: <code>str</code> — 待处理的原始响应文本；在命中修复条件时作为拼接基础; <code>error</code>: <code>str</code> — 错误描述字符串；仅通过子串包含判断决定是否执行修复</li><li>返回: 二元组 <code>(str, bool)</code>：若 <code>error</code> 不含 <code>"Missing &lt;/response&gt; closing tag"</code>，返回 <code>(response, False)</code>；若包含，则返回 <code>(response.rstrip() + "\n&lt;/response&gt;", True)</code>。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先对参数 <code>error</code> 做一次子串包含判断：检查其中是否出现固定文本 <code>"Missing &lt;/response&gt; closing tag"</code>。</li><li>若判断失败，立即返回原始 <code>response</code> 与布尔值 <code>False</code>，表示本次未做任何修正。</li><li>若判断成立，先计算 <code>corrected = response.rstrip() + "\n&lt;/response&gt;"</code>，即去掉 <code>response</code> 末尾空白后补上一行关闭标签。</li><li>最后返回 <code>corrected</code> 与布尔值 <code>True</code>，把修正后的文本交还调用方。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _fix_missing_response_tag(self, response: str, error: str) -&gt; tuple[str, bool]:
+        """Fix missing &lt;/response&gt; closing tag by appending it."""
+        if "Missing &lt;/response&gt; closing tag" not in error:
+            return response, False
+
+        # Simply append &lt;/response&gt; at the end
+        corrected = response.rstrip() + "\n&lt;/response&gt;"
+        return corrected, True</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>修复触发条件被收窄为对 <code>error</code> 固定子串的精确包含判断，而不是对 <code>response</code> 内容做更宽松的猜测式修补；从代码可见，这一选择限制了函数只处理一种已知错误形态。</li><li>在补标签前先调用 <code>response.rstrip()</code>，说明实现刻意去除尾随空白后再追加 <code>"\n&lt;/response&gt;"</code>；这样可避免把关闭标签插在一串末尾空白之后。</li><li>返回值显式携带布尔标记 <code>True/False</code>，而不是仅返回字符串；从接口形状可见，调用方可以直接区分“未改动的原文返回”与“已生成修正文”。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 外部调用方可传入 <code>response</code> 与 <code>error</code> 请求一次缺失结束标签修复</li><li><strong>核心被调用</strong>: str.__contains__：用于判断 <code>error</code> 是否包含固定错误文本; str.rstrip：用于去除 <code>response</code> 末尾空白</li><li><strong>配置/状态来源</strong>: 无实例配置或 <code>self</code> 状态输入；全部判断依据均来自形参 <code>response</code> 与 <code>error</code></li><li><strong>结果去向</strong>: 返回给调用方一个 <code>(文本, 是否已修复)</code> 二元组</li><li><strong>同类 sibling</strong>: TerminusXMLPlainParser.__init__：只初始化 <code>self.required_sections</code>，而本函数完全不接触实例状态。; TerminusXMLPlainParser._get_auto_fixes：返回修复项列表；本函数本身只实现其中一个具体修复动作。</li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_combine_warnings"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser._combine_warnings</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L180-L185" title="terminus_xml_plain_parser.py:180-185">terminus_xml_plain_parser.py:180–185 ↗</a></summary><div class="file-body"><p class="fn-sub">警告文本拼接格式化助手</p>
+<blockquote><p><strong>stage 上下文</strong>: 该条目对应解析器内部的一个极小型字符串整理辅助函数。它本身不处理解析状态，只负责把一条新警告按固定格式并入已有警告文本。与同 stage 中直接返回固定列表或按条件修补字符串的兄弟函数一样，这里也不读取实例内部字段。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_combine_warnings(self, auto_warning, existing_warning)</code> 接收两段警告文本，返回一段新的组合结果。若 <code>existing_warning</code> 为真值，则返回 <code>f"- {auto_warning}\n{existing_warning}"</code>；若其为假值，则返回 <code>f"- {auto_warning}"</code>。函数不读取 <code>self</code> 上的任何属性，也不产生副作用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, auto_warning: str, existing_warning: str) -&gt; str</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 实例自身；在函数体内未被使用; <code>auto_warning</code>: <code>str</code> — 将被格式化为前导项目符号行的新警告文本; <code>existing_warning</code>: <code>str</code> — 已有警告文本；其真值性决定是否追加换行并保留原文本</li><li>返回: 返回组合后的警告字符串：<code>existing_warning</code> 为真值时插入一个前导 <code>- </code> 和一个换行后接上原文本；为假值时仅返回 <code>- {auto_warning}</code>。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先对参数 <code>existing_warning</code> 做真值判断。</li><li>若 <code>existing_warning</code> 为真值，则生成并返回 <code>f"- {auto_warning}\n{existing_warning}"</code>，即把新警告写成带 <code>- </code> 前缀的首行，并用一个换行连接旧文本。</li><li>若 <code>existing_warning</code> 为假值，则直接返回 <code>f"- {auto_warning}"</code>，不附加换行，也不拼接旧文本。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _combine_warnings(self, auto_warning: str, existing_warning: str) -&gt; str:
+        """Combine auto-correction warning with existing warnings."""
+        if existing_warning:
+            return f"- {auto_warning}\n{existing_warning}"
+        else:
+            return f"- {auto_warning}"</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>新警告始终放在返回字符串的最前面；这从两个分支都以 <code>- {auto_warning}</code> 起始可以直接看出，而不是把新内容追加到旧文本尾部。</li><li>只有在 <code>existing_warning</code> 为真值时才插入换行；这样可避免在没有可接续文本时产生多余的尾随分隔符。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未知；该函数源码片段未展示调用点</li><li><strong>核心被调用</strong>: 无；函数体未调用其他函数</li><li><strong>配置/状态来源</strong>: 参数 <code>auto_warning</code>; 参数 <code>existing_warning</code></li><li><strong>结果去向</strong>: 直接作为返回值交还给调用方; 返回结果内容取决于 <code>existing_warning</code> 的真值性分支</li><li><strong>同类 sibling</strong>: 同 stage 的 <code>__init__</code> 直接设置固定实例字段；本函数则完全不接触实例状态。; 同 stage 的 <code>_get_auto_fixes</code> 直接返回固定列表；本函数改为依据参数真值性返回两种字符串之一。; 同 stage 的 <code>_fix_missing_response_tag</code> 也是条件分支后返回字符串与布尔值；本函数同样是纯函数式返回，但只产出字符串。</li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_extract_response_content"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser._extract_response_content</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L225-L236" title="terminus_xml_plain_parser.py:225-236">terminus_xml_plain_parser.py:225–236 ↗</a></summary><div class="file-body"><p class="fn-sub">提取 response 包裹内容的字符串助手</p>
+<blockquote><p><strong>stage 上下文</strong>: 该条目位于 parser 内部辅助函数分组中，职责是对单个字符串做局部内容抽取。就函数体可见信息而言，它不依赖实例状态，也不像 XML 解析器那样解释结构；同组已知兄弟函数也多为这类短小、无副作用的字符串处理或修复助手。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_extract_response_content(self, response: str) -&gt; str</code> 在输入字符串 <code>response</code> 中查找字面量 <code>&lt;response&gt;</code> 与 <code>&lt;/response&gt;</code>，并返回两者之间、或从起始标签到字符串末尾的子串，再对结果执行 <code>.strip()</code>。若找不到起始标签，则直接返回空字符串 <code>""</code>。整个过程不读取任何 <code>self</code> 属性，也不写入状态或产生外部副作用。它使用普通字符串搜索与切片，而不是 XML 解析，因此不验证标签结构、嵌套或配对正确性。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, response: str) -&gt; str</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 实例自身；本函数体内未使用; <code>response</code>: <code>str</code> — 待搜索的输入字符串</li><li>返回: 返回字符串结果：若不存在 <code>"&lt;response&gt;"</code>，返回空字符串；若存在起始标签但不存在 <code>"&lt;/response&gt;"</code>，返回从起始标签之后到字符串末尾的切片并 <code>.strip()</code>；若两个标签都存在，返回两标签之间的切片并 <code>.strip()</code>。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先在 <code>response</code> 上用 <code>response.find("&lt;response&gt;")</code> 查找起始标签位置，结果保存到 <code>start_pos</code>。</li><li>若 <code>start_pos == -1</code>，说明输入中没有字面量 <code>&lt;response&gt;</code>，函数立即返回空字符串 <code>""</code>。</li><li>若找到起始标签，再从 <code>start_pos</code> 开始用 <code>response.find("&lt;/response&gt;", start_pos)</code> 查找结束标签位置，结果保存到 <code>end_pos</code>。</li><li>若 <code>end_pos == -1</code>，则截取 <code>response[start_pos + len("&lt;response&gt;") :]</code>，并对该子串调用 <code>.strip()</code> 后返回。</li><li>若结束标签存在，则截取 <code>response[start_pos + len("&lt;response&gt;") : end_pos]</code>，并对该子串调用 <code>.strip()</code> 后返回。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _extract_response_content(self, response: str) -&gt; str:
+        """Extract content from &lt;response&gt; tags."""
+        start_pos = response.find("&lt;response&gt;")
+        if start_pos == -1:
+            return ""
+
+        end_pos = response.find("&lt;/response&gt;", start_pos)
+        if end_pos == -1:
+            # Missing closing tag - return content from opening tag to end
+            return response[start_pos + len("&lt;response&gt;") :].strip()
+
+        return response[start_pos + len("&lt;response&gt;") : end_pos].strip()</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>实现选择了 <code>str.find</code> 与切片，而非 XML 解析 API；这样可在极简成本下完成固定标签的内容提取，但相应地不会校验标签是否合法、不会处理嵌套，也不做标签平衡判断。</li><li>函数把缺失结束标签视为可接受情形：当 <code>end_pos == -1</code> 时仍返回从起始标签后到字符串末尾的内容，而不是报错或返回空值。这体现出对不完整文本输入的容忍策略。</li><li>两条成功返回路径都统一执行 <code>.strip()</code>，说明该函数有意去除提取片段首尾空白，使调用方获得规整化文本，而不是保留原始边界空格与换行。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未在本函数源码中直接体现具体调用者; 任何需要从普通字符串中抽取 <code>&lt;response&gt;...&lt;/response&gt;</code> 包裹内容的同类内部逻辑</li><li><strong>核心被调用</strong>: response.find; len; str.strip</li><li><strong>配置/状态来源</strong>: 无配置来源；行为仅由字面量标签 <code>"&lt;response&gt;"</code> 与 <code>"&lt;/response&gt;"</code> 决定</li><li><strong>结果去向</strong>: 返回给直接调用方作为提取后的纯字符串内容; 在未找到起始标签时向调用方提供空字符串哨兵值; 在缺失结束标签时向调用方提供宽容截取后的字符串结果</li><li><strong>同类 sibling</strong>: TerminusXMLPlainParser.__init__：同样是短小实现，但该函数只初始化 <code>required_sections</code>，而本函数只做字符串提取。; TerminusXMLPlainParser._fix_missing_response_tag：两者都围绕 <code>response</code> 标签文本处理；该兄弟负责修补缺失结束标签，本函数则在缺失结束标签时直接截到末尾。; TerminusXMLPlainParser._combine_warnings：同属无状态、无副作用的纯字符串加工助手。</li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_find_top_level_tags"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser._find_top_level_tags</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L393-L440" title="terminus_xml_plain_parser.py:393-440">terminus_xml_plain_parser.py:393–440 ↗</a></summary><div class="file-body"><p class="fn-sub">扫描字符串顶层标签名的辅助函数</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数属于解析子系统内部辅助例程，职责仅限于对给定字符串做局部标签扫描并产出标签名列表。它与同组里 <code>_extract_response_content</code> 这类字符串级辅助函数相似，都不依赖实例状态；相比 <code>_combine_warnings</code> 之类纯拼接逻辑，本函数额外维护一个局部 <code>depth</code> 计数来区分当前是否处于零层级。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_find_top_level_tags(self, content: str) -&gt; List[str]</code> 顺序扫描输入字符串 <code>content</code>，收集所有在当前扫描深度 <code>depth == 0</code> 时遇到的、非闭合标签的标签名，并按出现顺序返回。它跳过标签内容以 <code>!</code> 或 <code>?</code> 开头的片段，遇到闭合标签时只做 <code>depth -= 1</code>，遇到找不到配对 <code>&gt;</code> 的起始 <code>&lt;</code> 时直接停止扫描。函数不读取任何 <code>self</code> 属性，也不写入实例或外部状态。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, content: str) -&gt; List[str]</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 实例自身；在函数体内未被读取; <code>content</code>: <code>str</code> — 被逐字符扫描的输入字符串，标签发现与层级判断均基于它</li><li>返回: 返回 <code>List[str]</code>：扫描过程中在 <code>depth == 0</code> 时遇到的非闭合标签名，保持原始出现顺序。标签名提取规则是：若标签内容含空格则取 <code>split()[0]</code>，否则取整个标签内容；之后若结果以 <code>/</code> 结尾再去掉该尾随 <code>/</code>。由于闭合标签会无条件令 <code>depth</code> 减一，畸形输入可能使 <code>depth</code> 变成负数，从而影响后续哪些标签会被计为“顶层”。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>初始化局部列表 <code>top_level_tags = []</code>、层级计数 <code>depth = 0</code> 和扫描下标 <code>i = 0</code>，随后用 <code>while i &lt; len(content)</code> 逐字符推进整个字符串。</li><li>当 <code>content[i]</code> 不是 <code>&lt;</code> 时，仅把 <code>i</code> 加一并继续；当遇到 <code>&lt;</code> 时，用 <code>content.find("&gt;", i)</code> 查找本次标签的结束位置。若未找到 <code>&gt;</code>（得到 <code>-1</code>），立即 <code>break</code>，后续内容不再处理。</li><li>取出 <code>tag_content = content[i + 1 : tag_end]</code> 作为尖括号内文本。若它以 <code>!</code> 或 <code>?</code> 开头，则直接把 <code>i</code> 移到 <code>tag_end + 1</code> 并跳过，不参与层级与结果列表处理。</li><li>若 <code>tag_content</code> 以 <code>/</code> 开头，则把它视为闭合标签，只执行 <code>depth -= 1</code>，然后把 <code>i</code> 移到 <code>tag_end + 1</code> 继续；这里不校验名称是否匹配，也不阻止 <code>depth</code> 变成负数。</li><li>对于其余标签，先用 <code>tag_content.endswith("/")</code> 判断是否为自闭合标签，再按“有空格取首词，否则取整体”的规则得到 <code>tag_name</code>；若 <code>tag_name</code> 末尾仍有 <code>/</code>，再去掉这个尾随字符。</li><li>在任何深度调整之前，先检查当前 <code>depth == 0</code>；若成立，就把 <code>tag_name</code> 追加进 <code>top_level_tags</code>。之后仅当该标签不是自闭合时才执行 <code>depth += 1</code>，最后把 <code>i</code> 移到 <code>tag_end + 1</code>。</li><li>循环结束后返回 <code>top_level_tags</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _find_top_level_tags(self, content: str) -&gt; List[str]:
+        """Find all top-level XML tags (direct children of response), not
+        nested tags."""
+        top_level_tags = []
+        depth = 0
+        i = 0
+
+        while i &lt; len(content):
+            if content[i] == "&lt;":
+                # Find the end of this tag
+                tag_end = content.find("&gt;", i)
+                if tag_end == -1:
+                    break
+
+                tag_content = content[i + 1 : tag_end]
+
+                # Skip comments, CDATA, etc.
+                if tag_content.startswith("!") or tag_content.startswith("?"):
+                    i = tag_end + 1
+                    continue
+
+                # Check if this is a closing tag
+                if tag_content.startswith("/"):
+                    depth -= 1
+                    i = tag_end + 1
+                    continue
+
+                # Check if this is a self-closing tag
+                is_self_closing = tag_content.endswith("/")
+
+                # Extract tag name (first word)
+                tag_name = tag_content.split()[0] if " " in tag_content else tag_content
+                if tag_name.endswith("/"):
+                    tag_name = tag_name[:-1]
+
+                # If we're at depth 0, this is a top-level tag
+                if depth == 0:
+                    top_level_tags.append(tag_name)
+
+                # Adjust depth for opening tags (but not self-closing)
+                if not is_self_closing:
+                    depth += 1
+
+                i = tag_end + 1
+            else:
+                i += 1
+
+        return top_level_tags</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>该实现采用字符串扫描与局部层级计数，而不是正式 XML 解析器：代码只依赖 <code>&lt;</code>、<code>&gt;</code>、前导 <code>/</code> 与尾随 <code>/</code> 等表面标记即可工作，因此实现短小，但也只提供语法层面的近似判断。</li><li>对以 <code>!</code> 或 <code>?</code> 开头的标签内容采取整段跳过策略，这是代码里唯一显式排除的特殊标签类别；它不再细分这些内容的内部结构，取舍点是简化处理分支。</li><li>“是否记为顶层”发生在打开标签的 <code>depth += 1</code> 之前，因此某个非闭合标签会以其进入前的层级来分类；这保证了零层级处的开始标签会被记录，而其内部嵌套内容不会因随后增深而倒置判断。</li><li>闭合标签路径只做 <code>depth -= 1</code> 而不验证合法性，意味着不匹配或多余的闭合标签会把 <code>depth</code> 拉成负数；该取舍降低了容错处理复杂度，但后续顶层判定会受此状态偏移影响。</li><li>遇到没有后续 <code>&gt;</code> 的 <code>&lt;</code> 时直接终止扫描，而不是把它当普通字符继续搜索；这一策略避免在不完整标签后继续做可能失真的解析。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未在给定源码片段中展示调用方; 外部调用关系无法仅凭此函数体确定</li><li><strong>核心被调用</strong>: 字符串方法 <code>content.find("&gt;", i)</code>：定位当前标签结束位置; 字符串方法 <code>tag_content.startswith("!")</code>：跳过前导 <code>!</code> 的标签片段; 字符串方法 <code>tag_content.startswith("?")</code>：跳过前导 <code>?</code> 的标签片段; 字符串方法 <code>tag_content.startswith("/")</code>：识别闭合标签; 字符串方法 <code>tag_content.endswith("/")</code>：识别自闭合标签; 字符串方法 <code>tag_content.split()</code>：在存在空格时提取首词作为标签名; 列表方法 <code>top_level_tags.append(tag_name)</code>：记录零深度遇到的标签名</li><li><strong>配置/状态来源</strong>: 无：函数体不读取任何 <code>self</code> 属性; 无：函数体不访问任何 register 或外部配置</li><li><strong>结果去向</strong>: 返回给直接调用者的 <code>List[str]</code> 结果; 结果仅通过返回值对外暴露，不写入实例状态</li><li><strong>同类 sibling</strong>: 同组的 <code>TerminusXMLPlainParser._extract_response_content</code> 也是纯字符串处理辅助函数，但它做固定边界切片；本函数则做逐字符扫描与层级分类。; 同组的 <code>TerminusXMLPlainParser._combine_warnings</code> 只组合文本，不维护扫描状态；本函数通过局部变量 <code>depth</code> 表达嵌套层级。</li></ul></div></details><details class="file" id="fn-terminusjsonplainparser_init"><summary><span class="chev"></span><code class="fpath">TerminusJSONPlainParser.__init__</code><a class="fn-range" href="../code/terminus_json_plain_parser.py.html#L26-L27" title="terminus_json_plain_parser.py:26-27">terminus_json_plain_parser.py:26–27 ↗</a></summary><div class="file-body"><p class="fn-sub">JSON/plain 解析器构造初始化</p>
+<blockquote><p><strong>stage 上下文</strong>: 该条目对应解析器内部辅助类的构造函数。就源码可见事实而言，它仅在实例初始化时写入一项实例属性；未展示任何进一步解析逻辑，也未与同 stage 其他辅助函数发生可见交互。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>__init__(self) 只接收实例自身 <code>self</code>。函数体将 <code>self.required_fields</code> 直接赋值为一个新的列表字面量 <code>["analysis", "plan", "commands"]</code>，随后隐式返回 <code>None</code>。除这次属性写入外，源码中没有其他状态读取、函数调用或外部副作用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self)</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 当前解析器实例</li><li>返回: 隐式返回 None；实际产出是把 <code>self.required_fields</code> 设为新的列表字面量</li><li>副作用: 写入 <code>self.required_fields</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>接收参数 <code>self</code>，不读取其他输入。</li><li>将 <code>self.required_fields</code> 赋值为新列表 <code>["analysis", "plan", "commands"]</code>。</li><li>函数结束并隐式返回 <code>None</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def __init__(self):
+        self.required_fields = ["analysis", "plan", "commands"]</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>构造时直接使用硬编码列表字面量，而不是从参数或其他状态推导其值。</li><li>赋值采用覆盖写入 <code>self.required_fields</code> 的方式；每次调用都会放入一个新的列表对象。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 源码片段未展示</li><li><strong>核心被调用</strong>: 无</li><li><strong>配置/状态来源</strong>: 无；仅使用函数体内列表字面量</li><li><strong>结果去向</strong>: <code>self.required_fields</code></li></ul></div></details><details class="file" id="fn-terminusjsonplainparser_get_auto_fixes"><summary><span class="chev"></span><code class="fpath">TerminusJSONPlainParser._get_auto_fixes</code><a class="fn-range" href="../code/terminus_json_plain_parser.py.html#L305-L313" title="terminus_json_plain_parser.py:305-313">terminus_json_plain_parser.py:305–313 ↗</a></summary><div class="file-body"><p class="fn-sub">JSON 解析器的自动修复表构造器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数属于 parser 子系统内部辅助逻辑，职责是在 JSON/plain 解析失败后的修复阶段提供候选策略表。它本身不执行修复，只把可尝试的修复器按顺序组织出来。与同 stage 中 XML 版本的 <code>_get_auto_fixes</code> 相对应，这里返回的是 JSON/plain 专用的两条修复项。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_get_auto_fixes(self)</code> 接收 <code>TerminusJSONPlainParser</code> 实例自身 <code>self</code>，返回一个新的列表字面量。列表中固定包含两个二元组：说明文本与对应的绑定方法引用，分别是 <code>self._fix_incomplete_json</code> 和 <code>self._fix_mixed_content</code>。函数体内不调用这些方法，也不写入任何实例状态或外部状态。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self)</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 当前 <code>TerminusJSONPlainParser</code> 实例；用于读取修复器方法属性并生成返回表</li><li>读状态: <code>self._fix_incomplete_json</code>, <code>self._fix_mixed_content</code></li><li>返回: 返回一个新列表，包含两个 <code>(description, fixer_callable)</code> 二元组：<code>("Fixed incomplete JSON by adding missing closing brace", self._fix_incomplete_json)</code> 与 <code>("Extracted JSON from mixed content", self._fix_mixed_content)</code>；其中 callable 以绑定方法引用形式返回，未在本函数内执行。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>构造并准备返回一个新的列表字面量，作为自动修复策略表。</li><li>在第一个元素中放入说明文本 <code>"Fixed incomplete JSON by adding missing closing brace"</code>，并通过属性读取取得绑定方法引用 <code>self._fix_incomplete_json</code>；该方法在此处仅被返回，不被调用。</li><li>在第二个元素中放入说明文本 <code>"Extracted JSON from mixed content"</code>，并通过属性读取取得绑定方法引用 <code>self._fix_mixed_content</code>；同样仅返回引用，不在此处执行。</li><li>将上述两项按源码中的既定顺序整体返回。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _get_auto_fixes(self):
+        """Return list of auto-fix functions to try in order."""
+        return [
+            (
+                "Fixed incomplete JSON by adding missing closing brace",
+                self._fix_incomplete_json,
+            ),
+            ("Extracted JSON from mixed content", self._fix_mixed_content),
+        ]</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数把“说明文本 + 修复器”成对返回，而不是只返回 callable，这一设计使每个修复策略都自带可读诊断标签；这一点可直接从两个二元组的结构看出。</li><li>返回顺序被硬编码在列表字面量中，说明策略次序是显式的解析器政策，而不是无序集合或动态发现结果。</li><li>源码使用 <code>return [ ... ]</code> 直接返回列表字面量，意味着每次调用都会产生一个新的列表容器，而不是复用先前保存的列表对象。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: TerminusJSONPlainParser.parse_response</li><li><strong>核心被调用</strong>: self._fix_incomplete_json（作为返回的绑定方法引用读取，不在此处调用）; self._fix_mixed_content（作为返回的绑定方法引用读取，不在此处调用）</li><li><strong>配置/状态来源</strong>: 无外部配置输入; <code>self._fix_incomplete_json</code> 属性查找; <code>self._fix_mixed_content</code> 属性查找</li><li><strong>结果去向</strong>: 返回给 <code>TerminusJSONPlainParser.parse_response</code>; 作为后续自动修复尝试的候选策略表; 为每个修复器提供对应的人类可读说明文本</li><li><strong>同类 sibling</strong>: 与 <code>TerminusXMLPlainParser._get_auto_fixes</code> 同属“返回有序自动修复表”的兄弟函数，但该函数返回的是 JSON/plain 路径下的两条修复项。; 与 <code>TerminusJSONPlainParser.__init__</code> 相比，本函数不设置 <code>self.required_fields</code> 一类实例字段，只读取两个方法属性来组装返回值。</li></ul></div></details><details class="file" id="fn-terminusjsonplainparser_fix_incomplete_json"><summary><span class="chev"></span><code class="fpath">TerminusJSONPlainParser._fix_incomplete_json</code><a class="fn-range" href="../code/terminus_json_plain_parser.py.html#L315-L328" title="terminus_json_plain_parser.py:315-328">terminus_json_plain_parser.py:315–328 ↗</a></summary><div class="file-body"><p class="fn-sub">JSON 截断响应的局部补全助手</p>
+<blockquote><p><strong>stage 上下文</strong>: 该单元位于 parser 内部辅助层，职责仅限于对单次 JSON 修复尝试做局部判断与改写。就源码可见事实而言，它不访问解析器实例状态，只基于 <code>response</code> 与 <code>error</code> 两个入参决定是否补上缺失的 <code>}</code>。与同 stage 中若干兄弟函数一致，这里也采用“返回修复后文本与是否修复成功”的纯函数式接口，不在函数内持久化任何状态。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_fix_incomplete_json(self, response: str, error: str) -&gt; tuple[str, bool]</code> 检查错误文本 <code>error</code> 是否包含四类固定提示之一：<code>"Invalid JSON"</code>、<code>"Expecting"</code>、<code>"Unterminated"</code>、<code>"No valid JSON found"</code>。只有在这些条件之一成立，且 <code>response.count("{") - response.count("}")</code> 大于 0 时，函数才会在原始 <code>response</code> 末尾追加对应数量的右花括号 <code>}</code>，并返回 <code>(fixed, True)</code>；其余情况都原样返回 <code>(response, False)</code>。函数不读取任何 <code>self</code> 属性，也没有实例状态或外部副作用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, response: str, error: str) -&gt; tuple[str, bool]</code></p>
+<ul><li>参数: <code>self</code>: <code>TerminusJSONPlainParser</code> — 实例自身；在该函数体内未被读取; <code>response</code>: <code>str</code> — 待检查并可能补全的原始响应字符串; <code>error</code>: <code>str</code> — 上游提供的错误描述文本，用于决定是否进入补全分支</li><li>返回: 返回二元组 <code>(文本, 是否已修复)</code>：仅当 <code>error</code> 含四个支持子串之一，且 <code>response.count('{') - response.count('}') &gt; 0</code> 时，返回在原字符串末尾补足 <code>}</code> 后的新字符串与 <code>True</code>；否则返回原始 <code>response</code> 与 <code>False</code>。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先对入参 <code>error</code> 做四个固定子串的包含判断：<code>"Invalid JSON"</code>、<code>"Expecting"</code>、<code>"Unterminated"</code>、<code>"No valid JSON found"</code>；若全部不匹配，则直接走到底部返回 <code>(response, False)</code>。</li><li>只有在上述错误门槛命中时，才计算 <code>brace_count = response.count("{") - response.count("}")</code>，即当前文本中未闭合左花括号的净数量。</li><li>若 <code>brace_count &gt; 0</code>，则构造 <code>fixed = response + "}" * brace_count</code>，把同样数量的右花括号追加到字符串末尾，并立即返回 <code>(fixed, True)</code>。</li><li>若错误门槛虽然命中，但 <code>brace_count &lt;= 0</code>，函数不会做任何修改，最终仍返回 <code>(response, False)</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _fix_incomplete_json(self, response: str, error: str) -&gt; tuple[str, bool]:
+        """Fix incomplete JSON by adding missing closing braces."""
+        if (
+            "Invalid JSON" in error
+            or "Expecting" in error
+            or "Unterminated" in error
+            or "No valid JSON found" in error
+        ):
+            # Try adding closing braces
+            brace_count = response.count("{") - response.count("}")
+            if brace_count &gt; 0:
+                fixed = response + "}" * brace_count
+                return fixed, True
+        return response, False</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>代码把修复尝试严格限制在四种错误文本模式之内，而不是对所有解析失败都补花括号；这一约束直接体现在开头的 <code>if (... in error or ...)</code> 条件上。</li><li>即使错误文本命中，函数也只有在 <code>response</code> 中左花括号数量多于右花括号数量时才改写输出；这表明“错误提示匹配”只是必要条件，不是充分条件。</li><li>修复范围只涉及花括号平衡：源码只统计 <code>{</code> 与 <code>}</code>，并仅追加 <code>}</code>，不尝试补引号、方括号、逗号或其他 JSON 结构。相较更宽泛的改写，这里的行为边界更容易从返回条件直接判定。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未在该源码片段中显式出现</li><li><strong>核心被调用</strong>: error.__contains__（通过 <code>"..." in error</code> 触发的字符串包含判断）; response.count; str.__mul__（<code>"}" * brace_count</code>）; str.__add__（<code>response + ...</code>）</li><li><strong>配置/状态来源</strong>: 参数 <code>response</code>; 参数 <code>error</code></li><li><strong>结果去向</strong>: 返回给本函数的直接调用方，形式为 <code>(possibly_fixed_response, did_fix)</code></li><li><strong>同类 sibling</strong>: 同为 <code>TerminusJSONPlainParser</code> 的内部辅助函数；与已翻译的 <code>__init__</code>、<code>_get_auto_fixes</code> 一样，本函数本体不修改解析器持久状态。</li></ul></div></details><details class="file" id="fn-terminusjsonplainparser_combine_warnings"><summary><span class="chev"></span><code class="fpath">TerminusJSONPlainParser._combine_warnings</code><a class="fn-range" href="../code/terminus_json_plain_parser.py.html#L345-L350" title="terminus_json_plain_parser.py:345-350">terminus_json_plain_parser.py:345–350 ↗</a></summary><div class="file-body"><p class="fn-sub">警告文本拼接格式化辅助函数</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数在本 stage 中承担极小粒度的字符串组合职责：把 <code>auto_warning</code> 按固定项目符号格式并入 <code>existing_warning</code>。从函数体可见，它只做一次对 <code>existing_warning</code> 真值性的分支判断，不读取任何解析器实例状态。与同类辅助函数一致，这里返回新字符串而非修改对象内部字段。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_combine_warnings(self, auto_warning, existing_warning)</code> 接收两段字符串输入，并返回一段新的警告文本。若 <code>existing_warning</code> 为真值，返回值精确为 <code>"- {auto_warning}\n{existing_warning}"</code>；若其为假值，返回值精确为 <code>"- {auto_warning}"</code>。函数体不读取 <code>self</code> 上的任何属性，也不写入实例或外部状态。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, auto_warning: str, existing_warning: str) -&gt; str</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 实例自身；在函数体内未被读取; <code>auto_warning</code>: <code>str</code> — 将被格式化为前导 <code>- </code> 项的警告文本; <code>existing_warning</code>: <code>str</code> — 用于真值判断；若为真值则作为后续文本原样拼接</li><li>返回: 返回一个新构造的警告字符串：要么是仅含 <code>- {auto_warning}</code> 的单行文本，要么是在其后追加换行和 <code>existing_warning</code> 的两段文本。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>接收 <code>auto_warning</code> 与 <code>existing_warning</code> 两个参数，并进入 <code>if existing_warning</code> 的真值判断分支。</li><li>当 <code>existing_warning</code> 为真值时，返回格式为 <code>- {auto_warning}</code> 开头、后接换行与 <code>existing_warning</code> 原文的新字符串。</li><li>当 <code>existing_warning</code> 为假值时，返回只包含 <code>- {auto_warning}</code> 的新字符串，不追加换行或其他内容。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _combine_warnings(self, auto_warning: str, existing_warning: str) -&gt; str:
+        """Combine auto-correction warning with existing warnings."""
+        if existing_warning:
+            return f"- {auto_warning}\n{existing_warning}"
+        else:
+            return f"- {auto_warning}"</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>分支条件使用的是 <code>if existing_warning</code> 真值判断，而不是显式比较空字符串；可观察结果是所有假值输入都会走同一路径。</li><li>当存在 <code>existing_warning</code> 时，函数把新条目放在返回字符串的第一行，且对 <code>existing_warning</code> 不做重新加前缀、拆行或标准化处理，只是原样接在换行之后。</li><li>函数通过直接返回格式化结果完成工作，不在 <code>self</code> 上缓存中间结果；其直接后果是调用方若需保留组合后的文本，必须接收返回值。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未在给定源码片段中出现; 需由外层调用方传入 <code>auto_warning</code> 与 <code>existing_warning</code></li><li><strong>核心被调用</strong>: 无显式函数调用; 仅使用 f-string 构造返回字符串</li><li><strong>配置/状态来源</strong>: 参数 <code>auto_warning</code>; 参数 <code>existing_warning</code></li><li><strong>结果去向</strong>: 直接作为函数返回值返回给调用方; 返回结果内容完全由两个入参决定</li><li><strong>同类 sibling</strong>: 同 stage 的 <code>TerminusXMLPlainParser._combine_warnings</code> 采用相同的二分支返回结构：有现有文本时前置新条目并追加换行，否则只返回单条项目符号文本。</li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_salvage_truncated_response"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser.salvage_truncated_response</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L528-L580" title="terminus_xml_plain_parser.py:528-580">terminus_xml_plain_parser.py:528–580 ↗</a></summary><div class="file-body"><p class="fn-sub">截断回复的保守式补救判定器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该条目位于 parser 内部辅助层，源码只体现它对一段 <code>truncated_response</code> 做一次最佳努力的补救判定。它先从字符串中寻找完整的 <code>&lt;/commands&gt;</code> 与后续 <code>&lt;/response&gt;</code> 边界，再把截出的片段交给 <code>self.parse_response(clean_response)</code> 复验；若结构不完整、复验报错、出现特定多块警告，或解析抛出异常，则直接放弃补救。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>salvage_truncated_response</code> 接收一段可能被截断的响应文本 <code>truncated_response</code>，尝试从中截出一个以 <code>&lt;/response&gt;</code> 结束的完整片段，并判断该片段是否可作为有效回复返回。它依赖 <code>self.parse_response(clean_response)</code> 的结果对象中的 <code>warning</code> 与 <code>error</code> 字段来决定输出。返回值是 <code>(salvaged_response, has_multiple_blocks)</code>：成功时返回清理后的字符串与 <code>False</code>，失败时返回 <code>None</code>，并在识别出特定“只能一次发一个块”的警告时把第二项置为 <code>True</code>。函数本身不写入实例状态，也无外部副作用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, truncated_response: str) -&gt; tuple[str | None, bool]</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 解析器实例；函数通过 <code>self.parse_response(clean_response)</code> 复验截出的片段，并依据返回对象的 <code>warning</code>/<code>error</code> 字段决定是否补救成功; <code>truncated_response</code>: <code>str</code> — 可能被截断的原始回复文本，作为字符串搜索与切片的输入</li><li>读状态: <code>可调用成员 </code>self.parse_response`<code>, </code><code>self.parse_response(clean_response)</code> 返回对象的 <code>warning</code> 字段<code>, </code><code>self.parse_response(clean_response)</code> 返回对象的 <code>error</code> 字段`</li><li>返回: 返回二元组 <code>(salvaged_response, has_multiple_blocks)</code>。当文本中能找到 <code>&lt;/commands&gt;</code> 与其后的 <code>&lt;/response&gt;</code>，且 <code>self.parse_response(clean_response)</code> 未给出 <code>error</code>、也未触发特定多块警告时，返回 <code>(clean_response, False)</code>；其余情况下返回 <code>(None, has_multiple_blocks_or_False)</code>。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先在 <code>truncated_response</code> 中查找 <code>"&lt;/commands&gt;"</code>；若 <code>commands_end == -1</code>，立即返回 <code>(None, False)</code>，不再尝试后续补救。</li><li>若找到 <code>&lt;/commands&gt;</code>，再从该位置之后查找 <code>"&lt;/response&gt;"</code>；若 <code>response_end == -1</code>，同样立即返回 <code>(None, False)</code>。</li><li>当两个闭合标签都存在时，以 <code>response_end + len("&lt;/response&gt;")</code> 为边界切出 <code>clean_response</code>，即只保留到完整 <code>&lt;/response&gt;</code> 结束的前缀。</li><li>在 <code>try</code> 块内调用 <code>self.parse_response(clean_response)</code> 得到 <code>parse_result</code>，随后把 <code>has_multiple_blocks</code> 初始化为 <code>False</code>。</li><li>若 <code>parse_result.warning</code> 为真值，则先转成小写 <code>warning_lower</code>，并仅在同时包含 <code>"only issue one"</code> 与 <code>"block at a time"</code> 这两个子串时，把 <code>has_multiple_blocks</code> 设为 <code>True</code>。</li><li>若 <code>parse_result.error</code> 为假值且 <code>has_multiple_blocks</code> 仍为 <code>False</code>，则把当前 <code>clean_response</code> 视为可用结果，返回 <code>(clean_response, False)</code>。</li><li>否则，若存在解析错误或识别出多块警告，则放弃补救，返回 <code>(None, has_multiple_blocks)</code>。</li><li>若 <code>self.parse_response(clean_response)</code> 或后续字段访问在 <code>try</code> 中抛出任意异常，<code>except Exception</code> 会统一吞掉异常并返回 <code>(None, False)</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def salvage_truncated_response(
+        self, truncated_response: str
+    ) -&gt; tuple[str | None, bool]:
+        """
+        Try to salvage a valid response from truncated output.
+
+        Args:
+            truncated_response: The truncated response from the LLM
+
+        Returns:
+            Tuple of (salvaged_response, has_multiple_blocks)
+            - salvaged_response: Clean response up to &lt;/response&gt; if salvageable, "
+                "None otherwise
+            - has_multiple_blocks: True if multiple response/commands blocks "
+                "were detected
+        """
+        # Check if we can find a complete response structure
+        commands_end = truncated_response.find("&lt;/commands&gt;")
+        if commands_end == -1:
+            return None, False
+
+        # Find the &lt;/response&gt; tag after &lt;/commands&gt;
+        response_end = truncated_response.find("&lt;/response&gt;", commands_end)
+        if response_end == -1:
+            return None, False
+
+        # We have a complete response up to at least &lt;/commands&gt;
+        # Truncate cleanly at &lt;/response&gt;
+        clean_response = truncated_response[: response_end + len("&lt;/response&gt;")]
+
+        # Check if this is a valid response with no critical issues
+        try:
+            parse_result = self.parse_response(clean_response)
+
+            # Check if there are no errors and no "multiple blocks" warnings
+            has_multiple_blocks = False
+            if parse_result.warning:
+                warning_lower = parse_result.warning.lower()
+                has_multiple_blocks = (
+                    "only issue one" in warning_lower
+                    and "block at a time" in warning_lower
+                )
+
+            if not parse_result.error and not has_multiple_blocks:
+                # Valid response! Return the clean truncated version
+                return clean_response, False
+            else:
+                # Has errors or multiple blocks
+                return None, has_multiple_blocks
+
+        except Exception:
+            # If parsing fails, not salvageable
+            return None, False</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数把“是否值得尝试补救”前置为两个显式闭合标签检查：缺少 <code>&lt;/commands&gt;</code> 或缺少其后的 <code>&lt;/response&gt;</code> 时直接失败。这意味着它只接受源码中可定位到完整结束边界的片段，不对更模糊的不完整文本做猜测性修复。</li><li>即使已经通过字符串搜索得到 <code>clean_response</code>，代码仍强制再走一次 <code>self.parse_response(clean_response)</code>。这里的取舍是：闭合标签齐全并不足以证明内容有效，真正的通过条件还取决于 <code>parse_result.error</code> 为空且未触发特定警告。</li><li>多块判定并不是把任意 <code>warning</code> 都视为失败，而是只匹配小写化后同时含有 <code>"only issue one"</code> 与 <code>"block at a time"</code> 的警告文本。这个选择把失败条件收窄到一个特定告警模式，其它警告不会单独导致 <code>has_multiple_blocks=True</code>。</li><li>成功返回时固定输出 <code>(clean_response, False)</code>，即便此前计算过 <code>has_multiple_blocks</code> 变量；只有在失败分支中才可能把第二项作为 <code>True</code> 返回。代码由此把“补救成功”与“检测到多块”设为互斥结果。</li><li>异常处理采用宽泛的 <code>except Exception</code> 并统一降级为 <code>(None, False)</code>。直接后果是：任何解析器异常都会被当作“不可补救”而非继续传播，从接口上维持一个纯返回值式的失败信号。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 源码片段未提供，无法从该函数体直接确认调用方</li><li><strong>核心被调用</strong>: <code>self.parse_response(clean_response)</code>; <code>truncated_response.find("&lt;/commands&gt;")</code>; <code>truncated_response.find("&lt;/response&gt;", commands_end)</code>; <code>parse_result.warning.lower()</code></li><li><strong>配置/状态来源</strong>: <code>truncated_response</code> 的字符串内容决定两个闭合标签是否存在以及 <code>clean_response</code> 的截断边界; <code>self.parse_response</code> 的可调用行为决定复验是否成功或是否抛出异常; <code>parse_result.warning</code> 的文本内容决定是否把结果标记为多块; <code>parse_result.error</code> 的真值决定是否接受 <code>clean_response</code></li><li><strong>结果去向</strong>: 直接作为本函数返回值输出给其调用者：<code>(clean_response, False)</code>; 直接作为本函数返回值输出给其调用者：<code>(None, False)</code>; 直接作为本函数返回值输出给其调用者：<code>(None, True)</code></li></ul></div></details><nav class="pn"><a class="pn-prev" href="stage-4.8.html"><span>← 上一阶段</span><strong>完成门控与循环控制</strong></a><a class="pn-next" href="stage-5.html"><span>下一阶段 →</span><strong>运行收尾</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

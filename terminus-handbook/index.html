@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terminus 2 Handbook</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<span class="topbar__brand"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus&nbsp;2&nbsp;Handbook</span></span>
+<nav class="topbar__nav">
+<div class="seg" id="lang-seg" role="tablist" aria-label="Language">
+<button data-lang="zh">中文</button>
+<button data-lang="en">EN</button>
+</div>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="landing"><section class="lang-sec" data-lang="zh" hidden>
+<div class="hero">
+<p class="hero__kicker">Handbook Studio · 终端智能体</p>
+<h1>Terminus 2 手册</h1>
+<p class="hero-sub">
+<span class="stat"><strong>20</strong> 个阶段</span>
+<span class="dot">·</span>
+<span class="stat"><strong>107</strong> 个函数已成文</span>
+<span class="dot">·</span>
+<span class="stat"><strong>10</strong> 个寄存器</span>
+<span class="dot">·</span>
+<a href="zh/registers.html">状态流寄存器 →</a>
+</p>
+</div>
+<details class="overview" open><summary><span class="chev"></span>系统总览</summary>
+<div class="overview-body"><h4>1. 一段系统总览</h4>
+<p>Terminus 2 是一个让大语言模型直接操作终端完成任务的 Agent（会自己反复观察、决定、执行的小系统）。它的作用是把“本来需要人一步步在终端里手动做”的事，交给模型自动完成。你可以把它理解成一个会远程操控终端的助手：它先看终端现在是什么样，收集任务信息和前面发生过的关键信息，再去问 LLM（大语言模型）下一步该做什么；如果模型说要敲命令，它就把命令发到 tmux session（可远程发命令的终端）里，等结果回来，再继续看。这个循环会一直重复，直到任务被明确确认做完、达到轮数上限，或运行被中断。整套系统的骨架很简单：准备环境、反复“看→想→敲→读→记”、结束时收尾并保存记录。</p>
+<h4>2. 两张 ASCII 小图</h4>
+<h5>图 A · 生命周期</h5>
+<pre><code>[初始化配置]
+      |
+      v
+[准备终端和环境]
+      |
+      v
+[run 主循环：反复看→想→敲]
+      |
+      v
+[结束收尾并保存记录]</code></pre>
+<h5>图 B · 一次迭代做什么</h5>
+<pre><code>[看终端]
+   |
+   v
+[收集任务信息和前面重点]
+   |
+   v
+[问 LLM 下一步]
+   |
+   v
+{模型说“任务已完成”？}
+   | yes                   | no
+   v                       v
+[再做一次完成确认]        [拿到要敲的命令]
+   |                       |
+   v                       v
+{确认真的完成？}         [把命令发到终端]
+   | yes      | no         |
+   v          v            v
+[停止运行]  [继续执行]   [等待结果返回]
+                            |
+                            v
+                        [记一步，再转下一圈]</code></pre>
+<h4>3. 主流程地图</h4>
+<ul><li>配置阶段：把用户给的参数整理成这次运行规则。</li><li>环境准备：启动终端会话，连到这次试验环境。</li><li>开始运行：清空本轮计数和记录，进入主循环前状态。</li><li>主循环：反复看终端、问模型、敲命令、读结果、记步骤。</li><li>结束收尾：不管怎么停，都整理输出并保存运行记录。</li><li>录屏后处理：把运行中的标记补进终端录屏文件。</li></ul>
+<hr></div></details>
+<div class="tree-bar">
+<h2>索引</h2>
+<input class="filter" type="search" placeholder="筛选阶段…" data-tree="tree-zh">
+<button class="tool" data-x="expand">全部展开</button>
+<button class="tool" data-x="collapse">全部折叠</button>
+</div>
+<div class="tree" id="tree-zh"><details class="t-node d0" data-title="配置固化 configuration crystallization stage-1"><summary><span class="chev"></span><span class="t-num">1</span><a class="t-link" href="zh/stage-1.html">配置固化</a><span class="t-count">6 个函数</span></summary><div class="t-body"><p>这一阶段把用户传入的零散配置收拢成一个稳定的 Terminus2 实例。它会确定模型、解析器、模板路径、计数器和会话字段，让后面的阶段不用反复猜默认值或担心上一次运行留下的状态。</p></div></details><details class="t-node d0" data-title="环境搭建 environment setup stage-2"><summary><span class="chev"></span><span class="t-num">2</span><a class="t-link" href="zh/stage-2.html">环境搭建</a><span class="t-count">3 个函数</span></summary><div class="t-body"><p>这一阶段把已经确定好的配置接到真实试验环境里，启动后续步骤可以操控的 tmux 终端会话。它负责把静态参数变成这一次 trial 里的活终端，为模型观察和执行命令铺好地基。</p></div></details><details class="t-node d0" data-title="运行起点 run onset stage-3"><summary><span class="chev"></span><span class="t-num">3</span><a class="t-link" href="zh/stage-3.html">运行起点</a><span class="t-count">3 个函数</span></summary><div class="t-body"><p>这一阶段把准备好的环境正式变成一次新的、可追踪的运行。它清掉上一轮可能残留的运行状态，整理终端信息、工具说明和技能说明，让 LLM 第一轮就拿到完整起点。</p></div></details><details class="t-node d0" open data-title="迭代主循环 iteration loop stage-4"><summary><span class="chev"></span><span class="t-num">4</span><a class="t-link" href="zh/stage-4.html">迭代主循环</a><span class="badge-x">★ Core</span><span class="t-count">50 个函数</span></summary><div class="t-body"><p>这一阶段是 Terminus 2 的核心循环：每一轮先检查还能不能继续，再决定是否需要摘要，然后调用 LLM、解析回复、执行命令、观察结果，并判断任务是否已经真正完成。</p><div class="t-kids"><details class="t-node d1" data-title="循环入口门控 loop entry gates stage-4.1"><summary><span class="chev"></span><span class="t-num">4.1</span><a class="t-link" href="zh/stage-4.1.html">循环入口门控</a><span class="t-count">2 个函数</span></summary><div class="t-body"><p>这一阶段是每轮迭代的入口检查。它先给当前轮次立好编号，再确认 tmux 终端还活着，确保后面的观察、思考和执行都建立在可追踪、可继续的状态上。</p></div></details><details class="t-node d1" data-title="主动摘要探测 proactive summarize probe stage-4.2"><summary><span class="chev"></span><span class="t-num">4.2</span><a class="t-link" href="zh/stage-4.2.html">主动摘要探测</a><span class="t-count">2 个函数</span></summary><div class="t-body"><p>这一阶段在调用 LLM 之前先检查上下文空间是否紧张。如果聊天历史快要超出模型容量，它会提前触发摘要流程，避免等到模型调用失败后才被动补救。</p></div></details><details class="t-node d1" data-title="llm 调用 llm query stage-4.3"><summary><span class="chev"></span><span class="t-num">4.3</span><a class="t-link" href="zh/stage-4.3.html">LLM 调用</a><span class="t-count">6 个函数</span></summary><div class="t-body"><p>这一阶段把整理好的上下文发给 LLM，并尽量稳妥地拿回一条可以继续推进的回复。它同时负责记录日志和成本，处理上下文过长、输出截断等模型调用中的常见风险。</p></div></details><details class="t-node d1" data-title="响应解析 response parse stage-4.4"><summary><span class="chev"></span><span class="t-num">4.4</span><a class="t-link" href="zh/stage-4.4.html">响应解析</a><span class="t-count">16 个函数</span></summary><div class="t-body"><p>这一阶段把 LLM 返回的自由文本拆成系统能理解的结果：是否继续、要执行什么命令、有没有格式或内容错误。没有这一步，后面只能靠猜测来驱动终端，流程会很不稳定。</p></div></details><details class="t-node d1" data-title="待交接提示 → 用户步骤(或切分) pending handoff prompt → user step (or split) stage-4.5"><summary><span class="chev"></span><span class="t-num">4.5</span><a class="t-link" href="zh/stage-4.5.html">待交接提示 → 用户步骤(或切分)</a><span class="t-count">2 个函数</span></summary><div class="t-body"><p>这一阶段处理摘要后的交接提示词。它会根据当前历史模式，决定把交接内容写成新的用户消息，还是切到新的轨迹段里继续运行。</p></div></details><details class="t-node d1" data-title="错误分支 error branch stage-4.6"><summary><span class="chev"></span><span class="t-num">4.6</span><a class="t-link" href="zh/stage-4.6.html">错误分支</a><span class="t-count">2 个函数</span></summary><div class="t-body"><p>这一阶段专门处理 LLM 回复格式不合规的情况。它拦住不能安全执行的结果，把错误原因反馈给模型，让下一轮有机会重新给出可解析、可执行的回答。</p></div></details><details class="t-node d1" data-title="命令执行 → 观察 → 轨迹步骤 command execute → observation → trajectory step stage-4.7"><summary><span class="chev"></span><span class="t-num">4.7</span><a class="t-link" href="zh/stage-4.7.html">命令执行 → 观察 → 轨迹步骤</a><span class="t-count">2 个函数</span></summary><div class="t-body"><p>这一阶段把模型决定执行的命令真正送进终端，并把终端新产生的输出整理成观察结果。它是“想法”落到真实 shell 的地方，也会把这次动作写进轨迹，方便之后复盘。</p></div></details><details class="t-node d1" data-title="完成门控与循环控制 completion gate + loop control stage-4.8"><summary><span class="chev"></span><span class="t-num">4.8</span><a class="t-link" href="zh/stage-4.8.html">完成门控与循环控制</a><span class="t-count">2 个函数</span></summary><div class="t-body"><p>这一阶段决定本轮之后是继续循环还是正式收尾。即使模型说任务完成，它也不会马上相信，而是用连续确认等规则降低过早结束的风险。</p></div></details><details class="t-node d1" data-title="解析器内部辅助 parser internal helpers stage-4.9"><summary><span class="chev"></span><span class="t-num">4.9</span><a class="t-link" href="zh/stage-4.9.html">解析器内部辅助</a><span class="t-count">11 个函数</span></summary><div class="t-body"><p>这一阶段是解析器内部的修补层。面对缺标签、半截 JSON、输出被截断等接近合法但不完整的回复，它会尽量恢复出可用结果，或给出明确失败原因。</p></div></details></div></div></details><details class="t-node d0" data-title="运行收尾 run teardown stage-5"><summary><span class="chev"></span><span class="t-num">5</span><a class="t-link" href="zh/stage-5.html">运行收尾</a><span class="t-count">4 个函数</span></summary><div class="t-body"><p>这一阶段负责运行结束时的收尾和对账。无论任务正常完成、中断还是报错，它都会尽量把轨迹、token、耗时和成本等信息汇总落盘。</p></div></details><details class="t-node d0" data-title="录制后处理(外部) recording post-process (external) stage-6"><summary><span class="chev"></span><span class="t-num">6</span><a class="t-link" href="zh/stage-6.html">录制后处理(外部)</a><span class="t-count">7 个函数</span></summary><div class="t-body"><p>这一阶段处理运行结束后的录制文件。它查看本次 trial 是否留下录制标记，并在需要时把终端录像等外部产物整理到最终结果里。</p></div></details><details class="t-node d0" data-title="上下文摘要 context summarization side-S1"><summary><span class="chev"></span><span class="t-num">S1</span><a class="t-link" href="zh/side-S1.html">上下文摘要</a><span class="t-count">7 个函数</span></summary><div class="t-body"><p>这一阶段负责在上下文装不下时做摘要。它把已经发生的长对话压缩成后续还能接着用的交接材料，但不直接把材料塞回主对话。</p></div></details><details class="t-node d0" data-title="token 与成本核算 token &amp; cost accounting crosscut-X1"><summary><span class="chev"></span><span class="t-num">X1</span><a class="t-link" href="zh/crosscut-X1.html">Token 与成本核算</a><span class="t-count">5 个函数</span></summary><div class="t-body"><p>这一横切层持续记录每次 LLM 调用和子 Agent 调用消耗的 token、耗时和成本。它不单独推动流程，却让整次试验的账本最后能对得上。</p></div></details><details class="t-node d0" data-title="输出长度限制 output length limiting crosscut-X2"><summary><span class="chev"></span><span class="t-num">X2</span><a class="t-link" href="zh/crosscut-X2.html">输出长度限制</a><span class="t-count">1 个函数</span></summary><div class="t-body"><p>这一横切层负责限制过长的终端输出。它在观察阶段先把要发给 LLM 的内容裁到合理长度，避免一次输出占满上下文空间。</p></div></details><details class="t-node d0" data-title="日志 logging crosscut-X3"><summary><span class="chev"></span><span class="t-num">X3</span><a class="t-link" href="zh/crosscut-X3.html">日志</a><span class="t-count">0 个函数</span></summary><div class="t-body"><p>这一横切层负责记录关键日志：流程走到哪里、为什么分支、哪里出错、是否接近限制。它像黑匣子一样贯穿整次运行，方便事后排查。</p></div></details><details class="t-node d0" data-title="tmux 内部辅助 tmux internal helpers subsys-tmux-internal"><summary><span class="chev"></span><span class="t-num">sub</span><a class="t-link" href="zh/subsys-tmux-internal.html">Tmux 内部辅助</a><span class="t-count">21 个函数</span></summary><div class="t-body"><p>这一子系统把 tmux 终端会话封装成上层 Agent 可以稳定使用的能力。它处理会话启动、按键发送、输出读取和等待命令完成等终端 I/O 细节。</p></div></details></div>
+</section><section class="lang-sec" data-lang="en" hidden>
+<div class="hero">
+<p class="hero__kicker">Handbook Studio · Terminal Agent</p>
+<h1>Terminus 2 Handbook</h1>
+<p class="hero-sub">
+<span class="stat"><strong>20</strong> stages</span>
+<span class="dot">·</span>
+<span class="stat"><strong>106</strong> functions documented</span>
+<span class="dot">·</span>
+<span class="stat"><strong>10</strong> registers</span>
+<span class="dot">·</span>
+<a href="en/registers.html">State-flow registers →</a>
+</p>
+</div>
+<details class="overview" open><summary><span class="chev"></span>System overview</summary>
+<div class="overview-body"><h4>1. System Overview Paragraph</h4>
+<p>Terminus 2 is a program that lets an LLM operate a terminal to complete tasks. You can think of it as an AI using a command-line window the way a person would: it looks at what is on screen, thinks about the next move, types a command, waits, then reads the result. The point is to let an LLM actually carry out multi-step terminal work instead of only describing what someone else should do. A terminal here is a command-line window, and Terminus 2 drives one through tmux, which is a terminal you can control remotely. Most of the system is just that loop repeated until the task appears complete, the run hits a limit, or the terminal dies. Around that core loop, Terminus 2 has a simple harness: set settings, start the terminal, begin a run, repeat the think-and-type loop, finish cleanly, and optionally clean up the screen recording afterward. Later chapters zoom into the loop, summarization, logging, token and cost tracking, output trimming, and the terminal and parsing subsystems.</p>
+<h4>2. Two Small ASCII Diagrams</h4>
+<pre><code>Diagram A · Lifecycle
+
+set settings
+    ↓
+start terminal
+    ↓
+begin run
+    ↓
+REPEAT LOOP   ← centerpiece
+    ↓
+finish run
+    ↓
+fix recording (optional)</code></pre>
+<pre><code>Diagram B · One Iteration
+
+1. Read the terminal screen
+2. Gather the task and recent history
+3. Ask the LLM what to do next
+4. Interpret its reply into an action
+5. Does the task look complete?
+   ├─ yes → confirm stop and end the run
+   └─ no  → continue
+6. Run the command in the terminal
+7. Wait for output from the command
+8. Record what happened for the next turn</code></pre>
+<h4>3. Main Flow Map</h4>
+<ul><li>Set settings: turns user options into one ready-to-run configuration before anything starts.</li><li>Start terminal: creates and starts the remote terminal for this run before the main loop.</li><li>Begin run: clears old run state and captures the initial screen right before looping.</li><li>Repeat loop: the core cycle that reads the terminal, asks the LLM, acts, and checks for completion.</li><li>Finish run: always cleans up and saves the final run record after the loop stops.</li><li>Fix recording: optionally post-processes the terminal recording after the run is fully finished.</li></ul>
+<hr></div></details>
+<div class="tree-bar">
+<h2>Stage index</h2>
+<input class="filter" type="search" placeholder="Filter stages…" data-tree="tree-en">
+<button class="tool" data-x="expand">Expand all</button>
+<button class="tool" data-x="collapse">Collapse all</button>
+</div>
+<div class="tree" id="tree-en"><details class="t-node d0" data-title="configuration crystallization  stage-1"><summary><span class="chev"></span><span class="t-num">1</span><a class="t-link" href="en/stage-1.html">Configuration Crystallization</a><span class="t-count">6 functions</span></summary><div class="t-body"><p>This stage turns loose constructor options into a stable Terminus2 instance. It settles the model, parser, prompt templates, counters, and run fields so later stages can rely on one clear agent configuration.</p></div></details><details class="t-node d0" data-title="environment setup  stage-2"><summary><span class="chev"></span><span class="t-num">2</span><a class="t-link" href="en/stage-2.html">Environment Setup</a><span class="t-count">3 functions</span></summary><div class="t-body"><p>This stage connects that settled configuration to a real trial environment. It starts the tmux terminal session that later stages will observe and control.</p></div></details><details class="t-node d0" data-title="run onset  stage-3"><summary><span class="chev"></span><span class="t-num">3</span><a class="t-link" href="en/stage-3.html">Run Onset</a><span class="t-count">3 functions</span></summary><div class="t-body"><p>This stage turns the prepared environment into a fresh, traceable run. It clears leftover state, gathers terminal and tool context, and gives the LLM a clean starting point for the first turn.</p></div></details><details class="t-node d0" open data-title="iteration loop  stage-4"><summary><span class="chev"></span><span class="t-num">4</span><a class="t-link" href="en/stage-4.html">Iteration Loop</a><span class="badge-x">★ Core</span><span class="t-count">49 functions</span></summary><div class="t-body"><p>This is the core Terminus 2 loop. Each round checks whether the run can continue, manages context pressure, queries the LLM, parses the reply, executes commands, observes results, and decides whether the task is truly done.</p><div class="t-kids"><details class="t-node d1" data-title="loop entry gates  stage-4.1"><summary><span class="chev"></span><span class="t-num">4.1</span><a class="t-link" href="en/stage-4.1.html">Loop Entry Gates</a><span class="t-count">2 functions</span></summary><div class="t-body"><p>This stage is the entry check for each loop iteration. It assigns a stable episode number and confirms the tmux session is still alive before the agent observes, thinks, or acts.</p></div></details><details class="t-node d1" data-title="proactive summarize probe  stage-4.2"><summary><span class="chev"></span><span class="t-num">4.2</span><a class="t-link" href="en/stage-4.2.html">Proactive Summarize Probe</a><span class="t-count">2 functions</span></summary><div class="t-body"><p>This stage checks context pressure before the next LLM call. If the conversation is getting too large, it prepares a summary handoff early instead of waiting for the model call to fail.</p></div></details><details class="t-node d1" data-title="llm query  stage-4.3"><summary><span class="chev"></span><span class="t-num">4.3</span><a class="t-link" href="en/stage-4.3.html">LLM Query</a><span class="t-count">6 functions</span></summary><div class="t-body"><p>This stage sends the prepared context to the LLM and tries to get back a usable next step. It also records timing and cost, and handles common model-call risks such as context overflow or truncated output.</p></div></details><details class="t-node d1" data-title="response parse  stage-4.4"><summary><span class="chev"></span><span class="t-num">4.4</span><a class="t-link" href="en/stage-4.4.html">Response Parse</a><span class="t-count">16 functions</span></summary><div class="t-body"><p>This stage turns the LLM's free-form reply into structured decisions the system can trust: whether to continue, which commands to run, and whether the reply has format or content problems.</p></div></details><details class="t-node d1" data-title="pending handoff prompt → user step (or split)  stage-4.5"><summary><span class="chev"></span><span class="t-num">4.5</span><a class="t-link" href="en/stage-4.5.html">Pending Handoff Prompt → User Step (or Split)</a><span class="t-count">2 functions</span></summary><div class="t-body"><p>This stage handles a pending summary handoff. Depending on the history mode, it either writes the handoff as a new user step or splits the trajectory so the next stretch can continue cleanly.</p></div></details><details class="t-node d1" data-title="error branch  stage-4.6"><summary><span class="chev"></span><span class="t-num">4.6</span><a class="t-link" href="en/stage-4.6.html">Error Branch</a><span class="t-count">2 functions</span></summary><div class="t-body"><p>This stage handles malformed LLM replies. It blocks unsafe output, feeds the parse error back to the model, and gives the next round a chance to produce a valid response.</p></div></details><details class="t-node d1" data-title="command execute → observation → trajectory step  stage-4.7"><summary><span class="chev"></span><span class="t-num">4.7</span><a class="t-link" href="en/stage-4.7.html">Command Execute → Observation → Trajectory Step</a><span class="t-count">2 functions</span></summary><div class="t-body"><p>This stage sends the model's chosen commands to the terminal and turns the new terminal output into an observation. It is where the agent's plan becomes real shell activity, and where that activity is recorded for later review.</p></div></details><details class="t-node d1" data-title="completion gate + loop control  stage-4.8"><summary><span class="chev"></span><span class="t-num">4.8</span><a class="t-link" href="en/stage-4.8.html">Completion Gate + Loop Control</a><span class="t-count">2 functions</span></summary><div class="t-body"><p>This stage decides whether to keep looping or finish. Even when the model says the task is done, it uses confirmation rules to reduce the chance of stopping too early.</p></div></details><details class="t-node d1" data-title="parser internal helpers  stage-4.9"><summary><span class="chev"></span><span class="t-num">4.9</span><a class="t-link" href="en/stage-4.9.html">Parser internal helpers</a><span class="t-count">10 functions</span></summary><div class="t-body"><p>This stage is the parser's repair layer. When a reply is almost valid but has missing tags, partial JSON, or truncated structure, it tries to recover a usable result or return a clear failure.</p></div></details></div></div></details><details class="t-node d0" data-title="run teardown  stage-5"><summary><span class="chev"></span><span class="t-num">5</span><a class="t-link" href="en/stage-5.html">Run Teardown</a><span class="t-count">4 functions</span></summary><div class="t-body"><p>This stage closes out the run and reconciles the record. Whether the task completed, stopped early, or hit an error, it gathers the final trajectory, token counts, timing, and cost data.</p></div></details><details class="t-node d0" data-title="recording post-process (external)  stage-6"><summary><span class="chev"></span><span class="t-num">6</span><a class="t-link" href="en/stage-6.html">Recording Post-process (External)</a><span class="t-count">7 functions</span></summary><div class="t-body"><p>This stage handles recording artifacts after the run. It looks for recording markers left by the trial and folds terminal recording output into the final result when needed.</p></div></details><details class="t-node d0" data-title="context summarization  side-S1"><summary><span class="chev"></span><span class="t-num">S1</span><a class="t-link" href="en/side-S1.html">Context Summarization</a><span class="t-count">7 functions</span></summary><div class="t-body"><p>This side stage summarizes long conversation history when the context window is getting full. It prepares a compact handoff for future turns, but does not itself insert that handoff back into the main dialogue.</p></div></details><details class="t-node d0" data-title="token &amp; cost accounting  crosscut-X1"><summary><span class="chev"></span><span class="t-num">X1</span><a class="t-link" href="en/crosscut-X1.html">Token &amp; Cost Accounting</a><span class="t-count">5 functions</span></summary><div class="t-body"><p>This cross-cutting layer tracks token usage, latency, and cost across main LLM calls and subagent work. It does not drive the task forward, but it makes the final run accounting reliable.</p></div></details><details class="t-node d0" data-title="output length limiting  crosscut-X2"><summary><span class="chev"></span><span class="t-num">X2</span><a class="t-link" href="en/crosscut-X2.html">Output Length Limiting</a><span class="t-count">1 functions</span></summary><div class="t-body"><p>This cross-cutting layer keeps terminal output from overwhelming the LLM. During observation, it trims very long command output before it enters the model context.</p></div></details><details class="t-node d0" data-title="logging  crosscut-X3"><summary><span class="chev"></span><span class="t-num">X3</span><a class="t-link" href="en/crosscut-X3.html">Logging</a><span class="t-count">0 functions</span></summary><div class="t-body"><p>This cross-cutting layer records what the agent is doing and why. It leaves a debug trail for branch decisions, failures, limits, and subagent activity across the whole run.</p></div></details><details class="t-node d0" data-title="tmux internal helpers  subsys-tmux-internal"><summary><span class="chev"></span><span class="t-num">sub</span><a class="t-link" href="en/subsys-tmux-internal.html">Tmux internal helpers</a><span class="t-count">21 functions</span></summary><div class="t-body"><p>This subsystem wraps tmux into a reliable execution surface for the agent. It handles session setup, keystroke delivery, output reading, and waiting for commands to finish.</p></div></details></div>
+</section></main>
+<script src="assets/app.js"></script>
+</body>
+</html>

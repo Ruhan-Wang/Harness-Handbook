@@ -1,0 +1,888 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>subsys-tmux-internal · Tmux 内部辅助</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=zh"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 手册</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=zh" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>返回主页</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>状态流寄存器</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>配置固化</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>环境搭建</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>运行起点</a></div><details class="s-node"><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>迭代主循环</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>循环入口门控</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>主动摘要探测</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM 调用</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>响应解析</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>待交接提示 → 用户步骤(或切分)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>错误分支</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>命令执行 → 观察 → 轨迹步骤</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>完成门控与循环控制</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>解析器内部辅助</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>运行收尾</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>录制后处理(外部)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>上下文摘要</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token 与成本核算</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>输出长度限制</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>日志</a></div><div class="s-leaf"><a class="s-link cur" href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux 内部辅助</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">索引</a></nav><div class="stage-head"><h1>Tmux 内部辅助</h1><div class="meta"><span class="chip mono">subsys-tmux-internal</span><span class="chip">Tmux internal helpers</span><span class="chip">21 个函数</span></div></div>
+<h2 class="sec">开场解释</h2>
+<p>这个 Stage 在解决一个很实际的问题：<strong>把“终端会话”和“键盘输入/屏幕输出”变成上层 Agent 能稳定使用的能力</strong>。上层知道自己想发什么命令、想看什么结果，但不该关心 tmux（可远程控制的终端复用器）有没有装、会话怎么起、按键怎么拆、什么时候该等命令跑完、怎么只拿到“新冒出来”的输出。这个 Stage 就是这层适配层：它在一次 run 里负责<strong>准备 tmux 环境 + 做终端 I/O 细活</strong>，让后面的执行路径只管“发请求、收结果”。</p>
+<h2 class="sec">主流程</h2>
+<p>这里不要把它理解成一个独立业务阶段，更准确地说：<strong>它是 tmux 子系统里的内部适配层</strong>。它会在两类时机被调用：</p>
+<ul><li>一次 run 开始、需要可用终端时</li><li>一次命令要发进终端、或要从终端取输出时</li></ul>
+<p>按一次实际运行来看，它大致是这样串起来的：</p>
+<ol><li><strong>先看 tmux 能不能用</strong><p>如果机器上还没有 tmux，就不能谈“开会话”“发按键”“抓屏幕”。 所以这层先做探测，再决定是<strong>跳过安装</strong>还是<strong>尝试安装</strong>。</p>
+<ul><li><code>_detect_system_info()</code>：看当前系统是什么环境，决定后面用哪条安装路。</li><li><code>_attempt_tmux_installation()</code>：tmux 不可用时，尝试把它装上。</li><li><code>_get_combined_install_command()</code>：拼出适合当前系统的安装命令。</li><li><code>_build_tmux_from_source()</code>：包管理器不方便时，退一步走源码编译。</li><li><code>_install_asciinema_with_pip()</code>：顺手补齐录屏相关依赖（asciinema，一种终端录制工具）。</li></ul>
+<p>这一步为什么放在这里，而不是上层？ 因为上层关心的是“我要一个可交互终端”，不该知道 Debian、RedHat、源码编译这些差异。<strong>环境差异应该被吸在适配层里。</strong></p>
+<p>分支上要注意两点：</p>
+<ul><li><strong>tmux 已存在</strong>：直接跳过安装。</li><li><strong>安装失败</strong>：这层就没法提供可用会话；上层只能收到“终端不可用”的失败结果，而不是继续假装能执行命令。</li></ul></li><li><strong>tmux 可用后，启动会话</strong><p>有了 tmux，下一步才是准备一个可操作的 pane/session（tmux 里的终端格子/会话）。</p>
+<ul><li><code>_tmux_start_session()</code>：真正把 tmux 会话拉起来。</li></ul>
+<p>这一步的意义很简单： <strong>没有固定会话，后面的输入和抓屏都没地方落。</strong> 上层需要的是“一个持续存在的 shell”，而不是一次性子进程。</p></li><li><strong>如果这次 run 只是读屏，就跳过发送</strong><p>不是每次都要发命令。有时上层只是想看看当前终端屏幕，或者读取命令跑出来的新内容。 这时会直接走抓屏和增量计算，不经过 send 流程。</p>
+<p>这也是为什么“发送输入”和“读取输出”放在同一适配层里： <strong>它们操作的是同一个终端对象，天然要共用一套会话状态。</strong></p></li><li><strong>要发输入时，先把输入整理成 tmux 能安全吃下的形状</strong><p>终端输入不是简单的字符串拼接。 tmux 的 <code>send-keys</code> 对特殊键、换行、长文本都有自己的坑。如果不先整理，上层以为自己是在“输入文本”，实际却可能变成“提前按了 Enter”或“键被拆坏”。</p>
+<ul><li><code>_prepare_keys()</code>：把要发的内容整理好，决定按键序列该怎么送。</li><li><code>_is_enter_key()</code>：识别这次是不是在发 Enter 这类会触发执行的键。</li><li><code>_ends_with_newline()</code>：识别文本尾部是否带换行。</li><li><code>_split_key_for_tmux()</code>：把 tmux 不方便直接处理的输入拆开。</li><li><code>_tmux_send_keys()</code>：底层真正调用 tmux 送键。</li><li><code>_tmux_send_keys._flush()</code>：必要时把累积的按键批次刷出去。</li></ul>
+<p>这一步的核心不是“怎么 split”，而是： <strong>把“文本”变成“不会误触发、不容易丢字符、tmux 能稳定接收的按键流”。</strong></p></li><li><strong>在真正发之前，先判断这次输入会不会触发命令执行</strong><p>这是这一层非常关键的判断。</p>
+<ul><li><code>_is_executing_command()</code>：判断这次输入是不是会让 shell 真正开始跑命令。</li><li><code>_prevent_execution()</code>：需要时阻止命令被立刻触发。</li></ul>
+<p>为什么这个判断必须放在这一层，而不是更上面？ 因为只有这一层同时知道两件事：</p>
+<ul><li>上层交下来的是“文本”</li><li>底层实际做的是“按键”</li></ul>
+<p><strong>是否会执行命令，不取决于文本长什么样，而取决于最后送进 tmux 的按键序列。</strong> 这是终端语义，不是业务语义。放在上层，上层看不见真实按键细节；放在更底层，又太晚，已经来不及改发送策略了。</p></li><li><strong>然后在“阻塞发送”和“非阻塞发送”之间选一种</strong><p>这是本层另一个重要职责：<strong>决定发完后要不要等。</strong></p>
+<ul><li><code>_send_blocking_keys()</code>：发完后等待，适合“这次确实在跑命令，我需要一个较完整的执行结果”。</li><li><code>_send_non_blocking_keys()</code>：只把键送进去就返回，适合“只是补字”“移动光标”“先把内容塞进去但不立即等结果”。</li><li><code>send_keys()</code>：对上层暴露的统一入口，把前面的准备和路由收口起来。</li></ul>
+<p>为什么要在这里分阻塞/非阻塞？ 因为这不是简单的“用户想不想等”，而是和终端状态强相关：</p>
+<ul><li>发的是不是会执行命令的键</li><li>发送后有没有必要马上抓屏</li><li>要不要等待输出稳定一点再返回</li></ul>
+<p><strong>如果上层自己决定阻塞策略，它就得懂终端行为；这会把大量 shell/tmux 细节泄漏出去。</strong></p></li><li><strong>发送后，或者独立地，抓当前屏幕</strong><p>终端是有状态的。命令有没有开始跑、有没有报错、屏幕上现在显示什么，都要靠抓 pane 内容来看。</p>
+<ul><li><code>_tmux_capture_pane()</code>：从 tmux 当前 pane 把可见内容抓出来。</li><li><code>_get_visible_screen()</code>：取当前“屏幕视图”。</li></ul>
+<p>这里不是为了做完整日志归档，而是为了给上层一个<strong>现在终端看到的样子</strong>。 上层后面做判断、总结、继续规划，依赖的往往就是这个屏幕快照。</p></li><li><strong>最后只算“新内容”，避免每次都把整屏重新喂给上层</strong><p>终端屏幕是会重复的。每次都把整块内容重新返回，会很吵，也容易让上层误判“又出现了一次同样输出”。</p>
+<ul><li><code>_find_new_content()</code>：拿“上一次看到的屏幕”和“这一次屏幕”做对比。</li><li><code>get_incremental_output()</code>：对外提供增量输出，只返回新冒出来的部分。</li></ul>
+<p>这一步的意义很大： <strong>把终端这种连续流，压成上层更容易消费的“增量事件”。</strong> 这样后续执行路径拿到的不是一整面旧屏幕，而是“刚刚新增了什么”。</p></li></ol>
+<p>边界也要说清：</p>
+<ul><li><strong>本层负责</strong>：tmux 可用性、会话就绪、按键发送、阻塞/非阻塞等待、抓屏、增量输出。</li><li><strong>本层不负责</strong>：决定“该执行什么命令”、解释命令结果、做下一步规划。这些都属于更上层的 Agent 流程。</li></ul>
+<h2 class="sec"> 状态流动</h2>
+<ul><li>写: <code>无（不读写 skeleton registers）</code> — 这个单元没有在输入提供的 skeleton register 中显式登记读写；它主要维护的是 tmux 子系统内部状态，而不是全局流水线寄存器。</li><li>读: <code>无（不读写 skeleton registers）</code> — 上层传进来的更多是“请求动作”（如启动会话、发送输入、读取输出），不是通过本题给出的显式 register 读取。</li><li>清: <code>无（不读写 skeleton registers）</code> — 本单元不负责清理 skeleton 层状态。</li><li>触发下游: <code>stage-4.9 execution path</code> — 当会话已就绪且 <code>send_keys()</code> / <code>get_incremental_output()</code> 返回可消费结果后，下游执行路径继续依据“命令已送达”“当前屏幕”“新增输出”推进。</li></ul>
+<p>补充说明：虽然没有显式 skeleton register，但<strong>内部状态</strong>是存在的，且对一次 run 很关键，主要包括：</p>
+<ul><li>tmux 是否已可用</li><li>当前 session/pane 句柄是否已建立</li><li>最近一次可见屏幕内容</li><li>用来做增量比较的上一份屏幕快照</li></ul>
+<p>这些状态都留在 <code>TmuxSession</code> 对象内部，用来跨多个调用维持“同一个终端”的连续性。</p>
+<h2 class="sec">与前后 Stage 的衔接</h2>
+<p>上游交给它的不是业务决策，而是更具体的终端请求：<strong>把 tmux 准备好、把一串输入送进 shell、或把当前屏幕/新增输出取回来</strong>。本层产出的是可继续消费的终端结果：一个可用会话、一次发送结果、当前屏幕或增量输出；后面的 <code>stage-4.9 execution path</code> 再基于这些结果判断命令是否已跑、输出是什么、下一步该怎么走。</p><div class="files-bar"><h2 class="sec">函数细节<span class="pill">21</span></h2><span class="spacer"></span><button class="tool" data-x="expand">全部展开</button><button class="tool" data-x="collapse">全部折叠</button></div><details class="file" id="fn-tmuxsession_send_keys"><summary><span class="chev"></span><code class="fpath">TmuxSession.send_keys</code><a class="fn-range" href="../code/tmux_session.py.html#L613-L654" title="tmux_session.py:613-654">tmux_session.py:613–654 ↗</a></summary><div class="file-body"><p class="fn-sub">tmux 按键发送分发入口</p>
+<blockquote><p><strong>stage 上下文</strong>: 该条目位于 tmux 内部辅助层，职责是把一次按键发送请求整理后分发给两条发送路径之一。触发时机从函数体本身不可见；就本函数可证实的范围而言，它只消费入参与若干 <code>self</code> 绑定方法/日志器，不直接持久化任何会话状态。作为本 stage 当前可见的首个条目，它体现的是内部发送封装而非更高层编排。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>send_keys</code> 接收 <code>keys</code>、<code>block</code> 以及两类超时参数，先通过 <code>_prepare_keys(...)</code> 归一化输入并得到最终是否走阻塞路径的判定。随后它记录一次调试日志，并依据 <code>is_blocking</code> 在 <code>_send_blocking_keys(...)</code> 与 <code>_send_non_blocking_keys(...)</code> 之间二选一地 <code>await</code> 调用。本协程没有显式 <code>return</code>，实际产出是把发送责任委托给后续 helper，并在特定参数组合下额外输出一条说明 <code>min_timeout_sec</code> 会被忽略的调试日志。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, keys: str | list[str], block: bool = False, min_timeout_sec: float = 0.0, max_timeout_sec: float = 180.0)</code></p>
+<ul><li>参数: <code>keys</code>: <code>str | list[str]</code> — 待发送的按键或命令序列，传入 <code>_prepare_keys(...)</code> 做整理; <code>block</code>: <code>bool</code> — 请求是否阻塞等待；既参与预警日志判断，也传给 <code>_prepare_keys(...)</code>; <code>min_timeout_sec</code>: <code>float</code> — 非阻塞路径下传给 <code>_send_non_blocking_keys(...)</code> 的最小等待时间；若 <code>block</code> 为真且大于 0，会先记录其将被忽略; <code>max_timeout_sec</code>: <code>float</code> — 阻塞路径下传给 <code>_send_blocking_keys(...)</code> 的最大等待时间</li><li>读状态: <code>self._logger</code>, <code>self._prepare_keys</code>, <code>self._send_blocking_keys</code>, <code>self._send_non_blocking_keys</code></li><li>返回: 无显式返回；该协程完成时解析为 <code>None</code>，真正结果是完成一次 helper 委托调用与相关日志输出。</li><li>副作用: 当 <code>block</code> 为 True 且 <code>min_timeout_sec &gt; 0.0</code> 时，调用 <code>self._logger.debug(...)</code> 记录忽略说明; 调用 <code>self._logger.debug(...)</code> 记录整理后的 <code>prepared_keys</code> 及超时参数; 按分支 <code>await self._send_blocking_keys(...)</code> 或 <code>await self._send_non_blocking_keys(...)</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先检查 <code>block and min_timeout_sec &gt; 0.0</code>；若成立，则通过 <code>self._logger.debug(...)</code> 记录“<code>min_timeout_sec</code> 会被忽略”的说明。</li><li>调用 <code>self._prepare_keys(keys=keys, block=block)</code>，取得二元结果 <code>prepared_keys, is_blocking</code>，其中后者作为后续实际分支条件。</li><li>无论后续是否真的使用 <code>min_timeout_sec</code>，都会再调用一次 <code>self._logger.debug(...)</code>，记录 <code>prepared_keys</code>、<code>min_timeout_sec</code> 与 <code>max_timeout_sec</code>。</li><li>若 <code>is_blocking</code> 为真，则 <code>await self._send_blocking_keys(keys=prepared_keys, max_timeout_sec=max_timeout_sec)</code>。</li><li>否则走非阻塞路径，<code>await self._send_non_blocking_keys(keys=prepared_keys, min_timeout_sec=min_timeout_sec)</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    async def send_keys(
+        self,
+        keys: str | list[str],
+        block: bool = False,
+        min_timeout_sec: float = 0.0,
+        max_timeout_sec: float = 180.0,
+    ):
+        """
+        Execute a command in the tmux session.
+
+        Args:
+            keys (str): The keys to send to the tmux session.
+            block (bool): Whether to wait for the command to complete.
+            min_timeout_sec (float): Minimum time in seconds to wait after executing.
+                Defaults to 0.
+            max_timeout_sec (float): Maximum time in seconds to wait for blocking
+                commands. Defaults to 3 minutes.
+        """
+        if block and min_timeout_sec &gt; 0.0:
+            self._logger.debug("min_timeout_sec will be ignored because block is True.")
+
+        prepared_keys, is_blocking = self._prepare_keys(
+            keys=keys,
+            block=block,
+        )
+
+        self._logger.debug(
+            f"Sending keys: {prepared_keys}"
+            f" min_timeout_sec: {min_timeout_sec}"
+            f" max_timeout_sec: {max_timeout_sec}"
+        )
+
+        if is_blocking:
+            await self._send_blocking_keys(
+                keys=prepared_keys,
+                max_timeout_sec=max_timeout_sec,
+            )
+        else:
+            await self._send_non_blocking_keys(
+                keys=prepared_keys,
+                min_timeout_sec=min_timeout_sec,
+            )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>阻塞与否不直接只由入参 <code>block</code> 决定，而是以 <code>_prepare_keys(...)</code> 返回的 <code>is_blocking</code> 为准；这表明本函数把“最终发送策略判定”收口到预处理阶段，避免在当前层重复解释 <code>keys</code> 形式或特殊命令语义。</li><li>对 <code>block=True</code> 且 <code>min_timeout_sec&gt;0</code> 的组合，代码没有报错或改写参数，只输出一条调试日志后继续执行；这是宽容处理，允许调用方传入冗余参数，同时明确提示该值不会生效。</li><li>第二条调试日志总是同时打印 <code>min_timeout_sec</code> 与 <code>max_timeout_sec</code>，即使稍后分支可能只使用其中一个；因此代码专门在前面加了一条“会被忽略”的日志来解释这种日志字段与实际执行路径之间的偏差。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未在给定源码片段中展示，无法从本函数体内确认具体调用者</li><li><strong>核心被调用</strong>: self._prepare_keys; self._send_blocking_keys; self._send_non_blocking_keys; self._logger.debug</li><li><strong>配置/状态来源</strong>: 参数 <code>keys</code>; 参数 <code>block</code>; 参数 <code>min_timeout_sec</code>; 参数 <code>max_timeout_sec</code></li><li><strong>结果去向</strong>: <code>prepared_keys</code> 传入 <code>_send_blocking_keys(...)</code> 或 <code>_send_non_blocking_keys(...)</code>; <code>max_timeout_sec</code> 仅传入 <code>_send_blocking_keys(...)</code>; <code>min_timeout_sec</code> 仅传入 <code>_send_non_blocking_keys(...)</code>; 调试信息输出到 <code>self._logger.debug(...)</code></li></ul></div></details><details class="file" id="fn-tmuxsession_prepare_keys"><summary><span class="chev"></span><code class="fpath">TmuxSession._prepare_keys</code><a class="fn-range" href="../code/tmux_session.py.html#L544-L569" title="tmux_session.py:544-569">tmux_session.py:544–569 ↗</a></summary><div class="file-body"><p class="fn-sub">tmux 按键负载预处理助手</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数属于 tmux 会话子系统的内部细化 helper，负责在真正发送按键前整理输入形态并计算本次返回的阻塞标志。触发点是同 stage 的 <code>TmuxSession.send_keys</code>，后者先调用这里得到规范化结果，再继续后续发送流程。相较已翻译的兄弟函数 <code>send_keys</code>，这里不执行发送，只处理 <code>keys</code> 与返回布尔值的预判。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_prepare_keys</code> 接收 <code>keys</code> 与 <code>block</code>，把字符串输入统一成列表，并依据最后一个按键是否被 <code>_is_executing_command(keys[-1])</code> 识别为执行命令的按键，决定返回的阻塞标志。若 <code>block</code> 为假、按键列表为空，或最后一个按键不构成执行命令，则直接返回当前 <code>keys</code> 与 <code>False</code>。只有在 <code>block</code> 为真且最后一个按键满足执行判定时，它才先用 <code>_prevent_execution(keys)</code> 重写列表，再在该列表后追加 <code>[self._TMUX_COMPLETION_COMMAND, "Enter"]</code>，并返回该列表与 <code>True</code>；本函数本身不写入实例状态。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, keys: str | list[str], block: bool) -&gt; tuple[list[str], bool]</code></p>
+<ul><li>参数: <code>keys</code>: <code>str | list[str]</code> — 待发送到终端的按键负载；若为 <code>str</code> 会先转换成新的单元素列表，若为 <code>list[str]</code> 则后续可能原样返回、被 <code>_prevent_execution(keys)</code> 替换，或在当前使用中的列表对象上被 <code>extend(...)</code> 追加元素; <code>block</code>: <code>bool</code> — 调用方请求的阻塞意图；本函数据此与末尾按键判定共同计算最终返回的阻塞标志</li><li>读状态: <code>self._is_executing_command</code>, <code>self._prevent_execution</code>, <code>self._TMUX_COMPLETION_COMMAND</code></li><li>返回: 返回 <code>tuple[list[str], bool]</code>：第一项是整理后的按键列表，第二项是本函数计算出的阻塞标志。返回的列表可能是由字符串新建出的列表、原始列表对象，或 <code>_prevent_execution(keys)</code> 返回的新列表/重写结果；在进入追加分支时，函数会对当时使用的列表执行 <code>extend([self._TMUX_COMPLETION_COMMAND, "Enter"])</code>。</li><li>副作用: 不写入任何 <code>self._</code> 实例字段; 在满足追加分支时，会修改当时使用中的 <code>keys</code> 列表对象内容（通过 <code>extend(...)</code>）</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先检查 <code>keys</code> 的类型；若 <code>isinstance(keys, str)</code> 为真，则把它包装为新的单元素列表 <code>[keys]</code>，把后续处理统一到列表路径。</li><li>随后执行单个提前返回判定：只要 <code>not block</code>、<code>not keys</code>、或 <code>not self._is_executing_command(keys[-1])</code> 三者之一成立，就直接返回当前 <code>keys</code> 与 <code>False</code>。</li><li>如果没有提前返回，说明此时 <code>block</code> 为真、列表非空，且最后一个元素通过了 <code>self._is_executing_command(keys[-1])</code> 检查；函数接着调用 <code>self._prevent_execution(keys)</code>，并以其返回值重新绑定 <code>keys</code>。</li><li>在重写后的 <code>keys</code> 上追加 <code>self._TMUX_COMPLETION_COMMAND</code> 与字面量 <code>"Enter"</code> 两个元素，然后返回该列表与 <code>True</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _prepare_keys(
+        self,
+        keys: str | list[str],
+        block: bool,
+    ) -&gt; tuple[list[str], bool]:
+        """
+        Prepare keys for sending to the terminal.
+
+        Args:
+            keys (str | list[str]): The keys to send to the terminal.
+            block (bool): Whether to wait for the command to complete.
+
+        Returns:
+            tuple[list[str], bool]: The keys to send to the terminal and whether the
+                the keys are blocking.
+        """
+        if isinstance(keys, str):
+            keys = [keys]
+
+        if not block or not keys or not self._is_executing_command(keys[-1]):
+            return keys, False
+
+        keys = self._prevent_execution(keys)
+        keys.extend([self._TMUX_COMPLETION_COMMAND, "Enter"])
+
+        return keys, True</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数采用单个复合条件的提前返回结构，把“不阻塞”的三种情况——<code>block</code> 为假、列表为空、末尾按键未通过执行判定——统一降级为返回布尔值 <code>False</code>；这一点直接体现在 <code>if not block or not keys or not self._is_executing_command(keys[-1]): return keys, False</code>。</li><li>它只在最后一个按键满足 <code>self._is_executing_command(keys[-1])</code> 时才保留返回值中的阻塞标志为 <code>True</code>；也就是说，调用方传入 <code>block=True</code> 并不足以单独决定结果，代码显式要求再通过一次末尾按键检查。</li><li>进入阻塞分支后，代码不直接在原列表上追加，而是先执行 <code>keys = self._prevent_execution(keys)</code> 再追加后续元素；从源码可见，这是一次显式的重写步骤，但其具体重写内容由 helper 自身决定，这里不在本函数内展开。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: TmuxSession.send_keys</li><li><strong>核心被调用</strong>: self._is_executing_command; self._prevent_execution; list.extend</li><li><strong>配置/状态来源</strong>: 参数 <code>keys</code>; 参数 <code>block</code>; 常量/属性 <code>self._TMUX_COMPLETION_COMMAND</code></li><li><strong>结果去向</strong>: 返回给 <code>TmuxSession.send_keys</code> 作为规范化后的 <code>keys</code>; 返回给 <code>TmuxSession.send_keys</code> 作为本函数计算出的阻塞布尔值</li><li><strong>同类 sibling</strong>: TmuxSession.send_keys：先调用本函数获取 <code>(prepared_keys, is_blocking)</code>，自身再继续后续发送路径</li></ul></div></details><details class="file" id="fn-tmuxsession_is_executing_command"><summary><span class="chev"></span><code class="fpath">TmuxSession._is_executing_command</code><a class="fn-range" href="../code/tmux_session.py.html#L526-L527" title="tmux_session.py:526-527">tmux_session.py:526–527 ↗</a></summary><div class="file-body"><p class="fn-sub">判定单个按键是否触发执行</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数属于 tmux 子系统内部的细粒度判定 helper，职责是把“这个 key 是否代表提交执行”压缩为一个布尔谓词。它位于同 stage 的按键处理辅助层级中，相比兄弟函数 <code>send_keys</code> 与 <code>_prepare_keys</code> 的编排职责，这里只负责单个 <code>key</code> 的最小判定，不直接操作会话或发送流程。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_is_executing_command</code> 接收一个 <code>key: str</code>，返回该字符串是否应被视为“执行命令”的输入。函数本体只做一个布尔合取判定：先测试 <code>self._is_enter_key(key)</code>，否则再测试 <code>self._ends_with_newline(key)</code>。它不写入任何实例属性，实际产出仅为布尔返回值。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, key: str) -&gt; bool</code></p>
+<ul><li>参数: <code>key</code>: <code>str</code> — 待判定的单个 tmux 按键字符串</li><li>读状态: <code>调用 self._is_enter_key(key)</code>, <code>调用 self._ends_with_newline(key)</code></li><li>返回: 布尔值；当 <code>key</code> 被 <code>_is_enter_key(key)</code> 识别为 Enter 类按键，或在前者为假时被 <code>_ends_with_newline(key)</code> 识别为以换行结尾时，返回 <code>True</code>，否则返回 <code>False</code>。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先以传入的 <code>key</code> 调用 <code>self._is_enter_key(key)</code>，检查它是否属于 Enter 风格按键。</li><li>若前一步结果为真，<code>or</code> 表达式短路，函数立即以 <code>True</code> 返回，不再求值 <code>self._ends_with_newline(key)</code>。</li><li>仅当前一步为假时，才继续调用 <code>self._ends_with_newline(key)</code>，检查该字符串是否以换行结束。</li><li>返回这两个 helper 判定的逻辑或结果。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _is_executing_command(self, key: str) -&gt; bool:
+        return self._is_enter_key(key) or self._ends_with_newline(key)</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数把“执行命令”压缩为两个条件的逻辑或：<code>_is_enter_key(key) or _ends_with_newline(key)</code>；这说明代码显式接受两类等价信号，而不是只认某一种输入形式。</li><li>这里直接使用 Python 的 <code>or</code> 表达式而非分别保存中间变量，带来的实际取舍是短路求值：一旦 <code>_is_enter_key(key)</code> 为真，就跳过 <code>_ends_with_newline(key)</code> 的检查。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未在给定源码片段中出现直接调用方; 外部内部 helper 若需要把单个 <code>key</code> 归类为“执行命令”可调用此谓词</li><li><strong>核心被调用</strong>: TmuxSession._is_enter_key; TmuxSession._ends_with_newline</li><li><strong>配置/状态来源</strong>: 参数 <code>key</code>; <code>self._is_enter_key</code> 的返回结果; <code>self._ends_with_newline</code> 的返回结果</li><li><strong>结果去向</strong>: 当前函数的布尔返回值; 调用方可据此决定是否把该 <code>key</code> 视为触发执行的输入</li><li><strong>同类 sibling</strong>: 同 stage 兄弟 <code>_prepare_keys</code> 处理按键列表与阻塞策略；本函数只处理单个 <code>key</code> 的真值判定。; 同 stage 兄弟 <code>send_keys</code> 负责实际发送路径选择；本函数不参与发送，只提供一个布尔谓词。</li></ul></div></details><details class="file" id="fn-tmuxsession_is_enter_key"><summary><span class="chev"></span><code class="fpath">TmuxSession._is_enter_key</code><a class="fn-range" href="../code/tmux_session.py.html#L511-L512" title="tmux_session.py:511-512">tmux_session.py:511–512 ↗</a></summary><div class="file-body"><p class="fn-sub">判定按键是否属于预设成员表</p>
+<blockquote><p><strong>stage 上下文</strong>: 该条目位于 tmux 子系统内部 helper 分层中，但就当前源码可见范围，本函数本体只承担一次简单布尔判定。它没有展示与其他 helper 的直接交互，也不包含额外控制流或状态处理。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_is_enter_key</code> 接收一个 <code>key: str</code>，读取 <code>self._ENTER_KEYS</code>，并直接返回 <code>key in self._ENTER_KEYS</code> 的布尔结果。函数唯一产出是该成员测试结果；源码中没有实例状态写入、外部调用或其他副作用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, key: str) -&gt; bool</code></p>
+<ul><li>参数: <code>key</code>: <code>str</code> — 待判定的按键字符串</li><li>读状态: <code>self._ENTER_KEYS</code></li><li>返回: 返回 <code>key</code> 是否属于 <code>self._ENTER_KEYS</code> 的布尔值。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>读取实例上的 <code>self._ENTER_KEYS</code>。</li><li>对传入的 <code>key</code> 执行成员测试 <code>key in self._ENTER_KEYS</code>。</li><li>将该测试结果作为布尔值直接返回。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _is_enter_key(self, key: str) -&gt; bool:
+        return key in self._ENTER_KEYS</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>该实现把整个判定压缩为单行成员测试，没有加入额外分支、归一化或异常处理；因此函数语义完全等同于 <code>key in self._ENTER_KEYS</code> 这一源码表达式。</li><li>函数本体只读 <code>self._ENTER_KEYS</code> 而不改写任何实例属性，说明它被实现为无副作用的薄包装判定接口。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 当前提供的源码片段未展示直接调用方</li><li><strong>核心被调用</strong>: 无；函数体内没有调用其他函数或方法</li><li><strong>配置/状态来源</strong>: self._ENTER_KEYS</li><li><strong>结果去向</strong>: 直接返回给调用者的布尔结果</li></ul></div></details><details class="file" id="fn-tmuxsession_ends_with_newline"><summary><span class="chev"></span><code class="fpath">TmuxSession._ends_with_newline</code><a class="fn-range" href="../code/tmux_session.py.html#L514-L516" title="tmux_session.py:514-516">tmux_session.py:514–516 ↗</a></summary><div class="file-body"><p class="fn-sub">基于会话正则的匹配布尔封装</p>
+<blockquote><p><strong>stage 上下文</strong>: 该条目位于 tmux 子系统内部 helper 分层中，职责很窄，只把一次正则搜索结果规整成布尔值。它属于实现细节级别的会话辅助函数，不承担状态编排，也不直接操作 tmux 外部资源。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_ends_with_newline</code> 接收一个 <code>key: str</code>，读取实例上的 <code>self._ENDS_WITH_NEWLINE_PATTERN</code>，并对 <code>key</code> 执行 <code>re.search(...)</code>。函数把搜索结果保存到局部变量 <code>result</code>，随后返回 <code>result is not None</code> 的布尔值。源码中没有任何实例状态写入，也没有除正则搜索外的额外处理。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, key: str) -&gt; bool</code></p>
+<ul><li>参数: <code>key</code>: <code>str</code> — 传入 <code>re.search(self._ENDS_WITH_NEWLINE_PATTERN, key)</code> 的待匹配字符串</li><li>读状态: <code>self._ENDS_WITH_NEWLINE_PATTERN</code></li><li>返回: 返回 <code>re.search(self._ENDS_WITH_NEWLINE_PATTERN, key)</code> 是否得到匹配；有匹配为 <code>True</code>，否则为 <code>False</code>。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>以 <code>self._ENDS_WITH_NEWLINE_PATTERN</code> 和参数 <code>key</code> 调用 <code>re.search(...)</code>，并将返回值存入局部变量 <code>result</code>。</li><li>执行显式非空判断 <code>result is not None</code>，把匹配对象或 <code>None</code> 归一化为布尔返回值。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _ends_with_newline(self, key: str) -&gt; bool:
+        result = re.search(self._ENDS_WITH_NEWLINE_PATTERN, key)
+        return result is not None</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数没有直接返回 <code>re.search(...)</code> 的原始结果，而是用 <code>result is not None</code> 做显式布尔化；这把返回契约固定为 <code>bool</code>，避免向调用方暴露正则匹配对象。</li><li>匹配模式取自实例属性 <code>self._ENDS_WITH_NEWLINE_PATTERN</code>，而不是在函数体内内联字面量；可见取舍是复用对象已有配置，而非在此处重新定义规则。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未在本翻译单元源码中直接出现；调用方信息不由此段代码显式给出</li><li><strong>核心被调用</strong>: re.search</li><li><strong>配置/状态来源</strong>: self._ENDS_WITH_NEWLINE_PATTERN; 参数 <code>key</code></li><li><strong>结果去向</strong>: 直接返回给该函数的调用方，形式为布尔值; 局部变量 <code>result</code> 仅作为返回前的中间承载</li><li><strong>同类 sibling</strong>: 同 stage 的 <code>_is_enter_key</code> 也是单一判定 helper，但它做的是集合成员测试；本函数对应的是正则匹配后的布尔封装。</li></ul></div></details><details class="file" id="fn-tmuxsession_prevent_execution"><summary><span class="chev"></span><code class="fpath">TmuxSession._prevent_execution</code><a class="fn-range" href="../code/tmux_session.py.html#L529-L542" title="tmux_session.py:529-542">tmux_session.py:529–542 ↗</a></summary><div class="file-body"><p class="fn-sub">tmux 按键序列去执行化辅助器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该条目位于 tmux 子系统的内部 helper 层，职责是对按键 token 列表做末尾清理，使其不再满足“会触发命令执行”的尾部形态。它与同 stage 的 <code>_is_executing_command</code>、<code>_is_enter_key</code>、<code>_ends_with_newline</code> 形成前后配套关系：兄弟函数负责判定，当前函数负责按该判定结果重写列表。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_prevent_execution</code> 接收 <code>keys: list[str]</code>，先复制一份列表，再持续检查末尾 token 是否被 <code>self._is_executing_command(keys[-1])</code> 视为执行命令的输入。若是 Enter 类 token，则直接移除；否则对最后一个 token 按 <code>self._NEWLINE_CHARS</code> 做右侧 <code>rstrip</code>，必要时回写或删除。函数返回清理后的新列表，不写入任何实例状态，也不修改调用方传入的原列表。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, keys: list[str]) -&gt; list[str]</code></p>
+<ul><li>参数: <code>keys</code>: <code>list[str]</code> — 待清理的 tmux 按键 token 列表，函数会基于其末尾元素是否构成执行输入来重写副本</li><li>读状态: <code>self._is_executing_command(...)</code>, <code>self._is_enter_key(...)</code>, <code>self._NEWLINE_CHARS</code></li><li>返回: 返回一个新的 <code>list[str]</code>：其末尾已被反复清理，直到列表为空或最后一个 token 不再被判定为执行命令。</li><li>副作用: 无实例状态写入; 对局部副本 <code>keys = keys.copy()</code> 进行修改，不改变调用方原始列表</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>首先执行 <code>keys = keys.copy()</code>，建立输入列表的副本，后续所有修改都作用于这份局部列表。</li><li>进入 <code>while keys and self._is_executing_command(keys[-1])</code> 循环；只要列表非空且最后一个 token 仍会触发执行，就继续处理尾部。</li><li>若 <code>self._is_enter_key(keys[-1])</code> 为真，则把该末尾 token 直接 <code>pop()</code> 掉。</li><li>否则进入非 Enter 分支：对最后一个 token 执行 <code>rstrip(self._NEWLINE_CHARS)</code>，结果保存到 <code>stripped_key</code>。</li><li>如果 <code>stripped_key</code> 非空，则用它覆盖原末尾元素 <code>keys[-1] = stripped_key</code>；如果为空，则说明剥掉右侧换行字符后该 token 已无内容，直接 <code>pop()</code> 删除该元素。</li><li>循环结束后返回当前 <code>keys</code>，此时其末尾已不再满足 <code>_is_executing_command(...)</code>，或列表已空。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _prevent_execution(self, keys: list[str]) -&gt; list[str]:
+        keys = keys.copy()
+        while keys and self._is_executing_command(keys[-1]):
+            if self._is_enter_key(keys[-1]):
+                keys.pop()
+            else:
+                stripped_key = keys[-1].rstrip(self._NEWLINE_CHARS)
+
+                if stripped_key:
+                    keys[-1] = stripped_key
+                else:
+                    keys.pop()
+
+        return keys</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li><code>keys.copy()</code> 明确选择在副本上工作，而不是原地修改传入参数；这一点从首行赋值可直接观察到，避免了调用方列表被隐式改写。</li><li>使用 <code>while</code> 而非单次 <code>if</code>，意味着代码显式支持连续清理多个尾部执行触发项，而不是只处理最后一个 token 一次。</li><li>Enter 类 token 与非 Enter token 走分支处理：前者整项删除，后者仅按 <code>self._NEWLINE_CHARS</code> 做右侧剥离；这保持了非 Enter token 在去掉尾部换行后的其余内容。</li><li>对 <code>rstrip(...)</code> 结果做显式真值检查，说明代码区分“剥离后仍有内容”和“剥离后为空串”两种情况；为空时改为删除整个 token，避免把空字符串留在列表尾部。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未在给定源码片段中展示; 外部调用方未知；本片段只能确认它是实例内部方法</li><li><strong>核心被调用</strong>: self._is_executing_command(keys[-1]); self._is_enter_key(keys[-1]); str.rstrip(self._NEWLINE_CHARS); list.copy(); list.pop()</li><li><strong>配置/状态来源</strong>: self._NEWLINE_CHARS; 由 <code>self._is_executing_command(...)</code> 封装的对象内判定逻辑; 由 <code>self._is_enter_key(...)</code> 封装的对象内判定逻辑</li><li><strong>结果去向</strong>: 返回给本方法的直接调用者作为清理后的按键列表; 作为同一 <code>TmuxSession</code> 内部后续处理可消费的列表值</li><li><strong>同类 sibling</strong>: TmuxSession._is_executing_command：负责判定单个 token 是否构成执行输入；本函数据此决定是否继续清理尾部。; TmuxSession._is_enter_key：负责识别 Enter 类 token；本函数在 Enter 分支中直接删除该 token。; TmuxSession._ends_with_newline：同属执行判定链上的基础检查，但本函数自身不直接调用它，而是经由 <code>_is_executing_command(...)</code> 间接利用该语义。</li></ul></div></details><details class="file" id="fn-tmuxsession_send_non_blocking_keys"><summary><span class="chev"></span><code class="fpath">TmuxSession._send_non_blocking_keys</code><a class="fn-range" href="../code/tmux_session.py.html#L594-L611" title="tmux_session.py:594-611">tmux_session.py:594–611 ↗</a></summary><div class="file-body"><p class="fn-sub">tmux 非阻塞按键发送与最小时延补偿</p>
+<blockquote><p><strong>stage 上下文</strong>: 该条目属于 tmux 子系统内部 helper，用于把一组已准备好的命令 token 展开成底层命令并逐条提交给 <code>environment.exec(...)</code>。它只覆盖非阻塞分支内部的实际执行与节流补偿，不处理按键预处理、阻塞判定或完成检测；这些职责由同 stage 的其他兄弟函数承担。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_send_non_blocking_keys(...)</code> 接收 <code>keys</code> 与 <code>min_timeout_sec</code>，先调用 <code>self._tmux_send_keys(keys)</code> 生成命令序列，再按顺序以 <code>user=self._user</code> 逐条执行 <code>self.environment.exec(...)</code>。每次执行后都会检查结果对象的 <code>return_code</code>；一旦非零，就用同一结果里的 <code>stderr</code> 组装 <code>RuntimeError</code> 抛出。若前面这段执行累计耗时仍小于 <code>min_timeout_sec</code>，函数会额外 <code>await asyncio.sleep(...)</code> 补足剩余时长；否则直接结束，本身无显式返回值，也不写入实例状态。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, keys: list[str], min_timeout_sec: float) -&gt; None</code></p>
+<ul><li>参数: <code>keys</code>: <code>list[str]</code> — 传入 <code>self._tmux_send_keys(keys)</code> 以生成待执行命令序列的按键 token 列表; <code>min_timeout_sec</code>: <code>float</code> — 与执行前后测得的耗时比较，决定是否需要额外睡眠补足最小时长</li><li>读状态: <code>self._tmux_send_keys</code>, <code>self.environment</code>, <code>self._user</code></li><li>返回: 无显式返回值；真正产出是逐条执行 <code>self._tmux_send_keys(keys)</code> 生成的命令，并在需要时追加一次异步睡眠。</li><li>副作用: 通过 <code>self.environment.exec(command=command, user=self._user)</code> 逐条执行生成出的命令; 读取每次执行结果对象的 <code>return_code</code> 与 <code>stderr</code> 以决定是否抛出异常; 在 <code>elapsed_time_sec &lt; min_timeout_sec</code> 时执行一次 <code>asyncio.sleep(...)</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>函数开始时记录 <code>start_time_sec = time.time()</code>，把它作为后续最小时长判断的起点。</li><li>对 <code>self._tmux_send_keys(keys)</code> 产出的每个 <code>command</code> 逐条循环，调用 <code>await self.environment.exec(command=command, user=self._user)</code> 执行，并接收结果对象 <code>result</code>。</li><li>每次拿到 <code>result</code> 后立即检查 <code>result.return_code != 0</code>；若条件成立，则以 <code>self.environment.session_id</code> 和 <code>result.stderr</code> 组装错误消息并抛出 <code>RuntimeError</code>，函数在该处提前终止。</li><li>若所有命令都未触发上述异常，则计算 <code>elapsed_time_sec = time.time() - start_time_sec</code>，这里测得的是从函数开头到全部命令执行结束这一段已消耗的时间。</li><li>仅当 <code>elapsed_time_sec &lt; min_timeout_sec</code> 时，才 <code>await asyncio.sleep(min_timeout_sec - elapsed_time_sec)</code> 补足剩余时长；若耗时等于或超过阈值，由于条件是严格的小于号，睡眠会被完全跳过。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    async def _send_non_blocking_keys(
+        self,
+        keys: list[str],
+        min_timeout_sec: float,
+    ):
+        start_time_sec = time.time()
+
+        for command in self._tmux_send_keys(keys):
+            result = await self.environment.exec(command=command, user=self._user)
+            if result.return_code != 0:
+                raise RuntimeError(
+                    f"{self.environment.session_id}: failed to send non-blocking keys: {result.stderr}"
+                )
+
+        elapsed_time_sec = time.time() - start_time_sec
+
+        if elapsed_time_sec &lt; min_timeout_sec:
+            await asyncio.sleep(min_timeout_sec - elapsed_time_sec)</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>错误处理采用逐条执行后立即检查 <code>result.return_code</code> 的失败即抛出策略，而不是收集全部结果后统一处理；这样一旦某条命令失败，后续命令不会继续提交，且异常消息直接复用当前 <code>result.stderr</code>。</li><li>最小时长控制是“补差额”而不是固定追加等待：代码先测量从 <code>start_time_sec</code> 到命令循环结束的已耗时，再只在不足 <code>min_timeout_sec</code> 时睡眠剩余部分，因此不会无条件增加一个完整的后置延迟。</li><li>睡眠条件使用严格的 <code>elapsed_time_sec &lt; min_timeout_sec</code>，这意味着当已耗时恰好达到阈值时也不会进入睡眠，体现的是下限满足即结束，而非追求额外缓冲。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 同一 tmux 子系统中的更高层非阻塞发送路径会 await 本协程以执行生成命令</li><li><strong>核心被调用</strong>: self._tmux_send_keys; self.environment.exec; time.time; asyncio.sleep</li><li><strong>配置/状态来源</strong>: 参数 <code>keys</code>; 参数 <code>min_timeout_sec</code>; self._user; self.environment.session_id</li><li><strong>结果去向</strong>: 通过 <code>self.environment.exec(...)</code> 向外部环境提交命令; 失败时抛出 <code>RuntimeError</code> 给上层调用者; 成功路径在必要时通过 <code>asyncio.sleep(...)</code> 延后协程完成时刻</li><li><strong>同类 sibling</strong>: 同 stage 的 <code>send_keys</code> 负责更高层发送入口；本函数只实现其非阻塞执行细节。; 同 stage 的 <code>_prepare_keys</code> 负责按键列表归一化与阻塞相关改写；本函数不处理这些输入整形。; 同 stage 的 <code>_prevent_execution</code>、<code>_is_executing_command</code> 等兄弟函数负责按键语义判断；本函数只消费最终传入的 <code>keys</code>。</li></ul></div></details><details class="file" id="fn-tmuxsession_send_blocking_keys"><summary><span class="chev"></span><code class="fpath">TmuxSession._send_blocking_keys</code><a class="fn-range" href="../code/tmux_session.py.html#L571-L592" title="tmux_session.py:571-592">tmux_session.py:571–592 ↗</a></summary><div class="file-body"><p class="fn-sub">tmux 阻塞式按键发送与等待助手</p>
+<blockquote><p><strong>stage 上下文</strong>: 该条目位于 tmux internal helpers，职责是执行一次“发送按键后等待完成信号”的底层阻塞流程。它与同 stage 的 <code>_send_non_blocking_keys</code> 形成对照：两者都负责下发 tmux 按键命令，但这里只有在发送完成后额外执行一次 <code>tmux wait done</code> 等待，并记录阻塞耗时日志。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_send_blocking_keys</code> 接收 <code>keys</code> 与 <code>max_timeout_sec</code>，先把 <code>keys</code> 交给 <code>self._tmux_send_keys(keys)</code> 展开为一个或多个实际命令，并逐条通过 <code>self.environment.exec(..., user=self._user)</code> 发送。任一发送命令返回非零 <code>return_code</code> 时，函数立即抛出带 <code>self.environment.session_id</code> 和 <code>stderr</code> 的 <code>RuntimeError</code>。发送全部成功后，它执行 <code>timeout {max_timeout_sec}s tmux wait done</code>；对这一步的任何非零返回统一映射为 <code>TimeoutError</code>。若等待步骤返回零，则计算从入口开始的总耗时并写入一条 debug 日志，本身无显式返回值。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, keys: list[str], max_timeout_sec: float)</code></p>
+<ul><li>参数: <code>keys</code>: <code>list[str]</code> — 待发送到 tmux 的按键 token 列表; <code>max_timeout_sec</code>: <code>float</code> — 等待 <code>tmux wait done</code> 的超时上限，直接插入 timeout 命令字符串</li><li>读状态: <code>self._tmux_send_keys</code>, <code>self.environment</code>, <code>self.environment.session_id</code>, <code>self._user</code>, <code>self._logger</code></li><li>返回: 无显式返回值；真正产出是向外部环境发送按键命令、执行一次等待命令，并在失败时抛出异常。</li><li>副作用: 调用 <code>self.environment.exec(...)</code> 执行展开后的 tmux 发送命令; 调用 <code>self.environment.exec(...)</code> 执行 <code>timeout {max_timeout_sec}s tmux wait done</code>; 发送失败时抛出 <code>RuntimeError</code>; 等待步骤非零返回时抛出 <code>TimeoutError</code>; 成功路径写入一条 debug 日志</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>记录入口时间 <code>start_time_sec = time.time()</code>，用于整个阻塞流程结束后的耗时统计。</li><li>调用 <code>self._tmux_send_keys(keys)</code> 取得待执行命令序列，并对其中每个 <code>command</code> 逐条 <code>await self.environment.exec(command=command, user=self._user)</code>。</li><li>每次发送后检查 <code>result.return_code</code>；只要某条发送命令返回非零，就立即抛出 <code>RuntimeError(f"{self.environment.session_id}: failed to send blocking keys: {result.stderr}")</code>，后续命令与等待步骤都不会继续执行。</li><li>若全部发送命令成功，再执行 <code>await self.environment.exec(f"timeout {max_timeout_sec}s tmux wait done", user=self._user)</code> 进入阻塞等待。</li><li>检查等待命令的 <code>result.return_code</code>；代码把任何非零返回统一视为超时路径，并抛出 <code>TimeoutError(f"Command timed out after {max_timeout_sec} seconds")</code>，不再区分其他失败原因。</li><li>仅当等待命令返回零时，计算 <code>time.time() - start_time_sec</code> 得到总耗时，并通过 <code>self._logger.debug(...)</code> 记录 <code>Blocking command completed in ...s.</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    async def _send_blocking_keys(
+        self,
+        keys: list[str],
+        max_timeout_sec: float,
+    ):
+        start_time_sec = time.time()
+
+        for command in self._tmux_send_keys(keys):
+            result = await self.environment.exec(command=command, user=self._user)
+            if result.return_code != 0:
+                raise RuntimeError(
+                    f"{self.environment.session_id}: failed to send blocking keys: {result.stderr}"
+                )
+
+        result = await self.environment.exec(
+            f"timeout {max_timeout_sec}s tmux wait done", user=self._user
+        )
+        if result.return_code != 0:
+            raise TimeoutError(f"Command timed out after {max_timeout_sec} seconds")
+
+        elapsed_time_sec = time.time() - start_time_sec
+        self._logger.debug(f"Blocking command completed in {elapsed_time_sec:.2f}s.")</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>发送阶段采用逐条执行、逐条校验的失败即停策略：循环内一旦发现 <code>return_code != 0</code> 就直接抛出 <code>RuntimeError</code>。这保证调用方不会在已知发送失败后继续进入等待步骤，但代价是不会尝试继续发送剩余命令。</li><li>等待阶段不解析 <code>stderr</code>、也不细分退出原因，而是把 <code>timeout {max_timeout_sec}s tmux wait done</code> 的任何非零返回统一映射为 <code>TimeoutError</code>。这是代码里明确可见的归一化处理，换来的结果是异常类型简单，但会丢失“非零是否真由超时引起”的区分信息。</li><li>耗时统计覆盖的是从首次发送前到等待完成后的整段流程，因为 <code>start_time_sec</code> 在任何外部命令执行之前记录，最终日志反映的是“发送 + 等待”的总耗时，而非仅等待耗时。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未知；给定源码片段未展示直接调用点; 任何需要以阻塞方式发送 tmux 按键的同类内部流程</li><li><strong>核心被调用</strong>: self._tmux_send_keys; self.environment.exec; time.time; self._logger.debug</li><li><strong>配置/状态来源</strong>: 参数 <code>keys</code>; 参数 <code>max_timeout_sec</code>; self._user; self.environment.session_id</li><li><strong>结果去向</strong>: 外部 tmux/环境命令执行副作用; RuntimeError 异常路径; TimeoutError 异常路径; debug 日志输出</li><li><strong>同类 sibling</strong>: 与 <code>_send_non_blocking_keys</code> 同样负责把 <code>keys</code> 经 <code>_tmux_send_keys(...)</code> 展开后逐条执行，并在发送命令非零返回时抛出异常；区别是本函数随后还会执行一次 <code>timeout ... tmux wait done</code>，并在成功后记录阻塞耗时。</li></ul></div></details><details class="file" id="fn-tmuxsession_tmux_send_keys"><summary><span class="chev"></span><code class="fpath">TmuxSession._tmux_send_keys</code><a class="fn-range" href="../code/tmux_session.py.html#L341-L392" title="tmux_session.py:341-392">tmux_session.py:341–392 ↗</a></summary><div class="file-body"><p class="fn-sub">tmux 按键命令分批构造器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 tmux 子系统内部 helper 层，负责把上游已经准备好的按键 token 序列翻译成可执行的 <code>tmux send-keys</code> 命令字符串。它通常由 <code>_send_non_blocking_keys(...)</code> 与 <code>_send_blocking_keys(...)</code> 在真正调用 <code>environment.exec(...)</code> 前触发。与兄弟函数相比，<code>_prepare_keys(...)</code> 决定“发什么、是否阻塞”，而本函数只负责“怎样把这些按键打包成 tmux 能接受的命令”。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_tmux_send_keys</code> 接收 <code>keys: list[str]</code>，读取 <code>self._session_name</code> 与 <code>self._TMUX_SEND_KEYS_MAX_COMMAND_LENGTH</code>，生成一个或多个 <code>tmux send-keys -t &lt;session&gt; ...</code> 命令字符串并返回。若所有按键在 shell 转义后仍能落入单条命令长度上限，则直接返回单元素列表；否则按长度上限分批，并在单个按键本身过长时借助 <code>_split_key_for_tmux(...)</code> 再拆分。函数不执行命令、不写入实例状态，真正的产出是供后续发送路径逐条执行的字符串列表。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, keys: list[str]) -&gt; list[str]</code></p>
+<ul><li>参数: <code>keys</code>: <code>list[str]</code> — 待发送到 tmux 会话的一组按键 token，由上游发送路径或阻塞包装逻辑提供</li><li>读状态: <code>self._session_name</code>, <code>self._TMUX_SEND_KEYS_MAX_COMMAND_LENGTH</code>, <code>self._split_key_for_tmux</code></li><li>返回: 返回 <code>list[str]</code>：一个或多个可直接执行的 <code>tmux send-keys -t &lt;session&gt; ...</code> 命令字符串；顺序保持输入按键的发送顺序。</li><li>副作用: 无实例状态写入; 无外部命令执行; 仅构造并返回命令字符串</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先以 <code>self._session_name</code> 经过 <code>shlex.quote(...)</code> 后构造固定前缀 <code>tmux send-keys -t ...</code>，并读取长度上限 <code>self._TMUX_SEND_KEYS_MAX_COMMAND_LENGTH</code> 作为后续所有打包判定的基准。</li><li>把全部 <code>keys</code> 先映射成 <code>escaped_keys = [shlex.quote(key) for key in keys]</code>，拼出单条候选命令 <code>single</code>；若其总长度未超过 <code>max_len</code>，立即返回 <code>[single]</code>，走单命令快速路径。</li><li>若单条命令超限，则初始化 <code>commands</code>、当前批次 <code>current_escaped</code> 与累计长度 <code>current_len</code>，并定义局部 <code>_flush()</code>：只要当前批次非空，就把它封装成一条完整命令追加到 <code>commands</code>，随后清空批次并把长度重置为前缀长度。</li><li>按原顺序遍历每个 <code>key</code>，对其重新做一次 <code>shlex.quote(...)</code>，并计算把该键加入当前命令所需增加的长度 <code>addition = 1 + len(escaped)</code>；其中额外的 <code>1</code> 对应前置空格。</li><li>若当前批次还能容纳该键，则直接把转义后的键追加到 <code>current_escaped</code>；若当前批次放不下、但该键单独作为一条命令仍未超限，则先 <code>_flush()</code> 结束上一批，再以该键开启新批次。</li><li>若某个键连单独成命令都超限，则先 <code>_flush()</code>，再计算可供单个转义片段使用的最大长度 <code>max_escaped = max_len - len(prefix) - 1</code>，并调用 <code>self._split_key_for_tmux(key, max_escaped)</code> 把该键拆成多个已适配长度约束的转义片段。</li><li>对拆出的每个 <code>chunk_escaped</code>，继续复用同一套“能装入当前批次就追加，否则先 <code>_flush()</code> 再新开一条”的策略，把超长单键分摊到一条或多条 <code>tmux send-keys</code> 命令中。</li><li>遍历结束后执行最后一次 <code>_flush()</code>，把尾部尚未落盘的批次写入 <code>commands</code>，再返回完整命令列表。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _tmux_send_keys(self, keys: list[str]) -&gt; list[str]:
+        """Build one or more ``tmux send-keys`` commands for *keys*.
+
+        If the shell-escaped command would exceed the tmux command-length
+        limit, the keys are spread across multiple commands so that each
+        individual command stays within the limit.  Oversized single keys
+        are split into sub-strings whose quoted form fits.
+        """
+        prefix = "tmux send-keys -t " + shlex.quote(self._session_name)
+        max_len = self._TMUX_SEND_KEYS_MAX_COMMAND_LENGTH
+
+        escaped_keys = [shlex.quote(key) for key in keys]
+        single = prefix + " " + " ".join(escaped_keys)
+        if len(single) &lt;= max_len:
+            return [single]
+
+        commands: list[str] = []
+        current_escaped: list[str] = []
+        current_len = len(prefix)
+
+        def _flush() -&gt; None:
+            nonlocal current_len
+            if current_escaped:
+                commands.append(prefix + " " + " ".join(current_escaped))
+                current_escaped.clear()
+                current_len = len(prefix)
+
+        for key in keys:
+            escaped = shlex.quote(key)
+            addition = 1 + len(escaped)  # space + quoted key
+
+            if current_len + addition &lt;= max_len:
+                current_escaped.append(escaped)
+                current_len += addition
+            elif len(prefix) + addition &lt;= max_len:
+                _flush()
+                current_escaped.append(escaped)
+                current_len = len(prefix) + addition
+            else:
+                _flush()
+                max_escaped = max_len - len(prefix) - 1
+                for chunk_escaped in self._split_key_for_tmux(key, max_escaped):
+                    if current_len + 1 + len(chunk_escaped) &lt;= max_len:
+                        current_escaped.append(chunk_escaped)
+                        current_len += 1 + len(chunk_escaped)
+                    else:
+                        _flush()
+                        current_escaped.append(chunk_escaped)
+                        current_len = len(prefix) + 1 + len(chunk_escaped)
+
+        _flush()
+        return commands</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数先尝试一次“整体单命令”快速路径，而不是一开始就进入逐键分批流程；这是对常见短命令场景的优化，既减少分支，也避免在无需拆分时维护批次状态。</li><li>长度判定基于 <code>shlex.quote(...)</code> 后的字符串，而不是原始 <code>key</code> 长度；代码显式围绕 shell 转义后的真实命令长度做预算，避免原始文本较短但转义后膨胀，最终生成超出 tmux 限制的命令。</li><li>对超限情况采用“两级退让”：先尝试按键级分批，只有当单个键自身仍过长时才调用 <code>_split_key_for_tmux(...)</code>。这种分层策略保留了普通按键的原子性，避免把本可整体发送的 token 过度拆碎。</li><li>局部 <code>_flush()</code> 只在 <code>current_escaped</code> 非空时追加命令，意味着即便遇到连续边界切换或超长键分裂，也不会生成空的 <code>tmux send-keys</code> 命令；这是一个静默但重要的正确性约束。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: TmuxSession._send_non_blocking_keys; TmuxSession._send_blocking_keys; tmux 内部按键发送路径在实际 <code>environment.exec(...)</code> 前的命令准备步骤; 由 <code>TmuxSession.send_keys</code> 间接触发的阻塞/非阻塞发送分支</li><li><strong>核心被调用</strong>: shlex.quote; TmuxSession._split_key_for_tmux</li><li><strong>配置/状态来源</strong>: self._session_name：决定 <code>-t &lt;session&gt;</code> 目标会话; self._TMUX_SEND_KEYS_MAX_COMMAND_LENGTH：决定单条命令最大允许长度; 输入参数 <code>keys</code>：提供待编码的按键序列; tmux <code>send-keys</code> 命令格式约束：决定返回值字符串的目标形态</li><li><strong>结果去向</strong>: 返回给 TmuxSession._send_non_blocking_keys 逐条执行; 返回给 TmuxSession._send_blocking_keys 逐条执行; 其返回列表中的每个字符串随后作为 <code>environment.exec(...)</code> 的命令参数; 为上层阻塞/非阻塞按键发送流程提供已分批且不超长的 tmux 命令表示</li><li><strong>同类 sibling</strong>: 相较于 <code>_prepare_keys(...)</code> 负责阻塞判定与补尾命令，本函数只处理命令字符串的长度约束与分批。; 相较于 <code>_send_non_blocking_keys(...)</code> 与 <code>_send_blocking_keys(...)</code> 会真正调用 <code>environment.exec(...)</code> 并处理错误，本函数纯构造返回值，没有执行副作用。; 当 <code>_prepare_keys(...)</code> 已经追加 <code>self._TMUX_COMPLETION_COMMAND</code> 与 <code>Enter</code> 后，这些新增 token 也会被本函数纳入同一套分批规则。</li></ul></div></details><details class="file" id="fn-tmuxsession_tmux_send_keys_flush"><summary><span class="chev"></span><code class="fpath">TmuxSession._tmux_send_keys._flush</code><a class="fn-range" href="../code/tmux_session.py.html#L361-L366" title="tmux_session.py:361-366">tmux_session.py:361–366 ↗</a></summary><div class="file-body"><p class="fn-sub">tmux 发送命令分批刷出助手</p>
+<blockquote><p><strong>stage 上下文</strong>: 该单元是 <code>TmuxSession._tmux_send_keys</code> 内部的嵌套助手，只服务于 tmux <code>send-keys</code> 命令字符串的分批拼装。它在外围逻辑判断“当前批次需要落盘”或“循环结束后做最终排空”时被触发，把已缓冲的一批按键转成一条完整命令。与同 stage 的 <code>_tmux_send_keys</code>、<code>_split_key_for_tmux</code> 一样，它属于底层实现细节；不同于 <code>_send_non_blocking_keys</code> / <code>_send_blocking_keys</code>，它不执行任何命令。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_flush</code> 从闭包中读取 <code>current_escaped</code>、<code>commands</code>、<code>prefix</code> 与 <code>current_len</code>，负责把当前已缓冲的转义按键 token 一次性追加到累计命令列表 <code>commands</code>。只有在 <code>current_escaped</code> 非空时，它才生成 <code>prefix + " " + " ".join(current_escaped)</code> 这一条 tmux 命令，并随后清空缓冲、把 <code>current_len</code> 重置为 <code>len(prefix)</code>。函数返回 <code>None</code>；真正产出是对外围局部状态的原地更新，供 <code>_tmux_send_keys</code> 继续分批或最终返回。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>() -&gt; None</code></p>
+<ul><li>返回: 返回 <code>None</code>；真正结果是把一条组装完成的命令写入闭包变量 <code>commands</code>，并重置当前批次缓冲状态。</li><li>副作用: 向闭包列表 <code>commands</code> 追加一条命令字符串; 清空闭包列表 <code>current_escaped</code>; 通过 <code>nonlocal current_len</code> 回写当前长度为 <code>len(prefix)</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>声明 <code>nonlocal current_len</code>，表明后续会直接改写外围 <code>_tmux_send_keys</code> 中维护的当前命令长度计数。</li><li>检查闭包变量 <code>current_escaped</code> 是否非空；若当前没有任何待输出 token，则函数直接结束，不产生新命令。</li><li>当 <code>current_escaped</code> 有内容时，将 <code>prefix</code> 与 <code>' '.join(current_escaped)</code> 组合成一条完整 shell 命令，并追加到 <code>commands</code>。</li><li>完成追加后，调用 <code>current_escaped.clear()</code> 清空当前批次缓冲，避免这些 token 被重复写入下一条命令。</li><li>最后把 <code>current_len</code> 重置为 <code>len(prefix)</code>，使外围逻辑后续按“只有前缀、尚未追加任何 key”的长度基线继续累计。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>        def _flush() -&gt; None:
+            nonlocal current_len
+            if current_escaped:
+                commands.append(prefix + " " + " ".join(current_escaped))
+                current_escaped.clear()
+                current_len = len(prefix)</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>它只在 <code>current_escaped</code> 非空时才追加命令，这是一个显式的空批次抑制策略：避免生成仅含 <code>prefix</code> 的空 <code>tmux send-keys</code> 命令，减少无意义发送。</li><li>函数在刷出后同时执行“清空缓冲”和“重置 <code>current_len</code>”，把一次批次提交后的两项收尾动作绑定在同一原子助手里；这样外围 <code>_tmux_send_keys</code> 在多处触发排空时无需重复维护这两项一致性。</li><li>这里不返回新列表或新长度，而是通过闭包原地改写 <code>commands</code>、<code>current_escaped</code> 与 <code>current_len</code>。这种选择符合其作为微型 batching primitive 的定位，降低了外围分批循环的返回值拆包复杂度。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: TmuxSession._tmux_send_keys 中的分批构造循环; TmuxSession._tmux_send_keys 的最终排空路径</li><li><strong>核心被调用</strong>: commands.append(...); ' '.join(current_escaped); current_escaped.clear(); len(prefix)</li><li><strong>配置/状态来源</strong>: 闭包变量 <code>prefix</code>：当前 tmux send-keys 命令前缀; 闭包变量 <code>current_escaped</code>：当前批次已转义 token 缓冲; 闭包变量 <code>commands</code>：累计输出命令列表; 闭包变量 <code>current_len</code>：外围维护的当前命令长度计数</li><li><strong>结果去向</strong>: 闭包列表 <code>commands</code>，供 <code>TmuxSession._tmux_send_keys</code> 最终返回; 闭包变量 <code>current_escaped</code> 的空状态，供外围开始下一批收集; 闭包变量 <code>current_len</code> 的重置值，供外围继续长度控制; 后续 <code>_send_non_blocking_keys</code> / <code>_send_blocking_keys</code> 消费的 tmux 命令序列</li><li><strong>同类 sibling</strong>: 与兄弟函数 <code>_tmux_send_keys</code> 相比，<code>_flush</code> 不负责拆分策略，只负责把当前已决定的一批 token 落成一条命令。; 与 <code>_prepare_keys</code>、<code>_prevent_execution</code> 这类上游按键规范化函数不同，本函数完全不解释按键语义，只处理命令批次缓冲的提交。</li></ul></div></details><details class="file" id="fn-tmuxsession_split_key_for_tmux"><summary><span class="chev"></span><code class="fpath">TmuxSession._split_key_for_tmux</code><a class="fn-range" href="../code/tmux_session.py.html#L395-L410" title="tmux_session.py:395-410">tmux_session.py:395–410 ↗</a></summary><div class="file-body"><p class="fn-sub">tmux 按键分块转义辅助</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 tmux 子系统内部辅助层，职责是为下游 <code>tmux send-keys</code> 命令构造提供长度受限的转义片段。它不会直接发送命令，只在调用方发现单条按键经 shell 转义后可能超长时触发。相较同 stage 的 <code>_tmux_send_keys</code> 负责整批命令拼装、<code>_send_*_keys</code> 负责真正执行，本函数只处理“单个过长 key 如何切块”这一更底层问题。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_split_key_for_tmux</code> 接收原始字符串 <code>key</code> 与转义后长度上限 <code>max_escaped_len</code>，把 <code>key</code> 拆成多个已经过 <code>shlex.quote(...)</code> 处理的片段，并保证每个片段的转义结果长度都不超过给定上限。函数只读取这两个入参，不访问任何 <code>self</code> 状态，也不产生外部副作用。返回值是 <code>list[str]</code>，供 <code>_tmux_send_keys</code> 继续拼接为一条或多条 <code>tmux send-keys</code> 命令。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(key: str, max_escaped_len: int) -&gt; list[str]</code></p>
+<ul><li>参数: <code>key</code>: <code>str</code> — 待拆分的单个按键/文本串；来自上游 <code>_tmux_send_keys</code> 处理中判定为过长的输入; <code>max_escaped_len</code>: <code>int</code> — 单个片段在执行 <code>shlex.quote(...)</code> 后允许达到的最大长度</li><li>返回: 返回按顺序组成的 <code>list[str]</code>；其中每个元素都是对原字符串某一连续子串执行 <code>shlex.quote(...)</code> 后的结果，供调用方继续组装 tmux 命令。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>初始化空列表 <code>chunks</code> 作为累计输出，并把完整输入放入局部变量 <code>remaining</code>，后续循环始终围绕“尚未切出的尾部文本”推进。</li><li>只要 <code>remaining</code> 非空，就为当前这段文本建立一次前缀搜索：把候选长度边界设为 <code>lo = 1</code>、<code>hi = len(remaining)</code>，并用 <code>best = 1</code> 记录当前已知可接受的最大前缀长度。</li><li>在内部循环中反复取中点 <code>mid</code>，对 <code>remaining[:mid]</code> 执行 <code>shlex.quote(...)</code> 并检查其长度是否 <code>&lt;= max_escaped_len</code>；若满足上限，就把 <code>best</code> 更新为 <code>mid</code> 并继续向更长前缀搜索，否则缩小到更短前缀区间。</li><li>当本轮二分结束后，把 <code>remaining[:best]</code> 的转义结果追加到 <code>chunks</code>，这一步产出当前能够放入单个 tmux 参数中的最大合法片段。</li><li>随后将 <code>remaining</code> 截去已消费的前 <code>best</code> 个字符，即更新为 <code>remaining[best:]</code>，进入下一轮直到原始 <code>key</code> 被完全覆盖。</li><li>循环结束后返回 <code>chunks</code>；返回列表中的元素顺序与原始文本顺序一致，函数本身不写入实例字段，也不执行任何 tmux 或环境命令。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _split_key_for_tmux(key: str, max_escaped_len: int) -&gt; list[str]:
+        """Split *key* into ``shlex.quote``-d chunks each ≤ *max_escaped_len*."""
+        chunks: list[str] = []
+        remaining = key
+        while remaining:
+            lo, hi, best = 1, len(remaining), 1
+            while lo &lt;= hi:
+                mid = (lo + hi) // 2
+                if len(shlex.quote(remaining[:mid])) &lt;= max_escaped_len:
+                    best = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            chunks.append(shlex.quote(remaining[:best]))
+            remaining = remaining[best:]
+        return chunks</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>长度约束是以 <code>len(shlex.quote(...))</code> 为准，而不是原始子串长度。这一取舍直接体现在内部判定条件 <code>len(shlex.quote(remaining[:mid]))) &lt;= max_escaped_len</code>，目的是把 shell 转义引入的额外字符也计入限制；否则原始文本看似够短，但实际拼进命令后仍可能超长。</li><li>每轮选择“当前剩余文本中可接受的最长前缀”，并通过二分搜索而非线性试探得到 <code>best</code>。代码层面体现为 <code>lo/hi/mid</code> 的区间收缩；这样做减少了对 <code>shlex.quote(...)</code> 的重复测量次数，适合被 <code>_tmux_send_keys</code> 在命令长度控制路径中频繁调用。</li><li>函数返回的是已经转义好的片段，而不是原始片段。这与其注释 <code>Split *key* into </code><code>shlex.quote</code><code>-d chunks</code> 以及两次 <code>chunks.append(shlex.quote(...))</code> / 长度测量保持一致，可避免调用方再次逐片转义时出现长度重新变化，保证上限判断与实际输出一致。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: TmuxSession._tmux_send_keys：当单个 key 经转义后无法直接装入当前 <code>tmux send-keys</code> 命令长度预算时调用本函数拆分</li><li><strong>核心被调用</strong>: shlex.quote：测量候选前缀的转义后长度; shlex.quote：生成最终写入 <code>chunks</code> 的 shell 安全片段; len：计算 <code>remaining</code> 与转义字符串的长度; list.append：把每轮确定的片段追加到输出列表</li><li><strong>配置/状态来源</strong>: 参数 <code>key</code>：待分块的原始文本来源; 参数 <code>max_escaped_len</code>：调用方施加的长度上限; 局部变量 <code>remaining</code>：当前尚未拆分的尾部内容; 局部变量 <code>best</code>：本轮可接受前缀长度的暂存结果</li><li><strong>结果去向</strong>: 返回给 <code>TmuxSession._tmux_send_keys</code>，作为其分批构造 <code>tmux send-keys -t &lt;session&gt; ...</code> 命令的一部分; 间接服务于 <code>TmuxSession._send_non_blocking_keys</code>，后者会执行 <code>_tmux_send_keys</code> 产出的命令列表; 间接服务于 <code>TmuxSession._send_blocking_keys</code>，后者同样依赖 <code>_tmux_send_keys</code> 的命令展开结果; 与同 stage 的 <code>_tmux_send_keys._flush</code> 配合：本函数先把超长单键拆成合法片段，<code>_flush</code> 再把这些片段打包进最终命令字符串</li><li><strong>同类 sibling</strong>: 相对 <code>_tmux_send_keys</code>：后者负责整条 tmux 命令的分批与前缀拼装，本函数只解决单个 key 过长时的细粒度拆分。; 相对 <code>_send_non_blocking_keys</code> / <code>_send_blocking_keys</code>：这些兄弟函数会真正执行环境命令并处理失败/超时，本函数纯计算、无 I/O、副作用为空。</li></ul></div></details><details class="file" id="fn-tmuxsession_attempt_tmux_installation"><summary><span class="chev"></span><code class="fpath">TmuxSession._attempt_tmux_installation</code><a class="fn-range" href="../code/tmux_session.py.html#L76-L151" title="tmux_session.py:76-151">tmux_session.py:76–151 ↗</a></summary><div class="file-body"><p class="fn-sub">tmux 依赖探测与补装助手</p>
+<blockquote><p><strong>stage 上下文</strong>: 该条目属于 tmux 子系统内部辅助逻辑，负责在实际会话建立前补齐远端所需二进制。它不直接发送 tmux 按键，也不操作会话内状态，而是围绕环境探测、安装分支选择与安装后校验展开。与同 stage 中偏命令构造/发送的兄弟函数不同，这里唯一处理的是工具可用性保障。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_attempt_tmux_installation</code> 先在远端检查 <code>tmux</code> 是否已存在，并仅在 <code>self._remote_asciinema_recording_path is not None</code> 时额外检查 <code>asciinema</code>。若所需工具都已可用，则记录 debug 日志后直接返回；否则根据 <code>_detect_system_info()</code> 返回的 <code>system_info['package_manager']</code> 尝试构造一次性联合安装命令，并在成功后分别复验每个仍缺失的工具。若联合安装不可走、执行失败，或执行成功但单项复验失败，则分别退回到源码编译 tmux 与 pip 安装 asciinema；函数返回 <code>None</code>，实际产出是远端命令执行、日志输出与可能发生的安装副作用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self) -&gt; None</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 提供远端执行入口 <code>environment.exec(...)</code>、录屏配置 <code>self._remote_asciinema_recording_path</code>、日志器，以及系统探测/安装辅助方法</li><li>读状态: <code>self.environment</code>, <code>self._remote_asciinema_recording_path</code>, <code>self._logger</code></li><li>返回: 返回 <code>None</code>；无直接 <code>self</code> 状态或 register 写入，真正产出是对远端环境执行检查/安装命令、调用后备安装辅助方法，以及记录日志。</li><li>副作用: 以 <code>user="root"</code> 执行远端命令 <code>tmux -V</code>、<code>asciinema --version</code> 与可能的安装命令; 调用 <code>self._detect_system_info()</code> 获取系统信息并读取其中的 <code>system_info['package_manager']</code> 参与分支选择; 可能调用 <code>self._get_combined_install_command(system_info, tools_needed)</code> 生成联合安装命令; 可能调用 <code>self._build_tmux_from_source()</code> 在远端编译安装 tmux; 可能调用 <code>self._install_asciinema_with_pip()</code> 在远端通过 pip 安装 asciinema; 写出 debug / warning 日志; 不直接写入任何 <code>self._...</code> 成员，也不直接读写题述 state_registers</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先通过 <code>self.environment.exec(command="tmux -V", user="root")</code> 探测 tmux，依据 <code>return_code == 0</code> 计算 <code>tmux_installed</code>。随后以 <code>self._remote_asciinema_recording_path is not None</code> 计算 <code>needs_asciinema</code>：若为真，再执行 <code>asciinema --version</code> 检查；若为假，则直接把 <code>asciinema_installed = True</code>，使后续“所需工具都齐备”判断可统一成立。</li><li>若 <code>tmux_installed and asciinema_installed</code> 为真，则记录 <code>Both tmux and asciinema are already installed</code> 的 debug 日志并立即返回，不进入任何安装路径。</li><li>否则根据缺失情况构造 <code>tools_needed</code> 列表：缺 tmux 时加入 <code>"tmux"</code>，缺且需要 asciinema 时加入 <code>"asciinema"</code>，再记录 <code>Installing: ...</code> 的 debug 日志。</li><li>调用 <code>self._detect_system_info()</code> 获取 <code>system_info</code>；只有当 <code>system_info["package_manager"]</code> 为真时，才进一步调用 <code>self._get_combined_install_command(system_info, tools_needed)</code> 生成联合安装命令。若该命令存在，则记录所用包管理器与命令文本，并以 root 执行该安装命令。</li><li>当联合安装命令执行结果 <code>result.return_code == 0</code> 时，函数不会立刻信任安装结果，而是仅对先前缺失的工具做复验：tmux 通过再次执行 <code>tmux -V</code>，asciinema 通过再次执行 <code>asciinema --version</code>。任一复验失败时分别记录 warning，并触发对应的单项后备安装：tmux 走 <code>_build_tmux_from_source()</code>，asciinema 走 <code>_install_asciinema_with_pip()</code>。这一轮处理完成后直接 <code>return</code>。</li><li>如果没有可用的包管理器、未拿到联合安装命令，或联合安装命令执行返回非零，则不会在该分支内抛错或复验，而是落入末尾的逐项后备路径：缺 tmux 时记录 <code>Installing tmux from source...</code> 并调用 <code>_build_tmux_from_source()</code>；需要且缺 asciinema 时记录 <code>Installing asciinema via pip...</code> 并调用 <code>_install_asciinema_with_pip()</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    async def _attempt_tmux_installation(self) -&gt; None:
+        """
+        Install both tmux and asciinema in a single operation for efficiency.
+        """
+        # Check what's already installed
+        tmux_result = await self.environment.exec(command="tmux -V", user="root")
+        tmux_installed = tmux_result.return_code == 0
+
+        needs_asciinema = self._remote_asciinema_recording_path is not None
+        if needs_asciinema:
+            asciinema_result = await self.environment.exec(
+                command="asciinema --version", user="root"
+            )
+            asciinema_installed = asciinema_result.return_code == 0
+        else:
+            asciinema_installed = True
+
+        if tmux_installed and asciinema_installed:
+            self._logger.debug("Both tmux and asciinema are already installed")
+            return
+
+        tools_needed = []
+        if not tmux_installed:
+            tools_needed.append("tmux")
+        if needs_asciinema and not asciinema_installed:
+            tools_needed.append("asciinema")
+
+        self._logger.debug(f"Installing: {', '.join(tools_needed)}")
+
+        # Detect system and package manager
+        system_info = await self._detect_system_info()
+
+        if system_info["package_manager"]:
+            install_command = self._get_combined_install_command(
+                system_info, tools_needed
+            )
+            if install_command:
+                self._logger.debug(
+                    f"Installing tools using {system_info['package_manager']}: {install_command}"
+                )
+                result = await self.environment.exec(
+                    command=install_command, user="root"
+                )
+
+                if result.return_code == 0:
+                    # Verify installations
+                    if not tmux_installed:
+                        verify_tmux = await self.environment.exec(
+                            command="tmux -V", user="root"
+                        )
+                        if verify_tmux.return_code != 0:
+                            self._logger.warning(
+                                "tmux installation verification failed"
+                            )
+                            await self._build_tmux_from_source()
+
+                    if needs_asciinema and not asciinema_installed:
+                        verify_asciinema = await self.environment.exec(
+                            command="asciinema --version", user="root"
+                        )
+                        if verify_asciinema.return_code != 0:
+                            self._logger.warning(
+                                "asciinema installation verification failed"
+                            )
+                            await self._install_asciinema_with_pip()
+
+                    return
+
+        # Fallback to individual installations
+        if not tmux_installed:
+            self._logger.warning("Installing tmux from source...")
+            await self._build_tmux_from_source()
+
+        if needs_asciinema and not asciinema_installed:
+            self._logger.warning("Installing asciinema via pip...")
+            await self._install_asciinema_with_pip()</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数把 <code>needs_asciinema == False</code> 显式映射为 <code>asciinema_installed = True</code>，从而让早退条件始终统一写成 <code>tmux_installed and asciinema_installed</code>，而不是在多个位置重复判断“是否需要 asciinema”。这是一种控制流归一化，代码中通过 <code>else: asciinema_installed = True</code> 直接体现。</li><li>当 <code>system_info['package_manager']</code> 可用时，代码优先尝试 <code>_get_combined_install_command(system_info, tools_needed)</code> 所代表的一次性联合安装；其后仍对每个原本缺失的工具单独复验。这个取舍表明：包管理器安装被当作首选路径，但函数并不把命令返回零视为充分条件，而是保留逐工具兜底。</li><li>联合安装分支只有在 <code>result.return_code == 0</code> 时才进入复验并 <code>return</code>；若命令不可构造、包管理器不存在，或安装命令本身失败，函数直接落到末尾的单项后备安装，而不是在中间抛异常。这说明这里的策略是“尽量补装成功”，而不是把包管理器路径视为强约束。</li><li>tmux 与 asciinema 的后备策略被刻意区分：tmux 调 <code>_build_tmux_from_source()</code>，asciinema 调 <code>_install_asciinema_with_pip()</code>。该差异不是由外部配置决定，而是源码中按工具名硬编码的独立恢复路径。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未在提供源码中出现显式调用方</li><li><strong>核心被调用</strong>: self.environment.exec; self._detect_system_info; self._get_combined_install_command; self._build_tmux_from_source; self._install_asciinema_with_pip; self._logger.debug; self._logger.warning</li><li><strong>配置/状态来源</strong>: self._remote_asciinema_recording_path：决定是否需要检查/安装 asciinema; self.environment：提供远端命令执行能力; self._logger：承载调试与告警输出; system_info['package_manager']：由 <code>_detect_system_info()</code> 返回并决定是否进入包管理器安装分支</li><li><strong>结果去向</strong>: 远端主机上的 tmux/asciinema 安装状态; 日志输出中的 debug / warning 记录; 后续由调用方继续使用的远端运行环境可用性; 本方法自身控制流的提前返回或后备安装分支选择</li></ul></div></details><details class="file" id="fn-tmuxsession_detect_system_info"><summary><span class="chev"></span><code class="fpath">TmuxSession._detect_system_info</code><a class="fn-range" href="../code/tmux_session.py.html#L153-L215" title="tmux_session.py:153-215">tmux_session.py:153–215 ↗</a></summary><div class="file-body"><p class="fn-sub">远端系统类型与包管理器探测器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该条目属于 tmux 子系统内部辅助函数，职责是把远端环境压缩成一个最小 <code>system_info</code> 字典，供后续内部逻辑读取。它与同 stage 的 <code>_attempt_tmux_installation</code>、<code>_tmux_send_keys</code> 一类函数不同：前者负责执行安装策略，后者负责发送 tmux 命令，而本函数只做环境探测与日志记录，不改写会话状态。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_detect_system_info</code> 不接收除 <code>self</code> 外的输入，完全依赖 <code>self.environment.exec(...)</code> 以 <code>user='root'</code> 运行若干远端命令，探测操作系统类别和首个可用包管理器。函数返回一个包含 <code>os</code>、<code>package_manager</code>、<code>update_command</code> 三个键的字典；其中 <code>update_command</code> 在当前实现中始终保持 <code>None</code>。除了一条 <code>self._logger.debug(...)</code> 调试日志外，它不写入任何 <code>self._*</code> 状态，也不触碰题面列出的 registers。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self) -&gt; dict</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 提供远端命令执行入口 <code>self.environment.exec</code> 与调试日志器 <code>self._logger</code></li><li>读状态: <code>self.environment</code>, <code>self._logger</code></li><li>返回: 返回 <code>dict[str, str | None]</code> 风格的系统信息字典，初始键为 <code>os</code>、<code>package_manager</code>、<code>update_command</code>；其中前两者可能被探测填充，<code>update_command</code> 在本函数内不被设置。</li><li>副作用: 以 <code>user='root'</code> 执行远端命令 <code>cat /etc/os-release 2&gt;/dev/null || echo 'not found'</code>; 以 <code>user='root'</code> 执行远端命令 <code>uname -s</code>; 以 <code>user='root'</code> 依次执行远端命令 <code>which apt-get &gt;/dev/null 2&gt;&amp;1</code>、<code>which dnf &gt;/dev/null 2&gt;&amp;1</code>、<code>which yum &gt;/dev/null 2&gt;&amp;1</code>、<code>which apk &gt;/dev/null 2&gt;&amp;1</code>、<code>which pacman &gt;/dev/null 2&gt;&amp;1</code>、<code>which brew &gt;/dev/null 2&gt;&amp;1</code>、<code>which pkg &gt;/dev/null 2&gt;&amp;1</code>、<code>which zypper &gt;/dev/null 2&gt;&amp;1</code>，直到首个返回码为 0 的候选出现后停止后续探测; 调用 <code>self._logger.debug(f"Detected system: {system_info}")</code> 输出调试日志</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先构造 <code>system_info</code>，把 <code>os</code>、<code>package_manager</code>、<code>update_command</code> 全部初始化为 <code>None</code>，为后续逐项填充保留默认值。</li><li>无条件以 <code>user='root'</code> 执行 <code>cat /etc/os-release 2&gt;/dev/null || echo 'not found'</code> 保存到 <code>os_release_result</code>，再执行 <code>uname -s</code> 保存到 <code>uname_result</code>；这两次探测在源码中都发生于任何分支判断之前。</li><li>定义固定优先级的 <code>package_managers</code> 列表：<code>apt-get</code>、<code>dnf</code>、<code>yum</code>、<code>apk</code>、<code>pacman</code>、<code>brew</code>、<code>pkg</code>、<code>zypper</code>。随后按顺序对每个候选执行 <code>which &lt;pm_name&gt; &gt;/dev/null 2&gt;&amp;1</code>；一旦某次 <code>check_result.return_code == 0</code>，就把该名字写入 <code>system_info['package_manager']</code> 并 <code>break</code>，因此只记录首个命中的包管理器。</li><li>若 <code>os_release_result.return_code == 0</code>、<code>os_release_result.stdout</code> 非空，且输出中不含字面量 <code>'not found'</code>，则把其内容转成小写后按关键词分类：包含 <code>ubuntu</code> 或 <code>debian</code> 记为 <code>debian-based</code>，包含 <code>fedora</code> 或 <code>rhel</code> 记为 <code>rhel-based</code>，包含 <code>alpine</code> 记为 <code>alpine</code>，包含 <code>arch</code> 记为 <code>arch</code>。</li><li>只有在上一条 <code>/etc/os-release</code> 分支未成立时，代码才进入 <code>elif uname_result.return_code == 0 and uname_result.stdout</code>，基于 <code>uname -s</code> 的小写输出把 <code>darwin</code> 映射为 <code>macos</code>、把 <code>freebsd</code> 映射为 <code>freebsd</code>。</li><li>最后记录 <code>Detected system: {system_info}</code> 调试日志并返回该字典。若 <code>/etc/os-release</code> 存在但内容未匹配任何已编码关键词，源码不会回退去使用 <code>uname_result</code>，因此 <code>system_info['os']</code> 会保持 <code>None</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    async def _detect_system_info(self) -&gt; dict:
+        """
+        Detect the operating system and available package managers.
+        """
+        system_info: dict[str, str | None] = {
+            "os": None,
+            "package_manager": None,
+            "update_command": None,
+        }
+
+        # Check for OS release files
+        os_release_result = await self.environment.exec(
+            command="cat /etc/os-release 2&gt;/dev/null || echo 'not found'",
+            user="root",
+        )
+
+        # Check uname for system type
+        uname_result = await self.environment.exec(command="uname -s", user="root")
+
+        # Detect package managers by checking if they exist
+        package_managers = [
+            "apt-get",
+            "dnf",
+            "yum",
+            "apk",
+            "pacman",
+            "brew",
+            "pkg",
+            "zypper",
+        ]
+
+        for pm_name in package_managers:
+            check_result = await self.environment.exec(
+                command=f"which {pm_name} &gt;/dev/null 2&gt;&amp;1", user="root"
+            )
+            if check_result.return_code == 0:
+                system_info["package_manager"] = pm_name
+                break
+
+        # Try to determine OS from available info
+        if (
+            os_release_result.return_code == 0
+            and os_release_result.stdout
+            and "not found" not in os_release_result.stdout
+        ):
+            stdout_lower = os_release_result.stdout.lower()
+            if "ubuntu" in stdout_lower or "debian" in stdout_lower:
+                system_info["os"] = "debian-based"
+            elif "fedora" in stdout_lower or "rhel" in stdout_lower:
+                system_info["os"] = "rhel-based"
+            elif "alpine" in stdout_lower:
+                system_info["os"] = "alpine"
+            elif "arch" in stdout_lower:
+                system_info["os"] = "arch"
+        elif uname_result.return_code == 0 and uname_result.stdout:
+            stdout_lower = uname_result.stdout.lower()
+            if "darwin" in stdout_lower:
+                system_info["os"] = "macos"
+            elif "freebsd" in stdout_lower:
+                system_info["os"] = "freebsd"
+
+        self._logger.debug(f"Detected system: {system_info}")
+        return system_info</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>操作系统探测采用“优先 <code>/etc/os-release</code>，其次 <code>uname -s</code>”的分层策略，而且 <code>uname_result</code> 被放在 <code>elif</code> 中而非独立补充判断。这意味着一旦 <code>/etc/os-release</code> 可读且不含 <code>'not found'</code>，即使内容无法识别，也不会再用 <code>uname -s</code> 兜底；这是当前实现中一个重要且不显眼的取舍。</li><li>包管理器探测与操作系统分类完全解耦：<code>package_managers</code> 循环在 OS 判断之前就无条件执行。因此即便 <code>system_info['os']</code> 最终仍为 <code>None</code>，<code>system_info['package_manager']</code> 也可能已成功填入某个值。</li><li>包管理器只保留首个命中项，而不是收集全部可用工具。对应代码是按固定顺序遍历并在首个 <code>return_code == 0</code> 后 <code>break</code>；其效果是把列表顺序编码为优先级，例如同时存在多个候选时偏向前面的 <code>apt-get</code>、<code>dnf</code> 等。</li><li>对 <code>/etc/os-release</code> 的缺失没有依赖异常处理，而是通过命令末尾的 <code>|| echo 'not found'</code> 与后续 <code>'not found' not in os_release_result.stdout</code> 显式识别不可用场景。这让函数在文件缺失时仍得到可解析的标准输出分支，而不是把控制流交给异常机制。</li><li>返回字典中预留了 <code>update_command</code> 键，但本函数从头到尾未对其赋新值。这表明当前实现只负责探测并返回统一形状的数据结构，而不在这里生成更新命令。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未知；给定源码片段未展示直接调用点; 任何需要最小系统信息字典的同类内部辅助逻辑</li><li><strong>核心被调用</strong>: self.environment.exec; self._logger.debug</li><li><strong>配置/状态来源</strong>: self.environment：提供远端命令执行能力; self._logger：提供调试日志输出能力; 局部常量 <code>package_managers</code>：规定包管理器探测顺序; 远端命令返回对象的 <code>return_code</code> 与 <code>stdout</code>：驱动 OS/包管理器分类分支</li><li><strong>结果去向</strong>: 函数调用方接收返回的 <code>system_info</code> 字典; 调试日志 <code>Detected system: {system_info}</code>; 返回值中的 <code>os</code> 字段; 返回值中的 <code>package_manager</code> 字段; 返回值中的 <code>update_command</code> 字段（当前保持 <code>None</code>）</li><li><strong>同类 sibling</strong>: 相较于 <code>_attempt_tmux_installation</code>，本函数只做探测与汇总，不执行任何安装命令。; 相较于 <code>_send_blocking_keys</code>、<code>_send_non_blocking_keys</code> 等发送路径，本函数同样调用 <code>self.environment.exec</code>，但用途是环境识别而非 tmux 命令执行。; 与 <code>_tmux_send_keys</code> 这类纯字符串组装函数不同，本函数的主要产出不是命令串，而是探测结果字典。</li></ul></div></details><details class="file" id="fn-tmuxsession_get_combined_install_command"><summary><span class="chev"></span><code class="fpath">TmuxSession._get_combined_install_command</code><a class="fn-range" href="../code/tmux_session.py.html#L217-L241" title="tmux_session.py:217-241">tmux_session.py:217–241 ↗</a></summary><div class="file-body"><p class="fn-sub">包管理器安装命令拼装器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该单元位于 tmux 子系统内部辅助层，职责是把包管理器标识与工具名列表折叠成一条安装命令字符串。它比同 stage 中真正执行远端命令的 <code>_attempt_tmux_installation</code>、<code>_send_*</code> 系函数更底层，只做字符串选择与拼接，不执行任何命令，也不接触实例级状态。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_get_combined_install_command</code> 从 <code>system_info.get("package_manager")</code> 读取包管理器名称，并把 <code>tools</code> 用空格连接成包列表，返回对应的一条安装命令字符串。若 <code>package_manager</code> 缺失、为 falsy 值（例如空串）或不是 <code>str</code>，函数直接返回空字符串 <code>""</code>。函数不校验 <code>tools</code> 内元素类型，除 <code>" ".join(tools)</code> 外不做额外处理，也没有任何状态写入或外部副作用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, system_info: dict, tools: list[str]) -&gt; str</code></p>
+<ul><li>参数: <code>self</code>: <code>TmuxSession</code> — 方法宿主；本函数体内未读取其实例属性; <code>system_info</code>: <code>dict</code> — 提供包管理器信息；仅通过 <code>system_info.get("package_manager")</code> 读取; <code>tools</code>: <code>list[str]</code> — 待安装工具名列表；直接经 <code>" ".join(tools)</code> 形成包列表字符串</li><li>返回: 始终返回 <code>str</code>：若包管理器有效且命中内置映射，则返回对应安装命令；否则返回空字符串 <code>""</code>。即使 <code>tools</code> 为空列表，也会返回某个字符串结果。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先执行 <code>system_info.get("package_manager")</code> 取出 <code>package_manager</code>，作为后续命令模板选择键。</li><li>若 <code>package_manager</code> 为 falsy，或其类型不是 <code>str</code>，立即返回空字符串 <code>""</code>，不再继续拼装。</li><li>把 <code>tools</code> 通过 <code>" ".join(tools)</code> 合成为单个 <code>packages</code> 字符串；代码未对元素内容或空列表做额外校验。</li><li>构造本地字典 <code>install_commands</code>，为 <code>apt-get</code>、<code>dnf</code>、<code>yum</code>、<code>apk</code>、<code>pacman</code>、<code>brew</code>、<code>pkg</code>、<code>zypper</code> 预置各自的安装命令模板，并把 <code>packages</code> 插入模板。</li><li>最后执行 <code>install_commands.get(package_manager, "")</code>：命中时返回对应命令，未命中时返回空字符串 <code>""</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _get_combined_install_command(self, system_info: dict, tools: list[str]) -&gt; str:
+        """
+        Get the appropriate installation command for multiple tools based on system info.
+        """
+        package_manager = system_info.get("package_manager")
+
+        if not package_manager or not isinstance(package_manager, str):
+            return ""
+
+        # Build the package list
+        packages = " ".join(tools)
+
+        # Package manager commands with non-interactive flags
+        install_commands = {
+            "apt-get": f"DEBIAN_FRONTEND=noninteractive apt-get update &amp;&amp; DEBIAN_FRONTEND=noninteractive apt-get install -y {packages}",
+            "dnf": f"dnf install -y {packages}",
+            "yum": f"yum install -y {packages}",
+            "apk": f"apk add --no-cache {packages}",
+            "pacman": f"pacman -S --noconfirm {packages}",
+            "brew": f"brew install {packages}",
+            "pkg": f"ASSUME_ALWAYS_YES=yes pkg install -y {packages}",
+            "zypper": f"zypper install -y -n {packages}",
+        }
+
+        return install_commands.get(package_manager, "")</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数把“不存在、空值、类型不符”的 <code>package_manager</code> 统一归约为返回 <code>""</code>，而不是抛异常；这使调用方可以把“无法生成命令”当成普通无结果分支处理。该取舍直接体现在 <code>if not package_manager or not isinstance(package_manager, str): return ""</code>。</li><li>安装命令以静态映射表 <code>install_commands</code> 集中声明，而非分支链逐个拼接；这样每个包管理器的非交互参数都被固定在单处，尤其便于保留细节差异，例如 <code>apt-get</code> 同时在 <code>update</code> 与 <code>install</code> 前重复添加 <code>DEBIAN_FRONTEND=noninteractive</code>，<code>pkg</code> 使用 <code>ASSUME_ALWAYS_YES=yes pkg install -y</code>，<code>zypper</code> 使用 <code>zypper install -y -n</code>。</li><li>对 <code>tools</code> 仅做 <code>" ".join(tools)</code>，不做转义、去重或类型过滤；这表明本函数定位是命令模板拼装，而不是输入清洗层，复杂性被有意压低在“字符串组合”这一层面。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: TmuxSession._attempt_tmux_installation（phase2 purpose 已注明会调用本函数）</li><li><strong>核心被调用</strong>: system_info.get("package_manager"); " ".join(tools); install_commands.get(package_manager, ""); isinstance(package_manager, str)</li><li><strong>配置/状态来源</strong>: 入参 <code>system_info</code> 中的 <code>package_manager</code> 键; 入参 <code>tools</code> 列表内容; 函数体内硬编码的 <code>install_commands</code> 模板映射; <code>package_manager</code> 的 truthiness 与字符串类型检查结果</li><li><strong>结果去向</strong>: 作为返回值交给调用方决定是否采用该安装命令; 命中映射时输出单条 shell 命令字符串; 未命中或输入无效时输出空字符串 <code>""</code>; 不写入任何 <code>self</code> 状态，也不直接执行外部命令</li><li><strong>同类 sibling</strong>: 与 <code>_detect_system_info</code> 形成前后衔接：后者负责探测包管理器，本函数只消费该结果做命令映射。; 与 <code>_attempt_tmux_installation</code> 相比，本函数不做远端检查、安装或复验，只产生命令文本。; 与 <code>_tmux_send_keys</code>、<code>_send_non_blocking_keys</code>、<code>_send_blocking_keys</code> 相比，本函数完全停留在字符串构造层，不涉及执行通道。</li></ul></div></details><details class="file" id="fn-tmuxsession_build_tmux_from_source"><summary><span class="chev"></span><code class="fpath">TmuxSession._build_tmux_from_source</code><a class="fn-range" href="../code/tmux_session.py.html#L243-L285" title="tmux_session.py:243-285">tmux_session.py:243–285 ↗</a></summary><div class="file-body"><p class="fn-sub">tmux 源码安装兜底构建器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数属于 tmux 子系统内部安装辅助路径，角色是在常规探测或包管理器安装未得到可用 tmux 时，尝试走源码编译这一更重的兜底方案。它不参与上层会话编排，只负责远端依赖安装、下载、编译、安装与末尾验证。与同 stage 的 <code>_attempt_tmux_installation</code> 相比，这里不再做安装策略选择，而是承接其 fallback 分支并落地执行源码构建。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_build_tmux_from_source</code> 不接收显式参数，主要依赖 <code>self.environment.exec(...)</code> 以 <code>user="root"</code> 在远端执行安装与构建命令，并通过 <code>self._logger</code> 记录结果。函数先轮流尝试若干发行版相关的构建依赖安装命令，再下载固定版本的 tmux 3.4 源码并在 <code>/usr/local</code> 前缀下编译安装。它返回 <code>None</code>，不修改任何会话字段；真实产出是远端机器上的包安装/源码构建副作用，以及成功、失败或异常时的日志记录。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self) -&gt; None</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 提供远端执行接口 <code>environment</code> 与日志器 <code>_logger</code> 的会话实例</li><li>读状态: <code>self.environment</code>, <code>self._logger</code></li><li>返回: 返回 <code>None</code>；真正结果是远端依赖安装、tmux 源码下载编译安装，以及相应的 debug/error 日志。</li><li>副作用: 以 <code>user="root"</code> 在远端执行多个包管理器安装命令; 在远端 <code>/tmp</code> 下载 <code>tmux-3.4.tar.gz</code>、解压、配置、编译并执行 <code>make install</code>; 在远端执行 <code>tmux -V || /usr/local/bin/tmux -V</code> 做安装验证; 写出 <code>self._logger.debug(...)</code> 或 <code>self._logger.error(...)</code> 日志</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>进入 <code>try</code> 后先构造 <code>dep_commands</code> 列表，内含 apt、yum、dnf、apk 四组带非交互参数的构建依赖安装命令，覆盖 <code>build-essential</code>/<code>Development Tools</code>、<code>libevent</code>、<code>ncurses</code> 与 <code>curl</code> 等源码构建前提。</li><li>按顺序遍历 <code>dep_commands</code>，对每条命令调用 <code>await self.environment.exec(command=cmd, user="root")</code>；一旦某次返回的 <code>result.return_code == 0</code> 就立即 <code>break</code>，停止继续尝试后续发行版命令。</li><li>随后组装单条 <code>build_cmd</code>，在 <code>/tmp</code> 下依次完成 <code>curl -L</code> 下载 tmux 3.4 发布包、<code>tar -xzf</code> 解压、进入 <code>tmux-3.4</code> 目录、执行 <code>./configure --prefix=/usr/local</code>、<code>make</code> 与 <code>make install</code>。</li><li>使用 <code>await self.environment.exec(command=build_cmd, user="root")</code> 执行整段源码构建命令；该返回值赋给 <code>result</code>，但后续逻辑并不检查这次构建命令的 <code>return_code</code>。</li><li>无论前一步构建命令的返回码为何，函数都会再执行一次验证：<code>tmux -V || /usr/local/bin/tmux -V</code>。若 <code>verify_result.return_code == 0</code>，记录 debug 日志说明源码构建安装成功；否则记录 error 日志说明源码安装失败。</li><li>若依赖安装、构建或验证阶段抛出 Python 层异常，则由外围 <code>except Exception as e</code> 捕获，并记录一条包含异常对象 <code>e</code> 的 error 日志；异常不会继续向上传播。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    async def _build_tmux_from_source(self) -&gt; None:
+        """
+        Build tmux from source as a fallback option.
+        """
+        try:
+            # Install build dependencies based on detected system - with non-interactive flags
+            dep_commands = [
+                "DEBIAN_FRONTEND=noninteractive apt-get update &amp;&amp; DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential libevent-dev libncurses5-dev curl",
+                "yum groupinstall -y 'Development Tools' &amp;&amp; yum install -y libevent-devel ncurses-devel curl",
+                "dnf groupinstall -y 'Development Tools' &amp;&amp; dnf install -y libevent-devel ncurses-devel curl",
+                "apk add --no-cache build-base libevent-dev ncurses-dev curl",
+            ]
+
+            # Try to install build dependencies
+            for cmd in dep_commands:
+                result = await self.environment.exec(command=cmd, user="root")
+                if result.return_code == 0:
+                    break
+
+            # Download and build tmux
+            build_cmd = (
+                "cd /tmp &amp;&amp; "
+                "curl -L https://github.com/tmux/tmux/releases/download/3.4/tmux-3.4.tar.gz -o tmux.tar.gz &amp;&amp; "
+                "tar -xzf tmux.tar.gz &amp;&amp; "
+                "cd tmux-3.4 &amp;&amp; "
+                "./configure --prefix=/usr/local &amp;&amp; "
+                "make &amp;&amp; "
+                "make install"
+            )
+
+            result = await self.environment.exec(command=build_cmd, user="root")
+
+            # Verify installation
+            verify_result = await self.environment.exec(
+                command="tmux -V || /usr/local/bin/tmux -V", user="root"
+            )
+            if verify_result.return_code == 0:
+                self._logger.debug("tmux successfully built and installed from source")
+            else:
+                self._logger.error("Failed to install tmux from source")
+
+        except Exception as e:
+            self._logger.error(f"Failed to build tmux from source: {e}")</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>依赖安装采用“多发行版命令串行试探、首个成功即接受”的策略：代码只根据 <code>return_code == 0</code> 提前 <code>break</code>，并不先调用 <code>_detect_system_info()</code> 做强绑定判断。这种做法降低了对系统识别准确性的依赖，但也意味着前面失败的尝试会被静默吞掉，只保留后续路径继续推进。</li><li>源码构建目标被硬编码为 GitHub 上的 <code>tmux</code> 3.4 发布包，且 <code>./configure</code> 固定使用 <code>--prefix=/usr/local</code>。这让行为稳定、可复现，但版本选择与安装前缀都不是外部配置项，升级或适配其他目录只能改代码。</li><li>安装是否成功并不以 <code>build_cmd</code> 自身的返回码作为唯一判据，而是单独再跑一次 <code>tmux -V || /usr/local/bin/tmux -V</code> 验证。这体现出“以最终二进制可用性为准”的判定口径；相对地，构建命令即使失败，只要验证能找到可用 tmux，函数仍会记成功日志。</li><li>外围使用宽泛的 <code>except Exception</code> 仅记录错误而不抛出，说明该函数被设计成安装 fallback 中的容错步骤，而不是失败即中断的强保证接口。代价是调用方无法从返回值或异常上区分‘验证失败’与‘执行过程中出现异常’，只能依赖日志侧信号。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: TmuxSession._attempt_tmux_installation（联合包安装路径不可用、失败或复验失败时的源码编译 fallback）; tmux 安装补救分支中的内部调用点，而非公开 orchestration 流程直接入口</li><li><strong>核心被调用</strong>: self.environment.exec; self._logger.debug; self._logger.error</li><li><strong>配置/状态来源</strong>: self.environment：提供远端命令执行能力与 root 用户上下文; self._logger：提供成功/失败/异常日志输出; 函数内局部常量 <code>dep_commands</code>：定义支持的发行版依赖安装候选集; 函数内局部常量 <code>build_cmd</code>：定义固定的 tmux 3.4 下载与 <code>/usr/local</code> 安装流程</li><li><strong>结果去向</strong>: 远端系统的软件环境：可能新增构建依赖包与 <code>/usr/local</code> 下的 tmux 安装产物; 日志系统：写入源码安装成功、验证失败或异常失败信息; 调用方 <code>_attempt_tmux_installation</code>：仅通过副作用与日志间接体现结果，本函数不返回状态; 后续 tmux 可用性探测/执行路径：消费这里安装出的 <code>tmux</code> 或 <code>/usr/local/bin/tmux</code> 二进制</li><li><strong>同类 sibling</strong>: 相较 <code>_attempt_tmux_installation</code> 的策略编排职责，本函数只负责源码构建这一条具体兜底路径。; 相较 <code>_detect_system_info</code> 与 <code>_get_combined_install_command</code> 的探测/命令拼装职责，本函数直接执行高成本安装步骤，不返回结构化系统信息或命令字符串。</li></ul></div></details><details class="file" id="fn-tmuxsession_install_asciinema_with_pip"><summary><span class="chev"></span><code class="fpath">TmuxSession._install_asciinema_with_pip</code><a class="fn-range" href="../code/tmux_session.py.html#L287-L323" title="tmux_session.py:287-323">tmux_session.py:287–323 ↗</a></summary><div class="file-body"><p class="fn-sub">asciinema 的 pip 回退安装助手</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数属于 tmux 子系统内部安装辅助路径，负责在常规包管理器安装链路之外，为 <code>asciinema</code> 提供一次 pip 兜底。它通常由 <code>_attempt_tmux_installation</code> 在系统包安装未能确保 <code>asciinema</code> 可用时触发。与同 stage 的 <code>_detect_system_info</code>、<code>_get_combined_install_command</code> 不同，这里不做探测或命令生成，而是直接执行一组保守的跨发行版安装尝试；与 <code>_build_tmux_from_source</code> 类似，它只产生远端环境副作用与日志。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_install_asciinema_with_pip</code> 不接收除 <code>self</code> 外的额外输入，依赖 <code>self.environment.exec(...)</code> 以 <code>root</code> 身份在远端先尝试装入 <code>python3-pip</code>，再尝试用 <code>pip3</code> 或 <code>pip</code> 安装 <code>asciinema</code>。一旦某条 pip 安装命令成功，它会立刻通过 <code>asciinema --version</code> 复验二进制是否已可执行；验证通过则记录 debug 日志并提前返回。函数本身返回 <code>None</code>，不修改任何 <code>self._*</code> 会话字段，真实产出是远端安装副作用以及失败/成功日志；全部路径失败或中途抛异常时，只记 error 日志而不向上继续抛出。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self) -&gt; None</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 提供远端执行入口 <code>self.environment</code> 与日志器 <code>self._logger</code> 的会话实例</li><li>读状态: <code>self.environment</code>, <code>self._logger</code></li><li>返回: 返回 <code>None</code>；真正的产出是远端执行安装/验证命令、可能成功安装 <code>asciinema</code>，以及写入 debug/error 日志。</li><li>副作用: 以 <code>user="root"</code> 在远端执行多条包管理器安装命令以获取 <code>python3-pip</code>; 以 <code>user="root"</code> 在远端执行 <code>pip3 install asciinema</code> 或 <code>pip install asciinema</code>; 以 <code>user="root"</code> 执行 <code>asciinema --version</code> 做安装后验证; 调用 <code>self._logger.debug(...)</code> 记录安装成功; 调用 <code>self._logger.error(...)</code> 记录安装失败或异常</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>进入函数后先落入最外层 <code>try</code>，构造 <code>pip_install_commands</code>：按顺序覆盖 <code>apt-get</code>、<code>yum</code>、<code>dnf</code>、<code>apk</code> 四类命令，用于先为远端准备 <code>python3-pip</code>。</li><li>按列表顺序逐条执行 <code>pip_install_commands</code>，每次都通过 <code>await self.environment.exec(command=cmd, user="root")</code> 运行；只要某条命令返回 <code>return_code == 0</code> 就立即 <code>break</code>，不继续尝试后续包管理器命令。</li><li>随后构造 <code>pip_commands = ["pip3 install asciinema", "pip install asciinema"]</code>，作为真正安装 <code>asciinema</code> 的两种候选路径。</li><li>再次顺序遍历 <code>pip_commands</code>；对每条命令，若执行结果 <code>return_code == 0</code>，则立刻发起一次 <code>asciinema --version</code> 验证调用，确认安装不仅命令执行成功，而且二进制已可见可运行。</li><li>若验证命令也返回零，则写入 <code>self._logger.debug("asciinema successfully installed using pip")</code> 并直接 <code>return</code>，终止整个回退安装流程。</li><li>如果两条 pip 安装命令都未能得到通过验证的结果，函数在循环结束后统一写入 <code>self._logger.error("Failed to install asciinema using pip")</code>。</li><li>若上述任一远端执行或日志路径抛出异常，最外层 <code>except Exception as e</code> 会吞掉异常并记录 <code>self._logger.error(f"Failed to install asciinema with pip: {e}")</code>，函数随后结束。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    async def _install_asciinema_with_pip(self) -&gt; None:
+        """
+        Install asciinema using pip as a fallback.
+        """
+        try:
+            # Try to install python3-pip first - with non-interactive flags
+            pip_install_commands = [
+                "DEBIAN_FRONTEND=noninteractive apt-get update &amp;&amp; DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip",
+                "yum install -y python3-pip",
+                "dnf install -y python3-pip",
+                "apk add --no-cache python3 py3-pip",
+            ]
+
+            # Try to install pip
+            for cmd in pip_install_commands:
+                result = await self.environment.exec(command=cmd, user="root")
+                if result.return_code == 0:
+                    break
+
+            # Install asciinema using pip
+            pip_commands = ["pip3 install asciinema", "pip install asciinema"]
+
+            for cmd in pip_commands:
+                result = await self.environment.exec(command=cmd, user="root")
+                if result.return_code == 0:
+                    # Verify installation
+                    verify_result = await self.environment.exec(
+                        command="asciinema --version", user="root"
+                    )
+                    if verify_result.return_code == 0:
+                        self._logger.debug("asciinema successfully installed using pip")
+                        return
+
+            self._logger.error("Failed to install asciinema using pip")
+
+        except Exception as e:
+            self._logger.error(f"Failed to install asciinema with pip: {e}")</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>该实现把“先补齐 pip，再装 asciinema”拆成两个顺序阶段，而不是直接假设 <code>pip</code> 已存在；这是因为它作为 <code>_attempt_tmux_installation</code> 的兜底路径，需要尽量适配缺少 Python 包工具的最小系统环境。</li><li>对 <code>python3-pip</code> 的安装采用多发行版命令串行试探，并在首个 <code>return_code == 0</code> 后停止，体现的是宽兼容优先而非精确探测优先；相较依赖 <code>_detect_system_info</code> 的单一路径，这里刻意牺牲了一些优雅性来换取回退链路的生存率。</li><li>pip 安装成功后没有把安装命令的零返回码视为最终成功，而是追加 <code>asciinema --version</code> 复验；这一取舍把“命令执行成功”和“工具真正可用”区分开，避免把 PATH、包装器或环境异常误判为安装完成。</li><li>整个函数用最外层 <code>try/except Exception</code> 吞掉异常并转成 error 日志，而不是继续抛出；这说明它被设计为安装尝试中的容错分支，失败应被记录但不应在本层打断更高层的恢复/收尾逻辑。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: TmuxSession._attempt_tmux_installation</li><li><strong>核心被调用</strong>: self.environment.exec; self._logger.debug; self._logger.error</li><li><strong>配置/状态来源</strong>: self.environment：提供远端命令执行能力; self._logger：提供成功与失败日志输出; 函数内常量列表 <code>pip_install_commands</code>：定义跨发行版的 pip 准备命令; 函数内常量列表 <code>pip_commands</code>：定义 pip 安装 asciinema 的候选命令</li><li><strong>结果去向</strong>: 远端系统的软件环境：可能新增 <code>python3-pip</code> 与 <code>asciinema</code>; _attempt_tmux_installation 的回退安装语义：为其提供 pip 方案结果; 日志系统：输出安装成功、失败或异常信息; 后续依赖 <code>asciinema</code> 的录制路径：仅在验证通过时获得可用二进制</li><li><strong>同类 sibling</strong>: 相较 <code>_detect_system_info</code> 与 <code>_get_combined_install_command</code> 的探测/拼装职责，本函数直接执行固定回退命令，不依赖系统信息字典。; 相较 <code>_build_tmux_from_source</code> 的源码编译回退，本函数的回退对象是 <code>asciinema</code>，且策略是多包管理器试探后转向 pip 安装。</li></ul></div></details><details class="file" id="fn-tmuxsession_tmux_start_session"><summary><span class="chev"></span><code class="fpath">TmuxSession._tmux_start_session</code><a class="fn-range" href="../code/tmux_session.py.html#L326-L339" title="tmux_session.py:326-339">tmux_session.py:326–339 ↗</a></summary><div class="file-body"><p class="fn-sub">生成 tmux 会话启动命令的内部助手</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 tmux 子系统的内部辅助层，职责不是实际执行远端命令，而是产出启动新 tmux session 所需的完整 shell 命令字符串。它通常在会话启动流程中被上层 <code>TmuxSession.start</code> 一类编排逻辑调用，与 <code>_tmux_send_keys</code> 这类“构造 tmux 命令但不执行”的兄弟函数同属命令生成侧。相较于安装/探测类兄弟函数，它不触发远端探测或写入，只消费既有配置状态并返回字符串。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_tmux_start_session</code> 根据 <code>self._extra_env</code>、<code>self._pane_width</code>、<code>self._pane_height</code>、<code>self._session_name</code> 与 <code>self._logging_path</code> 组装一条完整的 shell 命令，用于创建一个 detached 的 tmux 会话并把 pane 输出持续导流到日志文件。函数先把额外环境变量转换成 <code>tmux new-session -e KEY=value</code> 片段，再连同固定的 <code>TERM</code>、<code>SHELL</code>、pane 尺寸、session 名称和 <code>pipe-pane</code> 子命令拼接为单一返回值。它不执行命令、不修改实例状态，真正产出是供上层启动路径提交给远端 shell 的命令字符串。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self) -&gt; str</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 提供 tmux 会话启动所需的实例配置状态</li><li>读状态: <code>self._extra_env</code>, <code>self._pane_width</code>, <code>self._pane_height</code>, <code>self._session_name</code>, <code>self._logging_path</code></li><li>返回: 返回一条 shell 命令字符串：先导出固定 <code>TERM</code> 与 <code>SHELL</code>，再执行 <code>tmux new-session ...</code> 创建 detached session，并通过 <code>pipe-pane</code> 将指定 session 的 pane 输出写入 <code>self._logging_path</code>。</li><li>副作用: 无直接副作用；仅构造并返回命令字符串</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先遍历 <code>self._extra_env.items()</code>，把每个额外环境变量转成 <code>-e &lt;shell-quoted KEY=value&gt;</code> 片段，并串接成 <code>env_options</code> 字符串，供后续 <code>tmux new-session</code> 复用。</li><li>随后构造返回值前半段：固定加入 <code>export TERM=xterm-256color &amp;&amp; export SHELL=/bin/bash &amp;&amp;</code>，保证启动 tmux 之前 shell 环境具备明确终端与登录 shell 默认值。</li><li>接着拼出核心 <code>tmux new-session</code> 命令：插入前面得到的 <code>env_options</code>，并使用 <code>-x {self._pane_width}</code>、<code>-y {self._pane_height}</code>、<code>-d</code>、<code>-s {self._session_name}</code> 设定 pane 尺寸、后台启动和 session 名称，最终在会话内执行 <code>'bash --login'</code>。</li><li>最后在同一返回字符串中追加 <code>\; pipe-pane -t {self._session_name} 'cat &gt; {self._logging_path}'</code>，使新建 session 的 pane 输出被持续重定向到日志文件，然后将整条命令作为 <code>str</code> 返回。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _tmux_start_session(self) -&gt; str:
+        # Build environment variable options for tmux new-session -e KEY=value
+        env_options = "".join(
+            f"-e {shlex.quote(f'{key}={value}')} "
+            for key, value in self._extra_env.items()
+        )
+
+        return (
+            f"export TERM=xterm-256color &amp;&amp; "
+            f"export SHELL=/bin/bash &amp;&amp; "
+            f"tmux new-session {env_options}-x {self._pane_width} -y {self._pane_height} -d -s {self._session_name} 'bash --login' \\; "
+            f"pipe-pane -t {self._session_name} "
+            f"'cat &gt; {self._logging_path}'"
+        )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>额外环境变量不是通过外层 shell 的 <code>export</code> 批量注入，而是逐项转成 <code>tmux new-session -e KEY=value</code> 参数；这使注入范围明确绑定到 tmux 会话创建动作本身，而不是隐式污染后续整条 shell 链。</li><li>对每个 <code>KEY=value</code> 使用 <code>shlex.quote(...)</code> 包裹，是此函数中最关键的防护性取舍：它接受 <code>self._extra_env</code> 的原始键值并直接拼接 shell 命令，因此显式转义可以避免空格或特殊字符破坏 <code>tmux new-session</code> 参数边界。</li><li>函数强制写入 <code>TERM=xterm-256color</code> 与 <code>SHELL=/bin/bash</code>，体现的是“固定终端默认值优先于继承调用环境”的策略；这样可减少远端默认 shell / TERM 不一致造成的 tmux 行为漂移。</li><li>日志捕获不是留给外层单独执行，而是在返回命令里紧跟 <code>pipe-pane</code>；这意味着会话一创建就建立持续输出采集，避免上层若分两步执行时出现早期输出丢失窗口。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: TmuxSession.start 内部的 tmux 启动流程; 远端终端环境准备阶段中需要创建新 session 的内部编排代码</li><li><strong>核心被调用</strong>: shlex.quote; dict.items（遍历 self._extra_env）</li><li><strong>配置/状态来源</strong>: self._extra_env 提供需要注入 tmux 的额外环境变量; self._pane_width 提供 <code>tmux new-session -x</code> pane 宽度; self._pane_height 提供 <code>tmux new-session -y</code> pane 高度; self._session_name 提供 tmux session 名称与 <code>pipe-pane -t</code> 目标; self._logging_path 提供 pane 输出落盘路径</li><li><strong>结果去向</strong>: 返回给上层启动路径作为待执行的远端 shell 命令; 新建 tmux session 的远端执行步骤; 后续 pane 日志持久化机制（通过 <code>pipe-pane</code> 写入日志文件）</li><li><strong>同类 sibling</strong>: _tmux_send_keys 同样只生成 tmux 命令字符串，但面向会话创建后的按键发送，而本函数面向初始 session 启动。; _attempt_tmux_installation<code> / </code>_detect_system_info` 负责确保 tmux 工具可用；本函数假定这些前置条件已满足，仅负责命令组装。</li></ul></div></details><details class="file" id="fn-tmuxsession_tmux_capture_pane"><summary><span class="chev"></span><code class="fpath">TmuxSession._tmux_capture_pane</code><a class="fn-range" href="../code/tmux_session.py.html#L412-L427" title="tmux_session.py:412-427">tmux_session.py:412–427 ↗</a></summary><div class="file-body"><p class="fn-sub">构造 tmux pane 抓取命令的内部助手</p>
+<blockquote><p><strong>stage 上下文</strong>: 该条目位于 tmux 内部辅助层，职责仅限于把 pane 抓取请求编码成一条 shell 命令字符串。它不执行命令，也不接触安装、会话启动或发送按键等同 stage 其他 helper 处理的事项。与兄弟函数相比，这里只负责 <code>capture-pane</code> 这一条 tmux CLI 的参数拼装。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_tmux_capture_pane</code> 根据布尔参数 <code>capture_entire</code> 与实例中的 <code>self._session_name</code>，返回一条完整的 <code>tmux capture-pane</code> 命令字符串。返回值只有两种形态：默认是 <code>tmux capture-pane -p -t &lt;session&gt;</code>；当 <code>capture_entire=True</code> 时变为 <code>tmux capture-pane -p -S - -t &lt;session&gt;</code>。函数本身不修改任何实例状态，也没有外部副作用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, capture_entire: bool = False) -&gt; str</code></p>
+<ul><li>参数: <code>capture_entire</code>: <code>bool</code> — 控制是否在命令中加入 <code>-S -</code> 这一组额外参数</li><li>读状态: <code>self._session_name</code></li><li>返回: 返回命令字符串：当 <code>capture_entire=False</code> 时为 <code>tmux capture-pane -p -t &lt;session&gt;</code>；当 <code>capture_entire=True</code> 时为 <code>tmux capture-pane -p -S - -t &lt;session&gt;</code>。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先检查 <code>capture_entire</code>：若为真，则把 <code>extra_args</code> 设为 <code>['-S', '-']</code>；否则设为空列表 <code>[]</code>。</li><li>构造一个命令 token 列表，固定部分为 <code>'tmux'</code>、<code>'capture-pane'</code>、<code>'-p'</code>、<code>'-t'</code> 与 <code>self._session_name</code>。</li><li>通过 <code>*extra_args</code> 把可选参数列表直接展开插入 token 序列；因此有额外参数时会得到扁平序列 <code>... -p -S - -t ...</code>，而不是列表嵌套。</li><li>对整个 token 序列执行 <code>' '.join(...)</code>，返回最终命令字符串。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _tmux_capture_pane(self, capture_entire: bool = False) -&gt; str:
+        if capture_entire:
+            extra_args = ["-S", "-"]
+        else:
+            extra_args = []
+
+        return " ".join(
+            [
+                "tmux",
+                "capture-pane",
+                "-p",
+                *extra_args,
+                "-t",
+                self._session_name,
+            ]
+        )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数把是否追加 <code>-S -</code> 的分支收敛为 <code>extra_args</code> 这一中间列表，再统一走一次 <code>' '.join(...)</code> 返回；这样避免为两种场景分别维护两套完整命令模板。</li><li>使用 <code>*extra_args</code> 而不是把 <code>extra_args</code> 作为单个元素放进列表，是这里的关键取舍：它保证返回结果是平铺的命令参数序列，能够精确形成 <code>tmux capture-pane -p -S - -t &lt;session&gt;</code> 这种字符串。</li><li>目标 pane 只通过 <code>self._session_name</code> 注入到 <code>-t</code> 后面，说明该 helper 的职责限定在命令拼装，不在此处做 session 名称校验、命令执行或结果解析。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未知上层 tmux pane 抓取流程；本函数源码自身未展示直接调用点</li><li><strong>核心被调用</strong>: str.join</li><li><strong>配置/状态来源</strong>: 参数 <code>capture_entire</code>; 实例状态 <code>self._session_name</code></li><li><strong>结果去向</strong>: 返回给上层作为待执行的 shell 命令字符串; 供后续需要 <code>tmux capture-pane</code> CLI 文本的路径直接使用</li><li><strong>同类 sibling</strong>: 同属 <a href="subsys-tmux-internal.html">[subsys-tmux-internal</a>](<a href="subsys-tmux-internal.html">subsys-tmux-internal</a>.html)，但不同于 <code>_tmux_start_session</code> 生成会话启动命令、<code>_tmux_send_keys._flush</code> 追加发送按键命令，这里只生成 pane 抓取命令。</li></ul></div></details><details class="file" id="fn-tmuxsession_get_incremental_output"><summary><span class="chev"></span><code class="fpath">TmuxSession.get_incremental_output</code><a class="fn-range" href="../code/tmux_session.py.html#L675-L710" title="tmux_session.py:675-710">tmux_session.py:675–710 ↗</a></summary><div class="file-body"><p class="fn-sub">tmux 增量终端输出提取器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数属于 tmux 会话内部辅助逻辑，职责是把 pane 的当前状态整理成可直接展示的文本反馈。它本身不接收业务参数，只围绕一次完整 pane 抓取、一次历史缓冲比对，以及必要时的可见屏幕回退展开。与同 stage 中返回 tmux 命令字符串的兄弟函数不同，这里直接发起异步读取并维护 <code>_previous_buffer</code> 这一会话内状态。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>get_incremental_output</code> 先抓取当前 pane 的完整缓冲区，再结合 <code>self._previous_buffer</code> 判断是返回“新增终端输出”还是返回“当前可见屏幕”。首次调用时没有历史基线，因此只记录当前完整缓冲区并返回可见屏幕内容；后续调用则尝试通过 <code>_find_new_content(current_buffer)</code> 提取增量。函数返回一个带固定标题前缀的 <code>str</code>，并在每次调用中把 <code>self._previous_buffer</code> 更新为最新完整缓冲区。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self: TmuxSession) -&gt; str</code></p>
+<ul><li>参数: <code>self</code>: <code>TmuxSession</code> — 提供 pane 抓取、可见屏幕读取、增量比对能力，并保存 <code>_previous_buffer</code> 历史缓冲区状态</li><li>读状态: <code>self._previous_buffer</code></li><li>返回: 返回格式化字符串：要么是 <code>"New Terminal Output:\n..."</code>，要么是 <code>"Current Terminal Screen:\n..."</code>。</li><li>副作用: 调用 <code>self.capture_pane(capture_entire=True)</code> 抓取当前 pane 完整缓冲区; 在非首次分支中调用 <code>self._find_new_content(current_buffer)</code> 尝试比对新增内容; 在首次分支和回退分支中调用 <code>self._get_visible_screen()</code> 读取当前可见屏幕; 写入 <code>self._previous_buffer</code> 为最新的 <code>current_buffer</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先执行 <code>await self.capture_pane(capture_entire=True)</code>，取得当前完整缓冲区并保存到局部变量 <code>current_buffer</code>。</li><li>若 <code>self._previous_buffer is None</code>，说明这是首次抓取：函数把 <code>self._previous_buffer</code> 设为 <code>current_buffer</code>，再调用 <code>await self._get_visible_screen()</code>，返回 <code>"Current Terminal Screen:\n..."</code>；这一分支不会调用 <code>_find_new_content(...)</code>。</li><li>若已存在历史缓冲区，则调用 <code>await self._find_new_content(current_buffer)</code>，把结果保存到 <code>new_content</code>。</li><li>随后无论比对结果如何，都会先把 <code>self._previous_buffer</code> 更新为当前的 <code>current_buffer</code>，使后续调用以本次完整缓冲区为新基线。</li><li>接着先判断 <code>new_content is not None</code>：若条件成立，再继续判断 <code>new_content.strip()</code> 是否为真。</li><li>当 <code>new_content is not None</code> 且 <code>new_content.strip()</code> 为真时，返回 <code>"New Terminal Output:\n{new_content}"</code>；当 <code>new_content is not None</code> 但去空白后为空时，调用 <code>await self._get_visible_screen()</code> 并返回 <code>"Current Terminal Screen:\n..."</code>。</li><li>当 <code>new_content is None</code> 时，函数认为无法可靠确定增量内容，于是调用 <code>await self._get_visible_screen()</code>，返回 <code>"Current Terminal Screen:\n..."</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    async def get_incremental_output(self) -&gt; str:
+        """
+        Get either new terminal output since last call, or current screen if
+        unable to determine.
+
+        This method tracks the previous buffer state and attempts to find new content
+        by comparing against the current full buffer. This provides better handling for
+        commands with large output that would overflow the visible screen.
+
+        Returns:
+            str: Formatted output with either "New Terminal Output:" or
+                 "Current Terminal Screen:"
+        """
+        current_buffer = await self.capture_pane(capture_entire=True)
+
+        # First capture - no previous state
+        if self._previous_buffer is None:
+            self._previous_buffer = current_buffer
+            visible_screen = await self._get_visible_screen()
+            return f"Current Terminal Screen:\n{visible_screen}"
+
+        # Try to find new content
+        new_content = await self._find_new_content(current_buffer)
+
+        # Update state
+        self._previous_buffer = current_buffer
+
+        if new_content is not None:
+            if new_content.strip():
+                return f"New Terminal Output:\n{new_content}"
+            else:
+                # No new content, show current screen
+                return f"Current Terminal Screen:\n{await self._get_visible_screen()}"
+        else:
+            # Couldn't reliably determine new content, fall back to current screen
+            return f"Current Terminal Screen:\n{await self._get_visible_screen()}"</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>首次调用不尝试构造增量，而是直接回退到可见屏幕；代码通过显式检查 <code>self._previous_buffer is None</code> 实现这一点，避免在没有历史基线时生成缺乏依据的“新增输出”。</li><li>函数把“无法可靠比对”与“比对得到的新增内容仅为空白”区分开来：前者对应 <code>new_content is None</code>，后者对应 <code>new_content is not None</code> 但 <code>not new_content.strip()</code>；两种情况都回退到可见屏幕，但分支语义并不相同。</li><li>在完成 <code>_find_new_content(...)</code> 后立即更新 <code>self._previous_buffer = current_buffer</code>，即使最终走的是回退显示路径也如此；这表明该状态的职责是记录最新完整缓冲区基线，而不是记录上一次实际返回给调用方的文本。</li><li>返回值总是带有固定标签前缀 <code>New Terminal Output:</code> 或 <code>Current Terminal Screen:</code>，把内容类别编码进字符串本身，减少调用方再额外判断来源类型的需要。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未在给定源码片段中出现直接调用者</li><li><strong>核心被调用</strong>: self.capture_pane(capture_entire=True); self._find_new_content(current_buffer); self._get_visible_screen()</li><li><strong>配置/状态来源</strong>: self._previous_buffer</li><li><strong>结果去向</strong>: 返回给本函数调用方的格式化终端反馈字符串; 写回 <code>self._previous_buffer</code> 作为下一次调用的历史缓冲区基线</li><li><strong>同类 sibling</strong>: 同属 tmux 内部辅助函数；相较于 <code>_tmux_capture_pane</code> 仅构造命令字符串，本函数直接执行异步读取并维护历史缓冲区状态。</li></ul></div></details><details class="file" id="fn-tmuxsession_find_new_content"><summary><span class="chev"></span><code class="fpath">TmuxSession._find_new_content</code><a class="fn-range" href="../code/tmux_session.py.html#L665-L673" title="tmux_session.py:665-673">tmux_session.py:665–673 ↗</a></summary><div class="file-body"><p class="fn-sub">tmux 缓冲片段判定辅助函数</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 tmux 会话子系统的内部辅助层，职责比 <code>_tmux_capture_pane</code> 更靠后：前者只生成抓屏命令，本函数则消费抓到的 <code>current_buffer</code> 做字符串判定。它通常在 <code>get_incremental_output</code> 取得完整 pane 文本后被调用，用于把当前缓冲区与上一份快照 <code>self._previous_buffer</code> 做一次轻量比较。与同 stage 兄弟函数相比，它不执行远端命令、不组装 tmux shell 命令，只在内存中返回一个字符串切片或 <code>None</code>。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_find_new_content</code> 接收一个 <code>current_buffer: str</code>，并读取 <code>self._previous_buffer</code> 来构造本次比对用的 <code>pb</code>。若 <code>self._previous_buffer is None</code>，代码把 <code>pb</code> 设为 <code>""</code>；若不是 <code>None</code>，则对其执行 <code>.strip()</code>。随后仅在 <code>pb in current_buffer</code> 时返回 <code>current_buffer</code> 的一个切片：先取 <code>current_buffer.index(pb)</code>，但当 <code>pb</code> 含有换行符时又会把该索引改写为 <code>pb.rfind("\n")</code>，最后返回 <code>current_buffer[idx:]</code>；否则返回 <code>None</code>。函数不修改任何实例状态，也没有外部副作用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, current_buffer: str) -&gt; str | None</code></p>
+<ul><li>参数: <code>current_buffer</code>: <code>str</code> — 当前一次 tmux pane 抓取得到的完整缓冲区文本</li><li>读状态: <code>self._previous_buffer</code></li><li>返回: 返回 <code>str | None</code>。当 <code>pb in current_buffer</code> 时返回 <code>current_buffer[idx:]</code>；其中 <code>idx</code> 先取 <code>current_buffer.index(pb)</code>，若 <code>pb</code> 含 <code>"\n"</code> 则改为 <code>pb.rfind("\n")</code>。特别地，当 <code>self._previous_buffer is None</code> 时，<code>pb</code> 会变成空串 <code>""</code>，包含判断恒成立，因此返回整个 <code>current_buffer</code>。若 <code>pb</code> 不在 <code>current_buffer</code> 中，则返回 <code>None</code>。</li><li>副作用: 无</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先读取 <code>self._previous_buffer</code>：若其为 <code>None</code>，把局部变量 <code>pb</code> 设为 <code>""</code>；否则取 <code>self._previous_buffer.strip()</code> 作为 <code>pb</code>。</li><li>检查 <code>pb in current_buffer</code>。若不成立，函数直接返回 <code>None</code>。</li><li>若包含关系成立，先用 <code>current_buffer.index(pb)</code> 计算 <code>idx</code>。</li><li>若 <code>pb</code> 中含有换行符 <code>"\n"</code>，代码会丢弃前一步得到的 <code>idx</code>，改为使用 <code>pb.rfind("\n")</code> 的结果作为新的 <code>idx</code>。</li><li>返回 <code>current_buffer[idx:]</code> 这一字符串切片；因此在 <code>self._previous_buffer is None</code> 时，会返回完整的 <code>current_buffer</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    async def _find_new_content(self, current_buffer: str) -&gt; str | None:
+        pb = "" if self._previous_buffer is None else self._previous_buffer.strip()
+        if pb in current_buffer:
+            idx = current_buffer.index(pb)
+            # Find the end of the previous buffer content
+            if "\n" in pb:
+                idx = pb.rfind("\n")
+            return current_buffer[idx:]
+        return None</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>对历史缓冲区先做 <code>None</code> 归一化与 <code>.strip()</code>，使比较输入固定落在两种形式：空串或去首尾空白后的旧快照。其直接结果是 <code>self._previous_buffer is None</code> 不会走异常路径，而是把空串拿去参与包含判断。</li><li>匹配条件只使用 <code>pb in current_buffer</code>，而不是做差异算法或逐行比较；因此代码只区分“包含”与“不包含”两类结果，控制流非常短，但返回值精度完全受这一包含判定约束。</li><li>换行分支里，代码先求 <code>current_buffer.index(pb)</code>，随后若 <code>"\n" in pb</code> 又把 <code>idx</code> 覆盖为 <code>pb.rfind("\n")</code>。这意味着最终切片位置在该分支中不再来自 <code>current_buffer</code> 内的匹配位置，而是来自 <code>pb</code> 自身内部的最后一个换行下标，并被直接用于 <code>current_buffer[idx:]</code>。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: TmuxSession.get_incremental_output</li><li><strong>核心被调用</strong>: self._previous_buffer.strip; current_buffer.index; pb.rfind</li><li><strong>配置/状态来源</strong>: self._previous_buffer; current_buffer</li><li><strong>结果去向</strong>: 返回给 <code>TmuxSession.get_incremental_output</code> 用于决定本次输出文本; 在未命中包含关系时以 <code>None</code> 形式交回调用方处理</li><li><strong>同类 sibling</strong>: 与 <code>_tmux_capture_pane</code> 相比，本函数不生成 tmux 命令，而是在抓取结果到手后做纯字符串处理。; 与 <code>get_incremental_output</code> 相比，本函数不更新 <code>self._previous_buffer</code>，只返回切片或 <code>None</code>。</li></ul></div></details><details class="file" id="fn-tmuxsession_get_visible_screen"><summary><span class="chev"></span><code class="fpath">TmuxSession._get_visible_screen</code><a class="fn-range" href="../code/tmux_session.py.html#L662-L663" title="tmux_session.py:662-663">tmux_session.py:662–663 ↗</a></summary><div class="file-body"><p class="fn-sub">tmux 可见屏幕读取包装器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该条目位于 tmux 会话子系统的内部辅助层，角色是把一次“读取当前可见屏幕”的请求收束为单独命名的方法。与同 stage 中负责拼装命令字符串或安装依赖的兄弟函数不同，这里只有一次异步委托调用，本身不承担额外状态管理。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>_get_visible_screen</code> 是一个异步薄包装：它只做一件事——等待 <code>self.capture_pane(capture_entire=False)</code> 完成，并把得到的字符串原样返回。输入只有 <code>self</code>，输出是一个 <code>str</code>。函数体本身不写入任何实例字段，也没有代码中可见的额外副作用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self) -&gt; str</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 绑定的 <code>TmuxSession</code> 实例；通过其 <code>capture_pane</code> 方法取得 pane 内容</li><li>读状态: <code>不直接读取任何可见的 </code>self._*<code> 字段</code>, <code>间接依赖 </code>self.capture_pane<code> 及其所绑定的会话上下文/实例状态</code></li><li>返回: 一个协程；被 <code>await</code> 后产出 <code>str</code>，即 <code>self.capture_pane(capture_entire=False)</code> 的返回结果。</li><li>副作用: 本包装函数自身无额外状态写入; 实际外部行为完全委托给 <code>self.capture_pane(...)</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>调用 <code>self.capture_pane</code>，并显式传入 <code>capture_entire=False</code>。</li><li>等待该异步调用完成。</li><li>将得到的返回值直接作为本方法的返回值交还调用方。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    async def _get_visible_screen(self) -&gt; str:
+        return await self.capture_pane(capture_entire=False)</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数把 <code>capture_entire</code> 固定为 <code>False</code>，用一个具名方法封装这组参数选择；代码中的非显然取舍仅此一项。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未在给定源码片段中体现；此方法面向 <code>TmuxSession</code> 内部其他代码提供可见屏幕读取入口</li><li><strong>核心被调用</strong>: <code>TmuxSession.capture_pane</code></li><li><strong>配置/状态来源</strong>: <code>self</code> 上绑定的 <code>capture_pane</code> 方法; <code>capture_pane</code> 所依赖的会话/实例上下文（本函数未直接展开）</li><li><strong>结果去向</strong>: 直接返回给本方法的调用方; 作为一次可见 pane 内容读取结果向上传递</li><li><strong>同类 sibling</strong>: <code>TmuxSession._tmux_capture_pane</code> 返回 <code>tmux capture-pane</code> 命令字符串；本函数则直接异步委托给 <code>capture_pane(...)</code> 取结果</li></ul></div></details><nav class="pn"><a class="pn-prev" href="crosscut-X3.html"><span>← 上一阶段</span><strong>日志</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-4.5 · Pending Handoff Prompt → User Step (or Split)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=en"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=en" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>Home</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>State-flow registers</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>Configuration Crystallization</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>Environment Setup</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>Run Onset</a></div><details class="s-node" open><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>Iteration Loop</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>Loop Entry Gates</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>Proactive Summarize Probe</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM Query</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>Response Parse</a></div><div class="s-leaf"><a class="s-link cur" href="stage-4.5.html"><span class="s-num">4.5</span>Pending Handoff Prompt → User Step (or Split)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>Error Branch</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>Command Execute → Observation → Trajectory Step</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>Completion Gate + Loop Control</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>Parser internal helpers</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>Run Teardown</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>Recording Post-process (External)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>Context Summarization</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token &amp; Cost Accounting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>Output Length Limiting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>Logging</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux internal helpers</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">Index</a><span class="sep">›</span><a href="stage-4.html">Iteration Loop</a></nav><div class="stage-head"><h1>Pending Handoff Prompt → User Step (or Split)</h1><div class="meta"><span class="chip mono">stage-4.5</span><span class="chip">2 functions</span></div></div>
+<h2 class="sec">Opening Explanation</h2>
+<p>This stage exists to turn a generated handoff prompt into actual conversation history in the right form for the next stretch of work. Earlier stages may decide the agent needs a summary handoff prompt: a compact message that carries forward what matters after a summarization boundary. But that prompt is only sitting in a register. This stage is the point where the system commits it into the trajectory, which is the recorded sequence of steps the agent uses as history. It sits after the model response has been parsed, because only then does the system know whether a handoff is needed, and before later control flow, because the next iteration must see the right history shape.</p>
+<h2 class="sec">Main Flow</h2>
+
+<ol><li>The stage checks <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a>.<p>If it is empty, there is nothing to do. If it has a value, the system has already decided that future work must continue from a summarized handoff rather than raw earlier history.</p></li><li>It then chooses between two ways to represent that handoff.<p>In non-linear mode, the handoff is added directly as a <code>user</code> step. This makes the prompt explicit in the live trajectory, so the next model call can read it like any other user message.</p></li><li>In linear-history mode, it uses <code>_split_trajectory_on_summarization()</code> (cuts the current recorded run at the summary boundary and starts a fresh continuation record).<p>This exists because linear history wants one clean, forward-only story. Instead of inserting an extra visible step, the system starts the next trajectory as if the handoff were the natural starting context.</p></li><li>After either path, it clears the pending prompt.<p>That matters because the handoff is a one-time bridge. If it stayed around, later iterations could replay it and duplicate context.</p></li></ol>
+<h2 class="sec"> State Flow</h2>
+<ul><li>writes: <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — written earlier in the loop when a summary handoff prompt is produced and needs to be carried into history</li><li>reads: <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — used here to decide whether a handoff must be materialized, and whether to append a user step or split the trajectory</li><li>clears: <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — cleared after the handoff is committed so it is not applied again on a later iteration</li><li>triggers downstream: <code>stage-4.8 Error Branch</code> — transition continues after this stage once the handoff has either been recorded or skipped</li></ul>
+<h2 class="sec">Pipeline Hand-Off</h2>
+<p>Upstream stages produce a parsed response and, in some cases, a pending summary handoff prompt that says how the next context should begin. This stage turns that pending prompt into durable history—either as an explicit user step or as a new continuation trajectory—so downstream logic works with the correct conversation state rather than a temporary register.</p><div class="files-bar"><h2 class="sec">Functions<span class="pill">2</span></h2><span class="spacer"></span><button class="tool" data-x="expand">Expand all</button><button class="tool" data-x="collapse">Collapse all</button></div><details class="file" id="fn-terminus2_run_agent_loop"><summary><span class="chev"></span><code class="fpath">Terminus2._run_agent_loop</code><a class="fn-range" href="../code/terminus_2.py.html#L1318-L1354" title="terminus_2.py:1318-1354">terminus_2.py:1318–1354 ↗</a></summary><div class="file-body"><p class="fn-sub">Consumes pending summarization artifacts into trajectory</p>
+<blockquote><p><strong>Stage context</strong>: This region implements the <a href="stage-4.6.html">stage-4.6</a> handoff materialization step inside <code>Terminus2._run_agent_loop</code>. It runs after the summarization side flow may have populated deferred state, and before later loop stages append model or completion-related steps. In this stage, it works as the consumer for artifacts produced earlier by the summarization path: <a href="stage-4.5.html">stage-4.5</a> records stored subagent references, and this region then handles the pending handoff prompt according to <code>_linear_history</code>.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>This region consumes two deferred pieces of summarization state: <code>_pending_subagent_refs</code> and <code>_pending_handoff_prompt</code>. If subagent refs exist, it appends a synthetic <code>Step</code> with <code>source="system"</code> to <code>_trajectory_steps</code>; if a handoff prompt exists, it either calls <code>_split_trajectory_on_summarization(...)</code> in linear-history mode or appends a <code>source="user"</code> step in non-linear mode. It always clears each pending field after consuming it, so the result is updated trajectory state rather than a direct return value.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self) -&gt; None</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — Terminus2 instance holding pending summarization state and trajectory</li><li>reads: <code>self._pending_subagent_refs</code>, <code>self._trajectory_steps</code>, <code>self._pending_handoff_prompt</code>, <code>self._linear_history</code></li><li>returns: None; the product is mutation of <code>_trajectory_steps</code> and clearing of pending summarization fields</li><li>effects: appends a synthetic system <code>Step</code> to <code>self._trajectory_steps</code> when <code>self._pending_subagent_refs</code> is set; sets <code>self._pending_subagent_refs = None</code> after recording refs; may call <code>self._split_trajectory_on_summarization(self._pending_handoff_prompt)</code> in linear-history mode; appends a user <code>Step</code> to <code>self._trajectory_steps</code> when <code>self._pending_handoff_prompt</code> is set and <code>self._linear_history</code> is false; sets <code>self._pending_handoff_prompt = None</code> after consumption</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Check <code>self._pending_subagent_refs</code>; when present, append a <code>Step</code> to <code>self._trajectory_steps</code> with <code>source="system"</code>, a fixed summarization message, and an <code>ObservationResult(subagent_trajectory_ref=self._pending_subagent_refs)</code> payload.</li><li>Clear <code>self._pending_subagent_refs</code> after recording the summarization reference step so the same refs do not get emitted again.</li><li>Check <code>self._pending_handoff_prompt</code>; when present, branch on <code>self._linear_history</code> to decide how the handoff enters trajectory state.</li><li>If <code>self._linear_history</code> is true, call <code>_split_trajectory_on_summarization(self._pending_handoff_prompt)</code> and rely on the split path to carry the handoff into the continuation trajectory instead of appending a local step.</li><li>If <code>self._linear_history</code> is false, append a <code>Step</code> to <code>self._trajectory_steps</code> with <code>source="user"</code> and <code>message=self._pending_handoff_prompt</code>.</li><li>Clear <code>self._pending_handoff_prompt</code> after either branch completes.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>            if self._pending_subagent_refs:
+                self._trajectory_steps.append(
+                    Step(
+                        step_id=len(self._trajectory_steps) + 1,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        source="system",
+                        message="Performed context summarization and handoff to continue task.",
+                        observation=Observation(
+                            results=[
+                                ObservationResult(
+                                    subagent_trajectory_ref=self._pending_subagent_refs
+                                )
+                            ]
+                        ),
+                    )
+                )
+                self._pending_subagent_refs = None
+
+            # Handle handoff prompt based on linear_history mode
+            if self._pending_handoff_prompt:
+                # If linear_history mode is enabled, split trajectory immediately WITHOUT adding handoff step
+                # The handoff step will be added to the continuation trajectory during the split
+                if self._linear_history:
+                    self._split_trajectory_on_summarization(
+                        self._pending_handoff_prompt
+                    )
+                else:
+                    # For non-linear mode, add the handoff prompt as a user step
+                    self._trajectory_steps.append(
+                        Step(
+                            step_id=len(self._trajectory_steps) + 1,
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                            source="user",
+                            message=self._pending_handoff_prompt,
+                        )
+                    )
+                self._pending_handoff_prompt = None</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The <code>_linear_history</code> branch avoids appending the handoff prompt in the current trajectory before calling <code>_split_trajectory_on_summarization(...)</code>. The code comment makes the intent explicit: in linear history, the split boundary owns that handoff so the prompt appears only in the continuation record. Appending it here would duplicate or misplace the transition.</li><li>The region records <code>_pending_subagent_refs</code> as a synthetic <code>source="system"</code> step with an <code>Observation</code> payload instead of folding those refs into the handoff prompt text. That keeps subagent provenance structured in <code>_trajectory_steps</code> and separate from the user-facing continuation message.</li><li>Both pending fields are cleared immediately after consumption. This favors one-shot deferred registers over recomputation or idempotent rechecks; the alternative would risk replaying the same summarization artifacts on later loop passes.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Terminus2._run_agent_loop</li><li><strong>Core callees</strong>: Step; Observation; ObservationResult; datetime.now; timezone.utc; Terminus2._split_trajectory_on_summarization</li><li><strong>Config / state sources</strong>: self._linear_history; self._pending_subagent_refs; self._pending_handoff_prompt; self._trajectory_steps</li><li><strong>Results to</strong>: reg-trajectory-steps; reg-pending-subagent-refs; reg-pending-handoff-prompt; later trajectory dumping in <a href="stage-4.9.html">stage-4.9</a> and <a href="stage-5.html">stage-5</a></li><li><strong>Related siblings</strong>: <a href="stage-4.5.html">stage-4.5</a> consumes the same summarization event stream to record subagent refs under trajectory state; <a href="side-S1.html">side-S1</a> produces both <code>_pending_subagent_refs</code> and <code>_pending_handoff_prompt</code> earlier in the iteration</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a> — consume stored summarization subagent refs</li><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — append synthetic system summarization step</li><li><a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a> — remove refs after recording</li><li><a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — check for deferred handoff prompt</li><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — append user handoff in non-linear mode</li><li><a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — remove prompt after split or append</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_split_trajectory_on_summarization"><summary><span class="chev"></span><code class="fpath">Terminus2._split_trajectory_on_summarization</code><a class="fn-range" href="../code/terminus_2.py.html#L1884-L1909" title="terminus_2.py:1884-1909">terminus_2.py:1884–1909 ↗</a></summary><div class="file-body"><p class="fn-sub">Split trajectory at summarization continuation boundary</p>
+<blockquote><p><strong>Stage context</strong>: This helper implements the linear-history branch of stage <a href="stage-4.6.html">[stage-4.6</a>](<a href="stage-4.6.html">stage-4.6</a>.html) when <code>_run_agent_loop</code> consumes <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a>. Instead of appending a new user step, it closes the current trajectory segment and prepares a continuation trajectory that carries prior context forward. It is the stage's split mechanism behind the sibling summary that says <code>_run_agent_loop</code> may call <code>_split_trajectory_on_summarization(...)</code> rather than writing directly into <code>_trajectory_steps</code>.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_split_trajectory_on_summarization</code> cuts the current trajectory at the summarization boundary and prepares in-memory state for the continuation segment. It reads <code>_summarization_count</code>, <code>_session_id</code>, and, if present, <code>_chat.messages</code>; it writes a trajectory file through <code>_dump_trajectory_with_continuation_index</code>, updates <code>_session_id</code>, and replaces <code>_trajectory_steps</code> with copied-context steps derived from prior chat history. The <code>handoff_prompt</code> parameter is accepted by the interface but this body does not inspect it.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, handoff_prompt: str) -&gt; None</code></p>
+<ul><li>params: <code>handoff_prompt</code>: <code>str</code> — handoff text passed from the summarization path; unused in this body</li><li>reads: <code>self._summarization_count</code>, <code>self._session_id</code>, <code>self._chat</code>, <code>self._chat.messages</code></li><li>returns: None; the real product is persisted trajectory output plus updated continuation state in <code>self._session_id</code> and <code>self._trajectory_steps</code>.</li><li>effects: Calls <code>self._dump_trajectory_with_continuation_index(...)</code> to write the finished trajectory segment; Writes <code>self._session_id</code> to a continuation id based on the current summarization count; Replaces <code>self._trajectory_steps</code> with converted steps from <code>self._chat.messages[:-1]</code> when <code>self._chat</code> is present</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>It dumps the current trajectory segment by calling <code>_dump_trajectory_with_continuation_index(self._summarization_count - 1)</code>, using <code>_summarization_count</code> to choose the continuation file index.</li><li>It rewrites <code>_session_id</code> to <code>"{base}-cont-{self._summarization_count}"</code>, where <code>base</code> comes from <code>self._session_id.split('-cont-')[0]</code> so any earlier continuation suffix is removed first.</li><li>If <code>_chat</code> exists, it rebuilds <code>_trajectory_steps</code> from <code>self._chat.messages[:-1]</code> via <code>_convert_chat_messages_to_steps(..., mark_as_copied=True)</code>.</li><li>That rebuilt trajectory intentionally excludes the last chat message, leaving the normal agent-loop path to append that response later rather than duplicating it here.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _split_trajectory_on_summarization(self, handoff_prompt: str) -&gt; None:
+        """Split trajectory on summarization when linear_history is enabled.
+
+        Saves current trajectory segment and resets for continuation with full linear history.
+
+        Args:
+            handoff_prompt: The handoff prompt containing answers
+        """
+        # Save current trajectory segment before creating a continuation
+        # When _summarization_count is 1, dump to trajectory.json (continuation_index = 0)
+        # When _summarization_count is 2, dump to trajectory.cont-1.json (continuation_index = 1)
+        self._dump_trajectory_with_continuation_index(self._summarization_count - 1)
+
+        # Create new session_id for continuation
+        self._session_id = (
+            f"{self._session_id.split('-cont-')[0]}-cont-{self._summarization_count}"
+        )
+
+        # After dumping the trajectory till the summarization stage, reset trajectory by
+        # converting from chat messages (excluding the last response which will be added
+        # by the normal agent loop flow). Mark all these steps as copied context since they
+        # were already present in the previous trajectory segment.
+        if self._chat:
+            self._trajectory_steps = self._convert_chat_messages_to_steps(
+                self._chat.messages[:-1], mark_as_copied=True
+            )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It computes the dump index as <code>_summarization_count - 1</code> because the file being closed is the pre-continuation segment, while the new <code>_session_id</code> uses the current <code>_summarization_count</code> for the segment that follows. Using the same number for both would blur the boundary between the finished file and the newly started continuation.</li><li>It reconstructs <code>_trajectory_steps</code> from <code>_chat.messages</code> instead of carrying the old step list forward verbatim so the continuation starts from the live chat history and can mark those entries as copied context with <code>mark_as_copied=True</code>. Reusing the old list would not encode which steps were inherited from the prior segment.</li><li>It slices <code>self._chat.messages[:-1]</code> rather than all messages because the last response belongs to the normal loop's later append path. Including it here would duplicate that response across the split boundary.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Terminus2._run_agent_loop</li><li><strong>Core callees</strong>: Terminus2._dump_trajectory_with_continuation_index; Terminus2._convert_chat_messages_to_steps</li><li><strong>Config / state sources</strong>: self._summarization_count; self._session_id; self._chat.messages</li><li><strong>Results to</strong>: Persisted trajectory segment selected by <code>_dump_trajectory_with_continuation_index</code>; self._session_id for subsequent continuation output; self._trajectory_steps consumed by later trajectory appends and dumps in the main loop</li><li><strong>Related siblings</strong>: Terminus2._run_agent_loop: consumes <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> and chooses this helper in linear-history mode instead of appending a <code>source="user"</code> step</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — choose dump index and continuation suffix</li><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — replace with copied-context continuation steps</li><li><a class="reg" href="registers.html#reg-chat-messages"><code>reg-chat-messages</code></a> — rebuild continuation steps from prior chat</li></ul></div>
+</div></details><nav class="pn"><a class="pn-prev" href="stage-4.4.html"><span>← Previous</span><strong>Response Parse</strong></a><a class="pn-next" href="stage-4.6.html"><span>Next →</span><strong>Error Branch</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

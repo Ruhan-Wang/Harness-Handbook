@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-4.2 · 主动摘要探测</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=zh"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 手册</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=zh" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>返回主页</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>状态流寄存器</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>配置固化</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>环境搭建</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>运行起点</a></div><details class="s-node" open><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>迭代主循环</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>循环入口门控</a></div><div class="s-leaf"><a class="s-link cur" href="stage-4.2.html"><span class="s-num">4.2</span>主动摘要探测</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM 调用</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>响应解析</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>待交接提示 → 用户步骤(或切分)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>错误分支</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>命令执行 → 观察 → 轨迹步骤</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>完成门控与循环控制</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>解析器内部辅助</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>运行收尾</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>录制后处理(外部)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>上下文摘要</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token 与成本核算</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>输出长度限制</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>日志</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux 内部辅助</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">索引</a><span class="sep">›</span><a href="stage-4.html">迭代主循环</a></nav><div class="stage-head"><h1>主动摘要探测</h1><div class="meta"><span class="chip mono">stage-4.2</span><span class="chip">Proactive Summarize Probe</span><span class="chip">2 个函数</span></div></div>
+<h2 class="sec">开场解释</h2>
+<p>这个 Stage 在解决一个很实际的问题：<strong>别等上下文快爆了才补救，而是提前看一眼，要不要现在就做摘要。</strong> 它是一次“预检”。位置上，它在真正问 LLM（大语言模型）之前，先判断当前对话离上下文上限还有多少余量。若空间已经很紧，它就先走一遍摘要旁路，把后续要交接的摘要材料先准备好；若还够用，就什么都不改，直接进入下一步。它的价值不是推进对话本身，而是提前控风险，避免后面因为上下文太长而被动收缩。</p>
+<h2 class="sec">主流程</h2>
+
+<ol><li><strong>先看要不要进这个 Stage。</strong> <p>只有两个条件都满足才会跑：</p>
+<ul><li>有 <code>original_instruction</code>（最初的用户任务，还保留着） </li><li>开了 <code>self._enable_summarize</code>（允许摘要） </li></ul>
+<p>少一个都不做，<strong>立刻落到 4.3</strong>。 这说明它不是每轮必跑，而是一个有条件的“容量探针”。</p></li><li><strong>如果要跑，就先做一次容量判断。</strong> <p><code>_check_proactive_summarization()</code>（检查“现在是否该主动摘要”）会看：</p>
+<ul><li>当前上下文上限 <code>context_limit</code> </li><li>已经用了多少 token（给 LLM 的文本切分单位） </li></ul>
+<p>本质上是在问：<strong>“剩余空间还安全吗？”</strong> 这里它自己就能做两种结论：</p>
+<ul><li><strong>不用摘要</strong>：余量还够，返回空结果 </li><li><strong>现在就摘要</strong>：余量低于阈值，立刻走完整摘要旁路</li></ul></li><li><strong>如果真的触发摘要，就先把“交接材料”暂存起来。</strong> <p>摘要旁路会产出两类东西：</p>
+<ul><li><code>handoff_prompt</code>：后面要写进轨迹的“交接提示词” </li><li><code>subagent_refs</code>：摘要里提到的 subagent（被主 Agent 调用的小 Agent）引用 </li></ul>
+<p>这个 Stage <strong>只把它们放进 pending 寄存器里暂存</strong>，还<strong>不会立刻改动主轨迹</strong>。 这么设计是为了让本轮后面的 4.5 / 4.6 按统一位置去落盘、记账、切分历史。 也就是说，它现在只是“先备好材料”，不是“当场改历史”。</p></li><li><strong>不管有没有摘要，这一轮通常都会继续往前走。</strong> <ul><li>没触发摘要：直接去 4.3 问 LLM </li><li>触发了摘要：把交接材料暂存后，继续本轮后续 Stage；真正写入轨迹要等 4.5 / 4.6 </li></ul>
+<p>所以它的成功效果很明确：<strong>要么什么都不变，要么只准备待提交的摘要交接物；它不直接改当前对话状态。</strong></p></li></ol>
+<h2 class="sec"> 状态流动</h2>
+<ul><li>读: <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — 本 Stage 不读取它；这个寄存器的意义在于后续 4.6 会消费这里暂存的摘要交接提示。这里说明它只是“待提交槽位”。</li><li>写: <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — 只有当主动摘要检查判定“现在就摘要”，且摘要旁路返回了 <code>handoff_prompt</code> 时才写入；目的是把本轮中途产出的交接提示先暂存，留给后续 Stage 统一记入轨迹。</li><li>写: <a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a> — 只有当主动摘要真的发生，且摘要旁路返回了 <code>subagent_refs</code> 时才写入；目的是把相关 subagent 引用一起暂存，供后续轨迹记录使用。</li><li>清: 无 — 这个 Stage 不清寄存器；如果门没过，或检查后判定“不需要摘要”，pending 寄存器在这里保持原样不变。</li></ul>
+<blockquote><p>分支结果要点：</p>
+<ul><li><strong>门条件不满足</strong>：本 Stage 不做检查，立即落到 4.3。 </li><li><strong>门条件满足并运行检查</strong>：<code>_check_proactive_summarization()</code> 会自己决定“无需摘要”或“立刻摘要”。 </li><li><strong>无需摘要</strong>：不写任何 pending 数据，继续到 4.3。 </li><li><strong>立刻摘要</strong>：把交接材料写入 pending 寄存器，但此时仍只是暂存，<strong>还没有提交进主轨迹</strong>。</li></ul></blockquote>
+
+<h2 class="sec">与前后 Stage 的衔接</h2>
+<p>4.1 刚完成本轮入口判断，把循环带到这里；这个 Stage 接着做的是“在真正发问前，先看上下文还撑不撑得住”。它产出的不是给 4.3 直接消费的答案内容，而是给 <strong>4.5 / 4.6 之后统一落轨迹</strong> 的待提交摘要材料；若什么都没产出，4.3 就像平常一样继续问 LLM。</p><div class="files-bar"><h2 class="sec">函数细节<span class="pill">2</span></h2><span class="spacer"></span><button class="tool" data-x="expand">全部展开</button><button class="tool" data-x="collapse">全部折叠</button></div><details class="file" id="fn-terminus2_run_agent_loop"><summary><span class="chev"></span><code class="fpath">Terminus2._run_agent_loop</code><a class="fn-range" href="../code/terminus_2.py.html#L1283-L1294" title="terminus_2.py:1283-1294">terminus_2.py:1283–1294 ↗</a></summary><div class="file-body"><p class="fn-sub">主循环中的主动摘要探测段</p>
+<blockquote><p><strong>stage 上下文</strong>: 该片段位于 <a href="stage-4.2.html">stage-4.2</a>，承担“是否提前触发摘要交接”的门控职责。只有 <code>original_instruction</code> 存在且 <code>self._enable_summarize</code> 为真时才进入；它本身不落轨迹，而是把 <code>_check_proactive_summarization(...)</code> 的结果暂存到 pending 状态，交由后续 <a href="stage-4.5.html">stage-4.5</a> / 4.6 统一记入 trajectory。由于这是本 stage 当前唯一已翻译单元，它也构成该 stage 与 <a href="side-S1.html">side-S1</a> 摘要支流的直接连接点。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>这段代码在 agent loop 中可选地执行一次“主动摘要”探测：以当前 <code>chat</code>、初始用户指令 <code>original_instruction</code> 与 <code>self._session</code> 为输入，调用 <code>_check_proactive_summarization(...)</code>。若该调用返回非空结果，则将返回的 <code>prompt</code> 与 <code>subagent_refs</code> 分别写入 <code>self._pending_handoff_prompt</code> 和 <code>self._pending_subagent_refs</code>。真正的产出不是立即修改轨迹，而是为当前迭代后续阶段延迟提供 handoff 用户消息与摘要子代理引用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, original_instruction, chat) -&gt; None</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — Terminus2 实例，提供摘要开关、会话对象与 pending 状态寄存; <code>original_instruction</code>: <code>?</code> — 原始用户任务指令；作为主动摘要探测的前置条件与输入之一; <code>chat</code>: <code>?</code> — 当前主对话对象；传入 <code>_check_proactive_summarization(...)</code> 进行上下文容量判断</li><li>读状态: <code>self._enable_summarize</code>, <code>self._session</code></li><li>返回: 无显式返回；真正产出是按条件写入 pending handoff / subagent 引用，供本次迭代后续 stage 消费。</li><li>副作用: 调用 <code>self._check_proactive_summarization(chat, original_instruction, self._session)</code>; 写入 <code>self._pending_subagent_refs</code>; 写入 <code>self._pending_handoff_prompt</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先同时检查 <code>original_instruction</code> 与 <code>self._enable_summarize</code>；只有两者都满足时，才进入主动摘要探测分支。</li><li>以当前对话 <code>chat</code>、原始指令 <code>original_instruction</code> 和会话 <code>self._session</code> 调用 <code>await self._check_proactive_summarization(...)</code>，得到 <code>proactive_summary_result</code>。</li><li>对返回值做真值判断；只有结果非空时，才将其解包为 <code>prompt, subagent_refs</code>。</li><li>把 <code>subagent_refs</code> 暂存到 <code>self._pending_subagent_refs</code>，用于稍后补写一条 system 级轨迹步骤。</li><li>把 <code>prompt</code> 暂存到 <code>self._pending_handoff_prompt</code>，用于稍后作为用户侧 handoff 消息进入当前迭代的轨迹处理。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>            if original_instruction and self._enable_summarize:
+                proactive_summary_result = await self._check_proactive_summarization(
+                    chat,
+                    original_instruction,
+                    self._session,
+                )
+                if proactive_summary_result:
+                    prompt, subagent_refs = proactive_summary_result
+                    # Store subagent_refs to add a system step later
+                    self._pending_subagent_refs = subagent_refs
+                    # Also store the handoff prompt to add as a user step
+                    self._pending_handoff_prompt = prompt</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>该段以双条件门控（<code>original_instruction</code> 与 <code>self._enable_summarize</code>）限制主动摘要探测范围，避免在无原始任务语义或功能开关关闭时进入额外的摘要判定路径。</li><li>代码对 <code>_check_proactive_summarization(...)</code> 的结果采用显式“仅在非空时写入 pending 状态”的策略，而不是无条件覆盖；这保留了“未触发摘要”这一状态的空值语义，避免后续 stage 将空摘要误当成一次真实 handoff。</li><li>这里不直接把结果写入 trajectory，而是先写入 <code>self._pending_*</code>；这种延迟提交把“是否触发摘要”与“如何在轨迹中落盘”分离，使 <a href="stage-4.5.html">stage-4.5</a> / 4.6 能用统一路径处理主动与回退两类摘要触发来源。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2._run_agent_loop</li><li><strong>核心被调用</strong>: Terminus2._check_proactive_summarization</li><li><strong>配置/状态来源</strong>: self._enable_summarize; self._session; original_instruction; chat</li><li><strong>结果去向</strong>: self._pending_handoff_prompt; self._pending_subagent_refs; <a href="stage-4.5.html">stage-4.5</a> 对 subagent refs 的轨迹记录; <a href="stage-4.6.html">stage-4.6</a> 对 handoff prompt 的轨迹记录或历史切分处理</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a> — 摘要触发后暂存子代理引用</li><li><a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — 摘要触发后暂存交接提示</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_check_proactive_summarization"><summary><span class="chev"></span><code class="fpath">Terminus2._check_proactive_summarization</code><a class="fn-range" href="../code/terminus_2.py.html#L956-L980" title="terminus_2.py:956-980">terminus_2.py:956–980 ↗</a></summary><div class="file-body"><p class="fn-sub">按上下文余量判定是否触发主动摘要</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数是 <a href="stage-4.2.html">stage-4.2</a> 中实际执行“主动摘要探测”的判定点。它不直接修改 Terminus2 的挂起寄存器，而是根据当前 chat 的估算 token 余量决定是否调用 <code>_summarize(...)</code>，并把结果作为返回值交给上层。与同 stage 已翻译的 <code>_run_agent_loop</code> 相比，前者负责接收并保存结果，本函数只负责判定、调用与容错。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数读取模型上下文上限与当前 chat 的总 token 估算值，计算 <code>free_tokens</code>，并与 <code>self._proactive_summarization_threshold</code> 比较。若余量低于阈值，则记录一条 debug 日志并异步调用 <code>_summarize(chat, original_instruction, session)</code>；成功时返回 <code>(summary_prompt, subagent_trajectory_refs)</code>，失败时记录 error 日志后返回 <code>None</code>。若余量未低于阈值，也直接返回 <code>None</code>。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, chat: Chat, original_instruction: str, session: TmuxSession) -&gt; tuple[str, list[SubagentTrajectoryRef] | None] | None</code></p>
+<ul><li>参数: <code>chat</code>: <code>Chat</code> — 当前对话历史；用于估算总 token，并在需要时传给 <code>_summarize(...)</code>; <code>original_instruction</code>: <code>str</code> — 原始指令文本；仅在触发摘要时转交给 <code>_summarize(...)</code>; <code>session</code>: <code>TmuxSession</code> — tmux 会话对象；仅在触发摘要时转交给 <code>_summarize(...)</code></li><li>读状态: <code>self._llm</code>, <code>self._proactive_summarization_threshold</code>, <code>self.logger</code></li><li>返回: 当 <code>free_tokens &lt; self._proactive_summarization_threshold</code> 且 <code>_summarize(...)</code> 成功时，返回 <code>(summary_prompt, subagent_trajectory_refs)</code>；其余情况返回 <code>None</code>。</li><li>副作用: 调用 <code>self._llm.get_model_context_limit()</code> 读取模型上下文上限; 调用 <code>self._count_total_tokens(chat)</code> 估算当前对话 token 总量; 在阈值触发时写入一条 debug 日志; 在阈值触发时异步调用 <code>self._summarize(chat, original_instruction, session)</code>; 若摘要过程抛出异常，写入一条 error 日志</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先通过 <code>self._llm.get_model_context_limit()</code> 取得 <code>context_limit</code>，再调用 <code>self._count_total_tokens(chat)</code> 得到 <code>current_tokens</code>，据此计算 <code>free_tokens = context_limit - current_tokens</code>。</li><li>将 <code>free_tokens</code> 与 <code>self._proactive_summarization_threshold</code> 比较；只有在余量低于阈值时，才进入主动摘要分支。</li><li>进入摘要分支后，先用 <code>self.logger.debug(...)</code> 记录一条包含 <code>free_tokens</code> 的调试日志，说明即将执行主动摘要。</li><li>随后在 <code>try</code> 中等待 <code>self._summarize(chat, original_instruction, session)</code> 完成；若成功，解包得到 <code>summary_prompt</code> 与 <code>subagent_trajectory_refs</code>，并立即以二元组形式返回。</li><li>如果 <code>_summarize(...)</code> 抛出任意异常，则由 <code>except Exception as e</code> 捕获，并通过 <code>self.logger.error(...)</code> 记录错误信息。</li><li>当未触发阈值，或触发后摘要失败时，函数都走到结尾并返回 <code>None</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    async def _check_proactive_summarization(
+        self, chat: Chat, original_instruction: str, session: TmuxSession
+    ) -&gt; tuple[str, list[SubagentTrajectoryRef] | None] | None:
+        """Check if we should proactively summarize due to token usage.
+
+        Returns:
+            tuple: (summary_prompt, subagent_trajectory_ref) if summarization occurred, None otherwise
+        """
+        context_limit = self._llm.get_model_context_limit()
+        current_tokens = self._count_total_tokens(chat)
+        free_tokens = context_limit - current_tokens
+
+        if free_tokens &lt; self._proactive_summarization_threshold:
+            self.logger.debug(
+                f"Proactively summarizing. Free tokens: approximately {free_tokens}"
+            )
+            try:
+                summary_prompt, subagent_trajectory_refs = await self._summarize(
+                    chat, original_instruction, session
+                )
+                return (summary_prompt, subagent_trajectory_refs)
+            except Exception as e:
+                self.logger.error(f"Error in proactively summarizing: {e}")
+
+        return None</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>触发条件使用“剩余上下文余量”<code>free_tokens &lt; self._proactive_summarization_threshold</code>，而不是等待真正超限；这是代码中显式采用的前置判定策略，使摘要在接近容量边界时就可发生。</li><li>摘要调用被包裹在 <code>try/except Exception</code> 中，且异常只记录日志、不再向外抛出；这表明该函数将主动摘要视为可失败的辅助路径，而不是必须成功的硬性步骤。</li><li>返回值设计为“摘要结果二元组或 <code>None</code>”的可空协议，而不是在函数内写入某个 <code>self._pending_*</code> 字段；因此本函数的职责被限定为判定与产出结果，不在本地完成持久化。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2._run_agent_loop</li><li><strong>核心被调用</strong>: self._llm.get_model_context_limit; self._count_total_tokens; self._summarize; self.logger.debug; self.logger.error</li><li><strong>配置/状态来源</strong>: self._proactive_summarization_threshold; self._llm</li><li><strong>结果去向</strong>: 返回给上层调用者的 <code>(summary_prompt, subagent_trajectory_refs)</code>; 返回给上层调用者的 <code>None</code></li><li><strong>同类 sibling</strong>: Terminus2._run_agent_loop：兄弟函数负责接收本函数返回值并进一步处理；本函数自身只做阈值判定、日志记录与 <code>_summarize(...)</code> 调用。</li></ul></div></details><nav class="pn"><a class="pn-prev" href="stage-4.1.html"><span>← 上一阶段</span><strong>循环入口门控</strong></a><a class="pn-next" href="stage-4.3.html"><span>下一阶段 →</span><strong>LLM 调用</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

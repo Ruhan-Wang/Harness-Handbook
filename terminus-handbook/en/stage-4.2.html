@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-4.2 · Proactive Summarize Probe</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=en"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=en" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>Home</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>State-flow registers</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>Configuration Crystallization</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>Environment Setup</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>Run Onset</a></div><details class="s-node" open><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>Iteration Loop</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>Loop Entry Gates</a></div><div class="s-leaf"><a class="s-link cur" href="stage-4.2.html"><span class="s-num">4.2</span>Proactive Summarize Probe</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM Query</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>Response Parse</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>Pending Handoff Prompt → User Step (or Split)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>Error Branch</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>Command Execute → Observation → Trajectory Step</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>Completion Gate + Loop Control</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>Parser internal helpers</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>Run Teardown</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>Recording Post-process (External)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>Context Summarization</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token &amp; Cost Accounting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>Output Length Limiting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>Logging</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux internal helpers</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">Index</a><span class="sep">›</span><a href="stage-4.html">Iteration Loop</a></nav><div class="stage-head"><h1>Proactive Summarize Probe</h1><div class="meta"><span class="chip mono">stage-4.2</span><span class="chip">2 functions</span></div></div>
+<h2 class="sec">Opening Explanation</h2>
+<p>This stage exists to catch context pressure early and prepare a summary handoff before the next LLM call fails or becomes inefficient. In plain terms, it asks: “Do we still have enough room in the model’s context window, or should we compress the conversation now?” Its job is not to record anything yet. Its job is to decide whether proactive summarization is needed and, if so, stage the resulting summary artifacts for later recording. It sits just before the main LLM query on purpose. That placement gives the agent one last chance to shrink history before sending another prompt, while still keeping the current iteration’s bookkeeping consistent.</p>
+<h2 class="sec">Main Flow</h2>
+
+<ol><li>This stage first checks whether proactive summarization is even allowed. <p>It only runs when there is an <code>original_instruction</code> to anchor the summary to, and when proactive summarization is enabled.</p></li><li>Then it calls <code>_check_proactive_summarization()</code> (check remaining context room, and if needed run summarization). <p>This is the key control point:</p>
+<ul><li><strong>If there is still enough context space:</strong> do nothing and continue normally.</li><li><strong>If space is below the threshold:</strong> this helper does not just return a warning flag. It runs the full summarization side flow, <a href="side-S1.html">[side-S1</a>](<a href="side-S1.html">side-S1</a>.html), and gets back summary artifacts.</li></ul></li><li>If summarization happened, this stage stores the returned artifacts in pending registers. <p>Those artifacts are:</p>
+<ul><li>a <strong>handoff prompt</strong>: the summary text that can stand in for older conversation history</li><li><strong>subagent refs</strong>: references to work done by subagents (smaller helper agents invoked by the main agent)</li></ul></li><li>It does <strong>not</strong> write the trajectory record itself. <p>That delay is intentional. The agent is still in the middle of an iteration, so this stage only stages the artifacts. Later recorder stages decide how to write them into history in a consistent way.</p></li></ol>
+<h2 class="sec"> State Flow</h2>
+<ul><li>writes: <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — written only when proactive summarization actually runs, so a later recorder stage can persist the summary handoff in this same iteration</li><li>writes: <a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a> — written alongside the handoff prompt when summarization runs, so later recording can preserve references to subagent work</li><li>triggers downstream: <code>stage-4.3 LLM Query</code> — always continues here after the check, whether the result was “no summary needed” or “summary artifacts staged”</li></ul>
+<h2 class="sec">Pipeline Hand-Off</h2>
+<p>Upstream, this stage inherits a live chat history plus the original task instruction, right after loop-entry checks have allowed the iteration to proceed. It produces either nothing or a staged summary handoff package; then the pipeline moves on in two steps: first to the normal <code>stage-4.3 LLM Query</code>, and later in the same iteration to recorder stages 4.5 / 4.6, which consume the pending artifacts and write them into the trajectory.</p><div class="files-bar"><h2 class="sec">Functions<span class="pill">2</span></h2><span class="spacer"></span><button class="tool" data-x="expand">Expand all</button><button class="tool" data-x="collapse">Collapse all</button></div><details class="file" id="fn-terminus2_run_agent_loop"><summary><span class="chev"></span><code class="fpath">Terminus2._run_agent_loop</code><a class="fn-range" href="../code/terminus_2.py.html#L1283-L1294" title="terminus_2.py:1283-1294">terminus_2.py:1283–1294 ↗</a></summary><div class="file-body"><p class="fn-sub">Proactive summarization probe and deferred handoff staging</p>
+<blockquote><p><strong>Stage context</strong>: This region is the <a href="stage-4.2.html">stage-4.2</a> gate for proactive summarization inside <code>Terminus2._run_agent_loop</code>. It runs only when both <code>original_instruction</code> and <code>self._enable_summarize</code> are truthy, and it delegates the actual probe to <code>_check_proactive_summarization(...)</code>. If that helper returns a truthy result, this region stages the returned prompt and subagent references on pending <code>self._</code> fields for later handling elsewhere in the loop.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>This region conditionally checks whether proactive summarization should run, using <code>chat</code>, <code>original_instruction</code>, and <code>self._session</code>. When <code>_check_proactive_summarization(...)</code> returns a truthy <code>(prompt, subagent_refs)</code> pair, it stores <code>subagent_refs</code> in <code>self._pending_subagent_refs</code> and <code>prompt</code> in <code>self._pending_handoff_prompt</code>. If either gate is false, or the helper returns a falsy value, this region leaves state unchanged.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>region interface within </code>Terminus2._run_agent_loop<code>: uses </code>(self, chat, original_instruction)<code> -&gt; no direct return; may write pending summarization state</code></p>
+<ul><li>params: <code>self</code>: <code>Terminus2</code> — owner object; supplies summarization config, session, and pending-state fields; <code>chat</code>: <code>?</code> — active chat state passed into <code>_check_proactive_summarization(...)</code>; <code>original_instruction</code>: <code>?</code> — truthiness gate and original user instruction passed to the summarization probe</li><li>reads: <code>self._enable_summarize</code>, <code>self._session</code></li><li>returns: none; the product is conditional writes to pending summarization fields</li><li>effects: awaits <code>self._check_proactive_summarization(chat, original_instruction, self._session)</code> when both gates are truthy; writes <code>self._pending_subagent_refs</code> when the helper returns a truthy result; writes <code>self._pending_handoff_prompt</code> when the helper returns a truthy result</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Check the two gates: <code>original_instruction</code> must be truthy and <code>self._enable_summarize</code> must be truthy.</li><li>When both gates pass, await <code>_check_proactive_summarization(chat, original_instruction, self._session)</code> and capture its return in <code>proactive_summary_result</code>.</li><li>Test <code>proactive_summary_result</code> by truthiness, not by an explicit <code>is not None</code> check.</li><li>When the result is truthy, unpack it into <code>prompt, subagent_refs</code> and store <code>subagent_refs</code> in <code>self._pending_subagent_refs</code>.</li><li>Store <code>prompt</code> in <code>self._pending_handoff_prompt</code>, matching the inline comments that these values are deferred for later addition as a system step and a user step.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>            if original_instruction and self._enable_summarize:
+                proactive_summary_result = await self._check_proactive_summarization(
+                    chat,
+                    original_instruction,
+                    self._session,
+                )
+                if proactive_summary_result:
+                    prompt, subagent_refs = proactive_summary_result
+                    # Store subagent_refs to add a system step later
+                    self._pending_subagent_refs = subagent_refs
+                    # Also store the handoff prompt to add as a user step
+                    self._pending_handoff_prompt = prompt</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>This region uses a double gate, <code>original_instruction</code> and <code>self._enable_summarize</code>, before calling <code>_check_proactive_summarization(...)</code>. That avoids probing summarization when the loop lacks the original instruction context or when summarization is disabled by configuration.</li><li>It stages the helper's outputs in <code>self._pending_subagent_refs</code> and <code>self._pending_handoff_prompt</code> instead of acting on them immediately. The inline comments tie that choice to deferred recording: one value is kept to add a system step later, and the other is kept to add a user step later.</li><li>The <code>if proactive_summary_result:</code> branch accepts only truthy returns from <code>_check_proactive_summarization(...)</code>. That is slightly broader than checking for a specific sentinel such as <code>None</code>, so the helper's falsy outputs all mean 'do not stage anything' here.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>Terminus2._run_agent_loop</code></li><li><strong>Core callees</strong>: <code>Terminus2._check_proactive_summarization</code></li><li><strong>Config / state sources</strong>: <code>self._enable_summarize</code>; <code>self._session</code>; <code>original_instruction</code></li><li><strong>Results to</strong>: <code>self._pending_subagent_refs</code>; <code>self._pending_handoff_prompt</code>; <a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a>; <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a></li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a> — store returned subagent refs when probe is truthy</li><li><a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — store returned prompt when probe is truthy</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_check_proactive_summarization"><summary><span class="chev"></span><code class="fpath">Terminus2._check_proactive_summarization</code><a class="fn-range" href="../code/terminus_2.py.html#L956-L980" title="terminus_2.py:956-980">terminus_2.py:956–980 ↗</a></summary><div class="file-body"><p class="fn-sub">Proactive token-budget summarization probe</p>
+<blockquote><p><strong>Stage context</strong>: This helper implements the <a href="stage-4.2.html">stage-4.2</a> probe that decides whether the current chat is close enough to the model context limit to trigger the summarization side flow. The main loop calls it only when proactive summarization is enabled and <code>original_instruction</code> exists. Unlike its caller, it does not store pending handoff data itself; it only returns the <code>(prompt, subagent_refs)</code> payload that <code>Terminus2._run_agent_loop</code> may place into the pending registers.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>The function measures remaining context budget for <code>chat</code> by combining <code>self._llm.get_model_context_limit()</code> with <code>self._count_total_tokens(chat)</code>. If the estimated free space is below <code>self._proactive_summarization_threshold</code>, it runs <code>self._summarize(chat, original_instruction, session)</code> and returns that routine's handoff prompt plus any <code>SubagentTrajectoryRef</code> list. If the threshold is not crossed, or summarization raises, it returns <code>None</code> and only emits a log message.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, chat: Chat, original_instruction: str, session: TmuxSession) -&gt; tuple[str, list[SubagentTrajectoryRef] | None] | None</code></p>
+<ul><li>params: <code>chat</code>: <code>Chat</code> — Current live conversation whose token load is checked; <code>original_instruction</code>: <code>str</code> — Original user/task instruction forwarded into <code>_summarize</code>; <code>session</code>: <code>TmuxSession</code> — Active tmux session forwarded into <code>_summarize</code></li><li>reads: <code>self._llm</code>, <code>self._count_total_tokens</code>, <code>self._proactive_summarization_threshold</code>, <code>self._summarize</code>, <code>self.logger</code></li><li>returns: Either <code>(summary_prompt, subagent_trajectory_refs)</code> from <code>_summarize</code>, or <code>None</code> when free tokens stay above the threshold or summarization fails.</li><li>effects: Emits a debug log when the proactive threshold triggers; Emits an error log if <code>_summarize</code> raises; May trigger the <code>_summarize</code> side flow, which performs broader external/stateful work outside this helper</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Read the model context cap from <code>self._llm.get_model_context_limit()</code>, count current chat tokens with <code>self._count_total_tokens(chat)</code>, and derive <code>free_tokens</code> as the remaining budget.</li><li>Compare <code>free_tokens</code> against <code>self._proactive_summarization_threshold</code> to decide whether proactive summarization should run.</li><li>When the threshold is crossed, write a debug message through <code>self.logger.debug(...)</code> that includes the approximate free-token count.</li><li>Call <code>await self._summarize(chat, original_instruction, session)</code> inside a <code>try</code> block and return its <code>(summary_prompt, subagent_trajectory_refs)</code> result unchanged.</li><li>If <code>_summarize</code> raises, log the exception through <code>self.logger.error(...)</code> and fall through to <code>None</code> instead of propagating the failure.</li><li>Return <code>None</code> when the threshold is not crossed or when summarization failed.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    async def _check_proactive_summarization(
+        self, chat: Chat, original_instruction: str, session: TmuxSession
+    ) -&gt; tuple[str, list[SubagentTrajectoryRef] | None] | None:
+        """Check if we should proactively summarize due to token usage.
+
+        Returns:
+            tuple: (summary_prompt, subagent_trajectory_ref) if summarization occurred, None otherwise
+        """
+        context_limit = self._llm.get_model_context_limit()
+        current_tokens = self._count_total_tokens(chat)
+        free_tokens = context_limit - current_tokens
+
+        if free_tokens &lt; self._proactive_summarization_threshold:
+            self.logger.debug(
+                f"Proactively summarizing. Free tokens: approximately {free_tokens}"
+            )
+            try:
+                summary_prompt, subagent_trajectory_refs = await self._summarize(
+                    chat, original_instruction, session
+                )
+                return (summary_prompt, subagent_trajectory_refs)
+            except Exception as e:
+                self.logger.error(f"Error in proactively summarizing: {e}")
+
+        return None</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It uses <code>free_tokens &lt; self._proactive_summarization_threshold</code> instead of waiting for an actual overflow condition. That gives the main loop room to summarize before the next LLM call runs out of context; the alternative would be a later, riskier trigger.</li><li>It treats token pressure as an estimate built from <code>get_model_context_limit()</code> and <code>_count_total_tokens(chat)</code>. The debug message even says <code>approximately</code>, which shows the function prefers a practical budget check over exact accounting.</li><li>It catches all <code>Exception</code> from <code>_summarize</code>, logs the failure, and returns <code>None</code>. This keeps the agent loop moving on the normal path instead of turning a summarization problem into a hard stop.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Terminus2._run_agent_loop</li><li><strong>Core callees</strong>: self._llm.get_model_context_limit; self._count_total_tokens; self._summarize; self.logger.debug; self.logger.error</li><li><strong>Config / state sources</strong>: self._proactive_summarization_threshold; self._llm</li><li><strong>Results to</strong>: Terminus2._run_agent_loop stores returned prompt into <code>self._pending_handoff_prompt</code> when truthy; Terminus2._run_agent_loop stores returned refs into <code>self._pending_subagent_refs</code> when truthy; <a href="stage-4.5.html">stage-4.5</a> via <a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a> after caller stores them; <a href="stage-4.6.html">stage-4.6</a> via <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> after caller stores it</li><li><strong>Related siblings</strong>: Terminus2._run_agent_loop: gates this helper on <code>original_instruction</code> and <code>_enable_summarize</code>, then records any returned handoff data into pending registers</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-chat-messages"><code>reg-chat-messages</code></a> — counts current chat tokens from live history</li></ul></div>
+</div></details><nav class="pn"><a class="pn-prev" href="stage-4.1.html"><span>← Previous</span><strong>Loop Entry Gates</strong></a><a class="pn-next" href="stage-4.3.html"><span>Next →</span><strong>LLM Query</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

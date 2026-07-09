@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tui/src/shimmer.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">tui/src/shimmer.rs</code>
+<span class="code-meta">80 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=k>use</b> std::sync::OnceLock;</i><i id="L2"><b class=k>use</b> std::time::Duration;</i><i id="L3"><b class=k>use</b> std::time::Instant;</i><i id="L4"></i><i id="L5"><b class=k>use</b> ratatui::style::Color;</i><i id="L6"><b class=k>use</b> ratatui::style::Modifier;</i><i id="L7"><b class=k>use</b> ratatui::style::Style;</i><i id="L8"><b class=k>use</b> ratatui::text::Span;</i><i id="L9"></i><i id="L10"><b class=k>use</b> <b class=k>crate</b>::color::blend;</i><i id="L11"><b class=k>use</b> <b class=k>crate</b>::terminal_palette::default_bg;</i><i id="L12"><b class=k>use</b> <b class=k>crate</b>::terminal_palette::default_fg;</i><i id="L13"></i><i id="L14"><b class=k>static</b> PROCESS_START: OnceLock&lt;Instant&gt; = OnceLock::new();</i><i id="L15"></i><i id="L16"><b class=k>fn</b> elapsed_since_start() -&gt; Duration {</i><i id="L17">    <b class=k>let</b> start = PROCESS_START.get_or_init(Instant::now);</i><i id="L18">    start.elapsed()</i><i id="L19">}</i><i id="L20"></i><i id="L21"><b class=k>pub</b>(<b class=k>crate</b>) <b class=k>fn</b> shimmer_spans(text: &amp;str) -&gt; Vec&lt;Span&lt;<b class=m>'static</b>&gt;&gt; {</i><i id="L22">    <b class=k>let</b> chars: Vec&lt;char&gt; = text.chars().collect();</i><i id="L23">    <b class=k>if</b> chars.is_empty() {</i><i id="L24">        <b class=k>return</b> Vec::new();</i><i id="L25">    }</i><i id="L26">    <b class=c>// Use time-based sweep synchronized to process start.</b></i><i id="L27">    <b class=k>let</b> padding = <b class=n>10usize</b>;</i><i id="L28">    <b class=k>let</b> period = chars.len() + padding * <b class=n>2</b>;</i><i id="L29">    <b class=k>let</b> sweep_seconds = <b class=n>2.0f32</b>;</i><i id="L30">    <b class=k>let</b> pos_f =</i><i id="L31">        (elapsed_since_start().as_secs_f32() % sweep_seconds) / sweep_seconds * (period <b class=k>as</b> f32);</i><i id="L32">    <b class=k>let</b> pos = pos_f <b class=k>as</b> usize;</i><i id="L33">    <b class=k>let</b> has_true_color = supports_color::on_cached(supports_color::Stream::Stdout)</i><i id="L34">        .map(|level| level.has_16m)</i><i id="L35">        .unwrap_or(<b class=k>false</b>);</i><i id="L36">    <b class=k>let</b> band_half_width = <b class=n>5.0</b>;</i><i id="L37"></i><i id="L38">    <b class=k>let</b> <b class=k>mut</b> spans: Vec&lt;Span&lt;<b class=m>'static</b>&gt;&gt; = Vec::with_capacity(chars.len());</i><i id="L39">    <b class=k>let</b> base_color = default_fg().unwrap_or((<b class=n>128</b>, <b class=n>128</b>, <b class=n>128</b>));</i><i id="L40">    <b class=k>let</b> highlight_color = default_bg().unwrap_or((<b class=n>255</b>, <b class=n>255</b>, <b class=n>255</b>));</i><i id="L41">    <b class=k>for</b> (i, ch) <b class=k>in</b> chars.iter().enumerate() {</i><i id="L42">        <b class=k>let</b> i_pos = i <b class=k>as</b> isize + padding <b class=k>as</b> isize;</i><i id="L43">        <b class=k>let</b> pos = pos <b class=k>as</b> isize;</i><i id="L44">        <b class=k>let</b> dist = (i_pos - pos).abs() <b class=k>as</b> f32;</i><i id="L45"></i><i id="L46">        <b class=k>let</b> t = <b class=k>if</b> dist &lt;= band_half_width {</i><i id="L47">            <b class=k>let</b> x = std::f32::consts::PI * (dist / band_half_width);</i><i id="L48">            <b class=n>0.5</b> * (<b class=n>1.0</b> + x.cos())</i><i id="L49">        } <b class=k>else</b> {</i><i id="L50">            <b class=n>0.0</b></i><i id="L51">        };</i><i id="L52">        <b class=k>let</b> style = <b class=k>if</b> has_true_color {</i><i id="L53">            <b class=k>let</b> highlight = t.clamp(<b class=n>0.0</b>, <b class=n>1.0</b>);</i><i id="L54">            <b class=k>let</b> (r, g, b) = blend(highlight_color, base_color, highlight * <b class=n>0.9</b>);</i><i id="L55">            <b class=c>// Allow custom RGB colors, as the implementation is thoughtfully</b></i><i id="L56">            <b class=c>// adjusting the level of the default foreground color.</b></i><i id="L57">            <b class=m>#[allow(clippy::disallowed_methods)]</b></i><i id="L58">            {</i><i id="L59">                Style::default()</i><i id="L60">                    .fg(Color::Rgb(r, g, b))</i><i id="L61">                    .add_modifier(Modifier::BOLD)</i><i id="L62">            }</i><i id="L63">        } <b class=k>else</b> {</i><i id="L64">            color_for_level(t)</i><i id="L65">        };</i><i id="L66">        spans.push(Span::styled(ch.to_string(), style));</i><i id="L67">    }</i><i id="L68">    spans</i><i id="L69">}</i><i id="L70"></i><i id="L71"><b class=k>fn</b> color_for_level(intensity: f32) -&gt; Style {</i><i id="L72">    <b class=c>// Tune fallback styling so the shimmer band reads even without RGB support.</b></i><i id="L73">    <b class=k>if</b> intensity &lt; <b class=n>0.2</b> {</i><i id="L74">        Style::default().add_modifier(Modifier::DIM)</i><i id="L75">    } <b class=k>else</b> <b class=k>if</b> intensity &lt; <b class=n>0.6</b> {</i><i id="L76">        Style::default()</i><i id="L77">    } <b class=k>else</b> {</i><i id="L78">        Style::default().add_modifier(Modifier::BOLD)</i><i id="L79">    }</i><i id="L80">}</i></pre></div>
+</main>
+<script src="../../../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memories/write/src/extensions/prune_tests.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">memories/write/src/extensions/prune_tests.rs</code>
+<span class="code-meta">85 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=k>use</b> <b class=k>super</b>::*;</i><i id="L2"><b class=k>use</b> <b class=k>crate</b>::memory_extensions_root;</i><i id="L3"><b class=k>use</b> pretty_assertions::assert_eq;</i><i id="L4"><b class=k>use</b> tempfile::TempDir;</i><i id="L5"></i><i id="L6"><b class=m>#[tokio::test]</b></i><i id="L7"><b class=k>async</b> <b class=k>fn</b> prunes_only_old_resources_from_extensions_with_instructions() {</i><i id="L8">    <b class=k>let</b> codex_home = TempDir::new().expect(<b class=s>"create temp codex home"</b>);</i><i id="L9">    <b class=k>let</b> memory_root = codex_home.path().join(<b class=s>"memories"</b>);</i><i id="L10">    <b class=k>let</b> extensions_root = memory_extensions_root(&amp;memory_root);</i><i id="L11">    <b class=k>let</b> chronicle_resources = extensions_root.join(<b class=s>"chronicle/resources"</b>);</i><i id="L12">    tokio::fs::create_dir_all(&amp;chronicle_resources)</i><i id="L13">        .<b class=k>await</b></i><i id="L14">        .expect(<b class=s>"create chronicle resources"</b>);</i><i id="L15">    tokio::fs::write(</i><i id="L16">        extensions_root.join(<b class=s>"chronicle/instructions.md"</b>),</i><i id="L17">        <b class=s>"instructions"</b>,</i><i id="L18">    )</i><i id="L19">    .<b class=k>await</b></i><i id="L20">    .expect(<b class=s>"write chronicle instructions"</b>);</i><i id="L21"></i><i id="L22">    <b class=k>let</b> now = DateTime::from_naive_utc_and_offset(</i><i id="L23">        NaiveDateTime::parse_from_str(</i><i id="L24">            <b class=s>"2026-04-14T12-00-00"</b>,</i><i id="L25">            <b class=k>crate</b>::extension_resources::FILENAME_TS_FORMAT,</i><i id="L26">        )</i><i id="L27">        .expect(<b class=s>"parse now"</b>),</i><i id="L28">        Utc,</i><i id="L29">    );</i><i id="L30">    <b class=k>let</b> old_file = chronicle_resources.join(<b class=s>"2026-04-06T11-59-59-abcd-10min-old.md"</b>);</i><i id="L31">    <b class=k>let</b> exact_cutoff_file = chronicle_resources.join(<b class=s>"2026-04-07T12-00-00-abcd-10min-cutoff.md"</b>);</i><i id="L32">    <b class=k>let</b> recent_file = chronicle_resources.join(<b class=s>"2026-04-08T12-00-00-abcd-10min-recent.md"</b>);</i><i id="L33">    <b class=k>let</b> invalid_file = chronicle_resources.join(<b class=s>"not-a-timestamp.md"</b>);</i><i id="L34">    <b class=k>for</b> file <b class=k>in</b> [&amp;old_file, &amp;exact_cutoff_file, &amp;recent_file, &amp;invalid_file] {</i><i id="L35">        tokio::fs::write(file, <b class=s>"resource"</b>)</i><i id="L36">            .<b class=k>await</b></i><i id="L37">            .expect(<b class=s>"write chronicle resource"</b>);</i><i id="L38">    }</i><i id="L39"></i><i id="L40">    <b class=k>let</b> ignored_resources = extensions_root.join(<b class=s>"ignored/resources"</b>);</i><i id="L41">    tokio::fs::create_dir_all(&amp;ignored_resources)</i><i id="L42">        .<b class=k>await</b></i><i id="L43">        .expect(<b class=s>"create ignored resources"</b>);</i><i id="L44">    <b class=k>let</b> ignored_old_file = ignored_resources.join(<b class=s>"2026-04-06T11-59-59-abcd-10min-old.md"</b>);</i><i id="L45">    tokio::fs::write(&amp;ignored_old_file, <b class=s>"ignored"</b>)</i><i id="L46">        .<b class=k>await</b></i><i id="L47">        .expect(<b class=s>"write ignored resource"</b>);</i><i id="L48"></i><i id="L49">    prune_old_extension_resources_with_now(&amp;memory_root, now).<b class=k>await</b>;</i><i id="L50"></i><i id="L51">    <b class=m>assert!</b>(</i><i id="L52">        !tokio::fs::try_exists(&amp;old_file)</i><i id="L53">            .<b class=k>await</b></i><i id="L54">            .expect(<b class=s>"check old file"</b>)</i><i id="L55">    );</i><i id="L56">    <b class=m>assert!</b>(</i><i id="L57">        !tokio::fs::try_exists(&amp;exact_cutoff_file)</i><i id="L58">            .<b class=k>await</b></i><i id="L59">            .expect(<b class=s>"check cutoff file"</b>)</i><i id="L60">    );</i><i id="L61">    <b class=m>assert!</b>(</i><i id="L62">        tokio::fs::try_exists(&amp;recent_file)</i><i id="L63">            .<b class=k>await</b></i><i id="L64">            .expect(<b class=s>"check recent file"</b>)</i><i id="L65">    );</i><i id="L66">    <b class=m>assert!</b>(</i><i id="L67">        tokio::fs::try_exists(&amp;invalid_file)</i><i id="L68">            .<b class=k>await</b></i><i id="L69">            .expect(<b class=s>"check invalid file"</b>)</i><i id="L70">    );</i><i id="L71">    <b class=m>assert!</b>(</i><i id="L72">        tokio::fs::try_exists(&amp;ignored_old_file)</i><i id="L73">            .<b class=k>await</b></i><i id="L74">            .expect(<b class=s>"check ignored file"</b>)</i><i id="L75">    );</i><i id="L76">}</i><i id="L77"></i><i id="L78"><b class=m>#[test]</b></i><i id="L79"><b class=k>fn</b> parses_timestamp_prefix_from_resource_file_name() {</i><i id="L80">    <b class=k>let</b> parsed = resource_timestamp(<b class=s>"2026-04-06T11-59-59-abcd-10min-old.md"</b>)</i><i id="L81">        .expect(<b class=s>"timestamp should parse"</b>);</i><i id="L82"></i><i id="L83">    <b class=m>assert_eq!</b>(parsed.timestamp(), <b class=n>1_775_476_799</b>);</i><i id="L84">    <b class=m>assert!</b>(resource_timestamp(<b class=s>"not-a-timestamp.md"</b>).is_none());</i><i id="L85">}</i></pre></div>
+</main>
+<script src="../../../../../assets/app.js"></script>
+</body>
+</html>

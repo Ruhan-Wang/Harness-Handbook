@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-2 · Environment Setup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=en"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=en" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>Home</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>State-flow registers</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>Configuration Crystallization</a></div><div class="s-leaf"><a class="s-link cur" href="stage-2.html"><span class="s-num">2</span>Environment Setup</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>Run Onset</a></div><details class="s-node"><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>Iteration Loop</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>Loop Entry Gates</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>Proactive Summarize Probe</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM Query</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>Response Parse</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>Pending Handoff Prompt → User Step (or Split)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>Error Branch</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>Command Execute → Observation → Trajectory Step</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>Completion Gate + Loop Control</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>Parser internal helpers</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>Run Teardown</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>Recording Post-process (External)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>Context Summarization</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token &amp; Cost Accounting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>Output Length Limiting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>Logging</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux internal helpers</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">Index</a></nav><div class="stage-head"><h1>Environment Setup</h1><div class="meta"><span class="chip mono">stage-2</span><span class="chip">3 functions</span></div></div>
+<h2 class="sec">Opening Explanation</h2>
+<p>This stage exists to turn a configured trial into a live terminal the agent can actually use. Upstream, the agent already knows its fixed settings: pane size, extra environment variables, default user, and whether terminal recording should be enabled. But none of that matters until there is a real shell running inside the trial environment. That is the job here.</p>
+<p>Environment Setup owns one thing: creating and starting the tmux session (a terminal you can drive remotely) that the rest of the agent will talk to. It sits between static setup and active execution. Without it, the next stage would have plans and prompts but no terminal to observe, type into, or record.</p>
+<h2 class="sec">Main Flow</h2>
+
+<ol><li><code>Terminus2.setup()</code> (prepare this trial’s live terminal) is called once for the trial.<ul><li>Its purpose is not to make decisions.</li><li>Its job is to bind the agent to the specific <code>environment</code> it was given for this run.</li></ul></li><li>Inside that, <code>TmuxSession.__init__()</code> (create a remote-controlled terminal wrapper) is used to package together:<ul><li>the target trial environment</li><li>terminal size</li><li>extra environment variables</li><li>default user</li><li>optional asciinema recording paths Asciinema is a terminal recording format, so this is where recording gets attached if the trial asked for it.</li></ul></li><li>Then <code>TmuxSession.start()</code> (actually launch the terminal session) makes that wrapper real.<ul><li>This is the moment the agent goes from “configured” to “able to interact.”</li><li>After this, later stages can send commands, read screen output, and treat the terminal as the agent’s workspace.</li></ul></li><li>This stage stops there on purpose.<ul><li>It does not run the task.</li><li>It does not inspect output.</li><li>It only guarantees: when <code>run()</code> begins, a usable terminal already exists.</li></ul></li></ol>
+<h2 class="sec"> State Flow</h2>
+<ul><li>writes: 无</li><li>reads: 无</li><li>clears: 无</li><li>triggers downstream: <code>stage-3 Run Onset</code> — after the tmux session has been created and started successfully</li></ul>
+<h2 class="sec">Pipeline Hand-Off</h2>
+<p>Upstream gives this stage frozen configuration from <a href="stage-1.html">stage-1</a> plus the concrete trial environment selected by the Harbor orchestrator. This stage produces a live tmux-backed terminal session, which <a href="stage-3.html">stage-3</a> can immediately enter and use as the execution surface for the agent loop.</p><div class="files-bar"><h2 class="sec">Functions<span class="pill">3</span></h2><span class="spacer"></span><button class="tool" data-x="expand">Expand all</button><button class="tool" data-x="collapse">Collapse all</button></div><details class="file" id="fn-terminus2_setup"><summary><span class="chev"></span><code class="fpath">Terminus2.setup</code><a class="fn-range" href="../code/terminus_2.py.html#L354-L373" title="terminus_2.py:354-373">terminus_2.py:354–373 ↗</a></summary><div class="file-body"><p class="fn-sub">Initialize and start the trial tmux session</p>
+<blockquote><p><strong>Stage context</strong>: This stage creates the terminal session that the rest of the trial will use. <code>Terminus2.setup</code> runs once per trial after the Harbor orchestrator has provided a concrete <code>environment</code> and before <code>run()</code> begins. In this stage, it is the entry point that materializes constructor-time terminal settings into a live <code>TmuxSession</code> bound to the trial paths.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>Terminus2.setup</code> builds a <code>TmuxSession</code> for the supplied <code>environment</code>, optionally wiring in asciinema recording paths when <code>_record_terminal_session</code> is enabled. It reads terminal sizing and environment configuration from instance state, stores the created session in <code>self._session</code>, and then starts that session asynchronously. The method returns <code>None</code>; its real product is a running tmux-backed terminal bound to the trial environment.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, environment: BaseEnvironment) -&gt; None</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — The <code>Terminus2</code> instance that owns configuration and receives the created session.; <code>environment</code>: <code>BaseEnvironment</code> — The trial environment that provides <code>trial_paths</code> and <code>default_user</code> for the session.</li><li>reads: <code>self._record_terminal_session</code>, <code>self._tmux_pane_width</code>, <code>self._tmux_pane_height</code>, <code>self._extra_env</code></li><li>returns: Returns <code>None</code>; it writes <code>self._session</code> and starts the tmux session.</li><li>effects: Writes <code>self._session</code> with a new <code>TmuxSession</code> instance; Starts the session by awaiting <code>self._session.start()</code>; Uses <code>environment.trial_paths.agent_dir</code> to choose a local recording destination when recording is enabled</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Check <code>self._record_terminal_session</code> to decide whether to derive asciinema paths or leave both recording path arguments as <code>None</code>.</li><li>When recording is enabled, build <code>local_recording_path</code> from <code>environment.trial_paths.agent_dir / "recording.cast"</code> and <code>remote_recording_path</code> from <code>EnvironmentPaths.agent_dir / "recording.cast"</code>.</li><li>Create <code>TmuxSession(...)</code> with the session name from <code>self.name()</code>, the provided <code>environment</code>, a fixed pane log path at <code>EnvironmentPaths.agent_dir / "terminus_2.pane"</code>, the two recording-path arguments, pane dimensions from <code>self._tmux_pane_width</code> and <code>self._tmux_pane_height</code>, extra environment from <code>self._extra_env</code>, and the user from <code>environment.default_user</code>.</li><li>Store that <code>TmuxSession</code> in <code>self._session</code> and await <code>self._session.start()</code> so the terminal is live before later stages use it.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    async def setup(self, environment: BaseEnvironment) -&gt; None:
+        if self._record_terminal_session:
+            local_recording_path = environment.trial_paths.agent_dir / "recording.cast"
+            remote_recording_path = EnvironmentPaths.agent_dir / "recording.cast"
+        else:
+            local_recording_path = None
+            remote_recording_path = None
+
+        self._session = TmuxSession(
+            session_name=self.name(),
+            environment=environment,
+            logging_path=EnvironmentPaths.agent_dir / "terminus_2.pane",
+            local_asciinema_recording_path=local_recording_path,
+            remote_asciinema_recording_path=remote_recording_path,
+            pane_width=self._tmux_pane_width,
+            pane_height=self._tmux_pane_height,
+            extra_env=self._extra_env,
+            user=environment.default_user,
+        )
+        await self._session.start()</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It always constructs <code>TmuxSession</code> with <code>local_asciinema_recording_path</code> and <code>remote_asciinema_recording_path</code>, and disables recording by passing <code>None</code> for both. This keeps session construction on one path instead of splitting into separate constructor call shapes.</li><li>It derives two recording paths from different roots: <code>environment.trial_paths.agent_dir</code> for the local artifact location and <code>EnvironmentPaths.agent_dir</code> for the in-environment location. That separation lets the session know both where the cast should exist inside the environment and where the harness expects to collect it outside.</li><li>It takes the session user from <code>environment.default_user</code> instead of a cached self field. That choice binds the shell identity to the concrete trial environment, while pane size and <code>extra_env</code> stay fixed from constructor configuration.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Harbor-orchestrated trial setup flow that invokes <code>Terminus2.setup(environment)</code> before <code>run()</code></li><li><strong>Core callees</strong>: <code>TmuxSession</code>; <code>TmuxSession.start</code>; <code>self.name</code></li><li><strong>Config / state sources</strong>: <code>self._record_terminal_session</code>; <code>self._tmux_pane_width</code>; <code>self._tmux_pane_height</code>; <code>self._extra_env</code>; <code>environment.trial_paths.agent_dir</code>; <code>environment.default_user</code>; <code>EnvironmentPaths.agent_dir</code></li><li><strong>Results to</strong>: <code>self._session</code> for later trial interaction; the live tmux terminal used by later <code>run()</code> logic; optional asciinema output at <code>recording.cast</code>; pane log output at <code>EnvironmentPaths.agent_dir / "terminus_2.pane"</code></li></ul></div></details><details class="file" id="fn-tmuxsession_init"><summary><span class="chev"></span><code class="fpath">TmuxSession.__init__</code><a class="fn-range" href="../code/tmux_session.py.html#L28-L57" title="tmux_session.py:28-57">tmux_session.py:28–57 ↗</a></summary><div class="file-body"><p class="fn-sub">Initialize tmux session configuration and recording state</p>
+<blockquote><p><strong>Stage context</strong>: This constructor prepares the <code>TmuxSession</code> object that <a href="stage-2.html">stage-2</a> will later start for a trial environment. <code>Terminus2.setup</code> invokes it while assembling the session described in the sibling entry, then hands the initialized object off to <code>TmuxSession.start</code>. In this stage, its job is to freeze session configuration, validate pane sizing, and seed bookkeeping fields needed by later setup and teardown paths.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>TmuxSession.__init__</code> captures the session name, bound <code>environment</code>, logging and optional asciinema paths, pane size, extra environment variables, and optional <code>user</code> into instance state. It validates <code>pane_width</code> and <code>pane_height</code> by coercing them through <code>int(...)</code> and rejecting non-positive values with <code>ValueError</code>. It returns <code>None</code>; the real result is a fully initialized <code>TmuxSession</code> object with recording flags, marker storage, and buffer cache set to known defaults.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, session_name: str, environment: BaseEnvironment, logging_path: Path | PurePosixPath, local_asciinema_recording_path: Path | None, remote_asciinema_recording_path: Path | PurePosixPath | None, pane_width: int = 160, pane_height: int = 40, extra_env: dict[str, str] | None = None, user: str | int | None = None)</code></p>
+<ul><li>params: <code>session_name</code>: <code>str</code> — tmux session identifier stored in <code>_session_name</code>; <code>environment</code>: <code>BaseEnvironment</code> — trial environment bound to <code>self.environment</code>; <code>logging_path</code>: <code>Path | PurePosixPath</code> — path for terminal logging stored in <code>_logging_path</code>; <code>local_asciinema_recording_path</code>: <code>Path | None</code> — host-side recording destination stored in <code>_local_asciinema_recording_path</code>; <code>remote_asciinema_recording_path</code>: <code>Path | PurePosixPath | None</code> — environment-side recording destination stored in <code>_remote_asciinema_recording_path</code>; <code>pane_width</code>: <code>int</code> — requested tmux pane width, validated then stored in <code>_pane_width</code>; <code>pane_height</code>: <code>int</code> — requested tmux pane height, validated then stored in <code>_pane_height</code>; <code>extra_env</code>: <code>dict[str, str] | None</code> — extra environment variables, normalized into <code>_extra_env</code>; <code>user</code>: <code>str | int | None</code> — default execution user stored in <code>_user</code></li><li>returns: Returns <code>None</code>; its real product is initialized instance state for later <code>TmuxSession.start</code>/<code>stop</code> work.</li><li>effects: writes <code>self._pane_width</code>; writes <code>self._pane_height</code>; writes <code>self._logging_path</code>; writes <code>self._local_asciinema_recording_path</code>; writes <code>self._remote_asciinema_recording_path</code>; writes <code>self._session_name</code>; writes <code>self._logger</code>; writes <code>self._previous_buffer</code>; writes <code>self._disable_recording</code>; writes <code>self.environment</code>; writes <code>self._markers</code>; writes <code>self._extra_env</code>; writes <code>self._user</code>; raises <code>ValueError</code> for non-integer or non-positive pane dimensions</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>It coerces <code>pane_width</code> and <code>pane_height</code> through <code>int(...)</code> and raises <code>ValueError("pane_width and pane_height must be valid integers.")</code> if either conversion fails.</li><li>It rejects zero or negative dimensions by checking <code>_pane_width &lt;= 0 or _pane_height &lt;= 0</code> and raising <code>ValueError("pane_width and pane_height must be positive integers.")</code>.</li><li>It stores the session-level configuration from the arguments into <code>_logging_path</code>, <code>_local_asciinema_recording_path</code>, <code>_remote_asciinema_recording_path</code>, <code>_session_name</code>, <code>environment</code>, and <code>_user</code>.</li><li>It seeds runtime helpers and bookkeeping with <code>_logger = logger</code>, <code>_previous_buffer = None</code>, <code>_disable_recording = False</code>, <code>_markers = []</code>, and <code>_extra_env = extra_env or {}</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def __init__(
+        self,
+        session_name: str,
+        environment: BaseEnvironment,
+        logging_path: Path | PurePosixPath,
+        local_asciinema_recording_path: Path | None,
+        remote_asciinema_recording_path: Path | PurePosixPath | None,
+        pane_width: int = 160,
+        pane_height: int = 40,
+        extra_env: dict[str, str] | None = None,
+        user: str | int | None = None,
+    ):
+        try:
+            self._pane_width = int(pane_width)
+            self._pane_height = int(pane_height)
+        except (ValueError, TypeError):
+            raise ValueError("pane_width and pane_height must be valid integers.")
+        if self._pane_width &lt;= 0 or self._pane_height &lt;= 0:
+            raise ValueError("pane_width and pane_height must be positive integers.")
+        self._logging_path = logging_path
+        self._local_asciinema_recording_path = local_asciinema_recording_path
+        self._remote_asciinema_recording_path = remote_asciinema_recording_path
+        self._session_name = session_name
+        self._logger = logger
+        self._previous_buffer: str | None = None
+        self._disable_recording = False
+        self.environment = environment
+        self._markers: list[tuple[float, str]] = []
+        self._extra_env: dict[str, str] = extra_env or {}
+        self._user = user</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It validates pane size at construction time, not when tmux starts. That makes bad <code>pane_width</code> and <code>pane_height</code> fail immediately in <code>Terminus2.setup</code> instead of surfacing later during session startup.</li><li>It runs both size inputs through <code>int(...)</code> before storing them. This accepts integer-like inputs while still rejecting unusable values through the <code>except (ValueError, TypeError)</code> path.</li><li>It normalizes <code>extra_env</code> with <code>extra_env or {}</code> so later code can treat <code>_extra_env</code> as a dictionary without repeated <code>None</code> checks. The trade-off is that an explicitly empty dict and <code>None</code> become equivalent.</li><li>It initializes recording-related state even when the recording paths may be <code>None</code>. Keeping <code>_disable_recording</code>, <code>_markers</code>, and <code>_previous_buffer</code> present from the start gives later methods one consistent object shape.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>Terminus2.setup</code>; <a href="stage-2.html">stage-2</a> environment setup flow that constructs the per-trial terminal session</li><li><strong>Core callees</strong>: <code>int</code>; <code>ValueError</code></li><li><strong>Config / state sources</strong>: <code>Terminus2.setup</code> passes <code>session_name</code>, <code>environment</code>, and recording paths; <a href="stage-1.html">stage-1</a>-crystallized pane sizing feeds <code>pane_width</code> and <code>pane_height</code>; <a href="stage-1.html">stage-1</a>-crystallized environment overrides feed <code>extra_env</code>; <a href="stage-1.html">stage-1</a>-crystallized default user feeds <code>user</code></li><li><strong>Results to</strong>: <code>TmuxSession.start</code> consumes <code>_session_name</code>, pane sizing, paths, and environment binding; <code>TmuxSession.stop</code> can consume <code>_markers</code> and recording flags later in the trial lifecycle; later buffer-handling code can read and update <code>_previous_buffer</code>; <code>Terminus2.setup</code> stores the constructed object in <code>self._session</code> and starts it</li><li><strong>Related siblings</strong>: <code>Terminus2.setup</code> builds this object and then starts it</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-asciinema-markers"><code>reg-asciinema-markers</code></a> — initialize empty marker list for later recording</li></ul></div>
+</div></details><details class="file" id="fn-tmuxsession_start"><summary><span class="chev"></span><code class="fpath">TmuxSession.start</code><a class="fn-range" href="../code/tmux_session.py.html#L429-L470" title="tmux_session.py:429-470">tmux_session.py:429–470 ↗</a></summary><div class="file-body"><p class="fn-sub">boot tmux session and optional terminal recording</p>
+<blockquote><p><strong>Stage context</strong>: This method performs the concrete startup work for the <code>TmuxSession</code> that <code>Terminus2.setup</code> created earlier in <a href="stage-2.html">stage-2</a>. <code>Terminus2.setup</code> calls it once per trial, after <code>TmuxSession.__init__</code> has frozen session configuration such as <code>_user</code>, pane sizing, and recording paths. Within this stage, it is the step that turns stored configuration into a live remote tmux shell, with optional asciinema capture enabled inside that shell.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>TmuxSession.start</code> starts the remote tmux session represented by this object, using <code>self.environment</code> to run commands as <code>self._user</code>. It first ensures tmux is available, then launches the session, tries to raise tmux scrollback history, and, when <code>_remote_asciinema_recording_path</code> is set, starts an <code>asciinema rec --stdin</code> process in the pane and uploads a timestamp helper script. It returns <code>None</code>; its real result is a prepared remote terminal session, or a <code>RuntimeError</code> if session startup itself fails.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self) -&gt; None</code></p>
+<ul><li>params: <code>self</code>: <code>TmuxSession</code> — session object holding the bound <code>environment</code>, startup command, logging, user, and optional recording paths</li><li>reads: <code>self.environment</code>, <code>self._tmux_start_session</code>, <code>self._user</code>, <code>self._logger</code>, <code>self._remote_asciinema_recording_path</code>, <code>self._GET_ASCIINEMA_TIMESTAMP_SCRIPT_HOST_PATH</code>, <code>self.GET_ASCIINEMA_TIMESTAMP_SCRIPT_CONTAINER_PATH</code></li><li>returns: <code>None</code>; the real product is a running remote tmux session with enlarged history when possible and optional asciinema recording setup.</li><li>effects: calls <code>self._attempt_tmux_installation()</code> before startup; executes the tmux start command in the remote <code>environment</code>; raises <code>RuntimeError</code> if the tmux start command returns a non-zero <code>return_code</code>; executes <code>tmux set-option -g history-limit 10000000</code> in the remote <code>environment</code>; logs a warning through <code>_logger</code> if the history-limit command fails; when <code>_remote_asciinema_recording_path</code> is set, sends keys to the tmux pane to start <code>asciinema rec --stdin ...</code>; when <code>_remote_asciinema_recording_path</code> is set, sends <code>clear</code> to the tmux pane; when <code>_remote_asciinema_recording_path</code> is set, uploads the asciinema timestamp helper script into the remote environment</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>It calls <code>_attempt_tmux_installation()</code> to make sure tmux is present before trying to open the session.</li><li>It runs <code>self._tmux_start_session</code> through <code>self.environment.exec(..., user=self._user)</code> and treats any non-zero <code>return_code</code> as fatal by raising <code>RuntimeError</code> with <code>start_session_result.stderr</code>.</li><li>It then asks tmux to use a large scrollback buffer by executing <code>tmux set-option -g history-limit 10000000</code> as <code>self._user</code>.</li><li>If that history-limit command fails, it logs a warning with <code>_logger.warning(...)</code> and continues instead of aborting startup.</li><li>If <code>_remote_asciinema_recording_path</code> is set, it starts asciinema inside the tmux pane by calling <code>send_keys(...)</code> with <code>asciinema rec --stdin ...</code> followed by <code>Enter</code>, using <code>min_timeout_sec=1.0</code> to give recording startup time.</li><li>Still under the recording branch, it clears the pane with another <code>send_keys(...)</code> call so the captured shell starts from a clean screen.</li><li>Finally, under the same recording condition, it uploads the helper script from <code>_GET_ASCIINEMA_TIMESTAMP_SCRIPT_HOST_PATH</code> to <code>GET_ASCIINEMA_TIMESTAMP_SCRIPT_CONTAINER_PATH</code> in the remote environment.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    async def start(self) -&gt; None:
+        await self._attempt_tmux_installation()
+        start_session_result = await self.environment.exec(
+            command=self._tmux_start_session, user=self._user
+        )
+        if start_session_result.return_code != 0:
+            raise RuntimeError(
+                f"Failed to start tmux session. Error: {start_session_result.stderr}"
+            )
+
+        history_limit = 10_000_000
+        command = f"tmux set-option -g history-limit {history_limit}"
+        set_history_result = await self.environment.exec(
+            command=command, user=self._user
+        )
+        if set_history_result.return_code != 0:
+            self._logger.warning(
+                "Failed to increase tmux history-limit: %s",
+                (set_history_result.stderr or "").strip(),
+            )
+
+        if self._remote_asciinema_recording_path:
+            self._logger.debug("Starting recording.")
+            await self.send_keys(
+                keys=[
+                    f"asciinema rec --stdin {self._remote_asciinema_recording_path}",
+                    "Enter",
+                ],
+                min_timeout_sec=1.0,
+            )
+            await self.send_keys(
+                keys=[
+                    "clear",
+                    "Enter",
+                ],
+            )
+
+        if self._remote_asciinema_recording_path:
+            await self.environment.upload_file(
+                source_path=self._GET_ASCIINEMA_TIMESTAMP_SCRIPT_HOST_PATH,
+                target_path=str(self.GET_ASCIINEMA_TIMESTAMP_SCRIPT_CONTAINER_PATH),
+            )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It makes tmux session creation a hard requirement but treats scrollback tuning as optional. The branch on <code>start_session_result.return_code</code> raises immediately, while the branch on <code>set_history_result.return_code</code> only logs, so the code preserves a usable shell even when tmux refuses the larger history setting.</li><li>It gates all recording work on <code>_remote_asciinema_recording_path</code> instead of a separate flag. That keeps recording setup tied to the presence of a concrete destination path; without that path, starting <code>asciinema rec</code> would not have enough information to produce a file.</li><li>It starts recording from inside the tmux pane with <code>send_keys(...)</code> rather than as an out-of-band process through <code>environment.exec(...)</code>. That choice keeps the recorder attached to the same interactive shell stream that the agent will use, which is necessary for <code>--stdin</code> capture.</li><li>It sends <code>clear</code> right after launching asciinema so the recording begins from a clean terminal view instead of including startup noise. The alternative would preserve whatever shell text preceded recording, which would make the capture harder to read.</li><li>It uploads the timestamp helper script only when recording is enabled. That avoids modifying the remote environment with recording-specific files during non-recorded trials.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>Terminus2.setup</code>; <a href="stage-2.html">stage-2</a> environment setup flow that starts the per-trial <code>TmuxSession</code></li><li><strong>Core callees</strong>: <code>TmuxSession._attempt_tmux_installation</code>; <code>environment.exec</code>; <code>TmuxSession.send_keys</code>; <code>environment.upload_file</code>; <code>_logger.warning</code>; <code>_logger.debug</code></li><li><strong>Config / state sources</strong>: <code>TmuxSession.__init__</code> populates <code>_tmux_start_session</code>; <code>TmuxSession.__init__</code> stores the bound <code>environment</code>; <code>TmuxSession.__init__</code> stores <code>_user</code>; <code>TmuxSession.__init__</code> stores <code>_remote_asciinema_recording_path</code>; <code>Terminus2.setup</code> decides whether recording paths are passed into <code>TmuxSession</code></li><li><strong>Results to</strong>: the remote trial environment now has a live tmux session; later terminal I/O methods operate against the started pane; optional asciinema output is written to <code>_remote_asciinema_recording_path</code>; the uploaded timestamp helper script is available for later recording-related use; <code>TmuxSession.stop</code> in <a href="stage-6.html">stage-6</a> can later shut down the session and finalize recording artifacts</li><li><strong>Related siblings</strong>: <code>Terminus2.setup</code> creates the <code>TmuxSession</code> and awaits this method; <code>TmuxSession.__init__</code> validates and stores the startup configuration that this method consumes</li></ul></div></details><nav class="pn"><a class="pn-prev" href="stage-1.html"><span>← Previous</span><strong>Configuration Crystallization</strong></a><a class="pn-next" href="stage-3.html"><span>Next →</span><strong>Run Onset</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

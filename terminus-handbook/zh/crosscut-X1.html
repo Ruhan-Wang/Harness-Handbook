@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>crosscut-X1 · Token 与成本核算</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=zh"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 手册</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=zh" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>返回主页</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>状态流寄存器</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>配置固化</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>环境搭建</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>运行起点</a></div><details class="s-node"><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>迭代主循环</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>循环入口门控</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>主动摘要探测</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM 调用</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>响应解析</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>待交接提示 → 用户步骤(或切分)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>错误分支</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>命令执行 → 观察 → 轨迹步骤</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>完成门控与循环控制</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>解析器内部辅助</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>运行收尾</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>录制后处理(外部)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>上下文摘要</a></div><div class="s-leaf"><a class="s-link cur" href="crosscut-X1.html"><span class="s-num">X1</span>Token 与成本核算</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>输出长度限制</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>日志</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux 内部辅助</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">索引</a></nav><div class="stage-head"><h1>Token 与成本核算</h1><div class="meta"><span class="chip mono">crosscut-X1</span><span class="chip">Token &amp; Cost Accounting</span><span class="chip">5 个函数</span></div></div>
+<h2 class="sec">开场解释</h2>
+<p>这个 Stage 在解决什么问题？它负责把每次 LLM（大语言模型）调用到底花了多少 token、多少时间、子 Agent（被主 Agent 调用的小 Agent）又额外花了多少，持续记清楚。它之所以存在，是因为 Agent 不只是要“跑完”，还要知道这次试验贵不贵、慢不慢、问题出在哪。它不单独决定流程，但会贴着各个调用点一路记账，最后把这些零散数据汇总成整次运行的成本视图。</p>
+<h2 class="sec">主流程</h2>
+
+<ol><li>先在每次 LLM 调用前后做“差分记账” <p>这里的核心不是再算一遍总量，而是先记住调用前的累计值，再看调用后多了多少。 <code>_count_total_tokens()</code>（把一段 chat 里的消息 token 加总）和各类 <code>total_*_tokens</code> 快照一起用，目的都是回答一句话：<strong>这一步到底新花了多少，而不是系统到现在总共花了多少。</strong> 这样做很重要，因为同一个 <code>Chat</code>（LLM 调用包装器）对象会连续用很多次；如果不做前后差分，单步成本会被累计值污染。</p></li><li>把“主 Agent”的一次调用成本写进当前 Step <p>无论这一步最后是正常完成，还是走到报错分支，都会重复做同一类事：</p>
+<ul><li>记输入/输出 token </li><li>记 cache token（模型缓存命中带来的 token 变化） </li><li>记请求耗时 这类数据最终落到 <code>Step.metrics</code>。 这么设计的意义是：<strong>不能只有成功步骤才有账单。</strong> 否则一到失败现场，你只知道“失败了”，却不知道失败前已经烧掉了多少资源。</li></ul></li><li>单独记子 Agent 的账，而不是混在主对话里 <p>子 Agent 是被主 Agent 拉起来干局部任务的小 Agent。它也会自己发起 LLM 调用，所以也会花 token、花时间。 <code>_extract_usage_metrics()</code>（从一次返回里抓出 usage 数据）负责把可用的 token/请求统计抽出来。 <code>_update_subagent_metrics()</code>（把某个子 Agent 的 usage 折到累计表里）负责持续累加。 这样做的原因是：<strong>主 Agent 的 chat 账单和子 Agent 的账单来源不同，直接混起来会看不清是谁花的。</strong> 先分开记，最后再汇总，既能看总成本，也能看成本结构。</p></li><li>需要时保留子 Agent 的完整 rollout 明细 <p><code>_append_subagent_response_step()</code>（把子 Agent 返回整理成一步，并在需要时附带更细的 rollout 记录）除了写结果，也会在打开 <code>_collect_rollout_details</code> 时，把完整子流程细节塞进 <code>_subagent_rollout_details</code>。 这不是每次都必需，但在做分析、复盘、性能排查时很有用。 可以把它理解成两层账本：</p>
+<ul><li>平时看总账 </li><li>调试时再翻流水明细</li></ul></li><li>顺手记每次 API 请求花了多久 <p><code>_track_api_request_time()</code>（把单次请求耗时追加到耗时列表）做的事很简单：每次调模型，就把 elapsed ms 记下来。 这看似是小事，但很关键。因为 token 只能告诉你“贵不贵”，时间才能告诉你“慢在哪”。 很多性能问题不是 token 爆了，而是请求抖动、单次延迟异常、某类子 Agent 特别慢。没有这条线，系统优化会很盲。</p></li><li>在试验结束时做总汇 <p>前面这些数字大多是“边跑边记”的局部账。到了 <a href="stage-5.html">stage-5</a>，系统会把主 chat 的累计值，再加上单独维护的子 Agent 累计值，一起刷进最终的 trial 级上下文统计。 这一步的意义是把“每一步花了什么”变成“这一整次运行总共花了什么”。 如果没有最后这次 flush，你只能看局部 Step，难以做整轮成本比较、预算控制和实验评估。</p></li></ol>
+<h2 class="sec"> 状态流动</h2>
+<ul><li>写: <a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — 每次 LLM/API 调用结束后追加一次耗时，目的是累计延迟分布，便于看慢点在哪里</li><li>写: <a class="reg" href="registers.html#reg-subagent-metrics"><code>reg-subagent-metrics</code></a> — 子 Agent 完成一次调用或返回时更新，把它自己的 token/usage 单独累计，避免和主 Agent 混账</li><li>写: <code>_subagent_rollout_details</code> — 当 <code>_collect_rollout_details</code> 打开时写入完整子 Agent rollout 明细，用于调试和复盘</li><li>读: <a class="reg" href="registers.html#reg-subagent-metrics"><code>reg-subagent-metrics</code></a> — 在 <a href="stage-5.html">stage-5</a> 做试验级汇总时读取，把子 Agent 总量加回最终 totals，形成完整成本视图</li><li>读: <a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — 在最终统计或分析延迟时读取，用来得到整轮请求时间信息</li><li>触发下游: <code>crosscut-X2 Output Length Limiting</code> — 记账完成后继续正常流水线；这些指标本身不改生成逻辑，但会伴随之后各步直到最终汇总</li></ul>
+<h2 class="sec">与前后 Stage 的衔接</h2>
+<p>上游的 Context Summarization 会把上下文压缩好，让后续 LLM 调用更可控；本 Stage 不改内容本身，而是把这些调用产生的 token、耗时、子 Agent 成本持续记下来。下游的 Output Length Limiting 继续限制输出规模，而这里提供的账单视角，正好能帮助系统判断长度控制是否真的省了 token、缩了时延。</p><div class="files-bar"><h2 class="sec">函数细节<span class="pill">5</span></h2><span class="spacer"></span><button class="tool" data-x="expand">全部展开</button><button class="tool" data-x="collapse">全部折叠</button></div><details class="file" id="fn-terminus2_count_total_tokens"><summary><span class="chev"></span><code class="fpath">Terminus2._count_total_tokens</code><a class="fn-range" href="../code/terminus_2.py.html#L524-L528" title="terminus_2.py:524-528">terminus_2.py:524–528 ↗</a></summary><div class="file-body"><p class="fn-sub">聊天消息总 token 计数封装</p>
+<blockquote><p><strong>stage 上下文</strong>: 该单元位于 Token &amp; Cost Accounting 主题下，承担对单个 <code>Chat</code> 当前消息列表做总 token 计数的最小封装。源码仅体现一次库函数调用：读取 <code>self._model_name</code> 与 <code>chat.messages</code>，将计数工作委托给 LiteLLM；本函数本身不维护累计寄存器，也不落盘或写回统计状态。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数 <code>_count_total_tokens(self, chat: Chat) -&gt; int</code> 接收一个 <code>Chat</code> 对象，读取其中的 <code>chat.messages</code>，并结合实例上的 <code>self._model_name</code> 计算整段聊天消息的总 token 数。它直接返回一个整数结果，不修改 <code>self</code>、<code>chat</code> 或任何 register。函数体内也没有本地异常处理；底层导入或计数调用若失败，将直接向外传播。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, chat: Chat) -&gt; int</code></p>
+<ul><li>参数: <code>chat</code>: <code>Chat</code> — 提供待统计消息列表；实际读取的是 <code>chat.messages</code></li><li>读状态: <code>self._model_name</code>, <code>chat.messages</code></li><li>返回: 返回 <code>token_counter(model=self._model_name, messages=chat.messages)</code> 的整数结果，即该聊天全部消息的总 token 数。</li><li>副作用: 函数体内执行 <code>from litellm.utils import token_counter</code>，依赖外部库导入与调用; 无对象状态写入；不修改 <code>self</code>、<code>chat</code> 或任何 register</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>在函数体内执行 <code>from litellm.utils import token_counter</code>，取得外部库的 token 计数函数。</li><li>读取 <code>self._model_name</code> 作为 <code>model</code> 参数，读取 <code>chat.messages</code> 作为 <code>messages</code> 参数。</li><li>调用 <code>token_counter(model=self._model_name, messages=chat.messages)</code>。</li><li>直接返回该调用结果；函数内无额外加工、缓存或状态更新。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _count_total_tokens(self, chat: Chat) -&gt; int:
+        """Count total tokens across all messages in the chat."""
+        from litellm.utils import token_counter
+
+        return token_counter(model=self._model_name, messages=chat.messages)</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>计数逻辑没有在本地展开，而是完整委托给 <code>litellm.utils.token_counter</code>；源码可见本函数只负责参数转交与返回结果。</li><li>模型选择不是从 <code>chat</code> 推导，而是显式读取实例状态 <code>self._model_name</code> 传给库函数；因此计数规则由该字段与外部库共同决定。</li><li>导入语句写在函数体内部而非模块顶层，这是源码可见的组织方式；本函数每次调用都会先执行该局部导入语句。</li><li>函数没有 <code>try/except</code>、没有默认值分支、也没有 <code>None</code> 检查；导入失败、<code>chat.messages</code> 不可用或 <code>token_counter</code> 抛错时，异常都会原样向外传播。</li><li>函数不接触任何 <code>self._...</code> 累计寄存器，也不写回 <code>chat</code>；其产出仅为返回值。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: unknown</li><li><strong>核心被调用</strong>: litellm.utils.token_counter</li><li><strong>配置/状态来源</strong>: self._model_name; chat.messages</li><li><strong>结果去向</strong>: 直接作为函数返回值交还调用方（具体去向在本源码片段中不可见）</li></ul></div></details><details class="file" id="fn-terminus2_extract_usage_metrics"><summary><span class="chev"></span><code class="fpath">Terminus2._extract_usage_metrics</code><a class="fn-range" href="../code/terminus_2.py.html#L632-L649" title="terminus_2.py:632-649">terminus_2.py:632–649 ↗</a></summary><div class="file-body"><p class="fn-sub">使用量对象归一化提取器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数是一个局部的数据整形单元：把 <code>usage_info</code> 转成固定四元组 <code>(prompt_tokens, completion_tokens, cached_tokens, cost_usd)</code>。从函数体可证的信息仅包括一次 falsy 判定和一次直接元组返回；其外部触发时机与 stage 内位置无法由此片段单独证明。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数 <code>_extract_usage_metrics(self, usage_info) -&gt; tuple[int, int, int, float]</code> 接收一个 <code>usage_info</code> 对象或其他可参与真值判断的值。若 <code>usage_info</code> 为 falsy，则直接返回 <code>0, 0, 0, 0</code>；否则读取其 <code>prompt_tokens</code>、<code>completion_tokens</code>、<code>cache_tokens</code> 与 <code>cost_usd</code> 属性，返回一个四元组，其中 <code>cost_usd</code> 会在不大于 0 时被归零。函数不读取任何 <code>self</code> 上的状态，也不产生副作用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, usage_info) -&gt; tuple[int, int, int, float]</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 实例方法接收者；本函数体内未使用其实例状态; <code>usage_info</code>: <code>?</code> — 待提取的使用量对象；先参与 <code>if not usage_info</code> 真值判断，truthy 路径上必须提供 <code>prompt_tokens</code>、<code>completion_tokens</code>、<code>cache_tokens</code>、<code>cost_usd</code> 属性</li><li>返回: 返回四元组 <code>(prompt_tokens, completion_tokens, cached_tokens, cost_usd)</code>；若 <code>usage_info</code> 为 falsy，则返回 <code>(0, 0, 0, 0)</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先对参数 <code>usage_info</code> 执行 falsy 检查：命中 <code>if not usage_info</code> 时，直接返回四个 0 组成的结果，不再读取任何属性。</li><li>若 <code>usage_info</code> 为 truthy，则直接构造并返回一个元组字面量：前三项分别取自 <code>usage_info.prompt_tokens</code>、<code>usage_info.completion_tokens</code>、<code>usage_info.cache_tokens</code>。</li><li>同一 truthy 路径中，第四项读取 <code>usage_info.cost_usd</code>，仅当其大于 0 时原样返回；否则返回 0。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _extract_usage_metrics(self, usage_info) -&gt; tuple[int, int, int, float]:
+        """Extract and normalize metrics from usage info.
+
+        Args:
+            usage_info: Usage information from LLM response
+
+        Returns:
+            Tuple of (prompt_tokens, completion_tokens, cached_tokens, cost_usd)
+        """
+        if not usage_info:
+            return 0, 0, 0, 0
+
+        return (
+            usage_info.prompt_tokens,
+            usage_info.completion_tokens,
+            usage_info.cache_tokens,
+            usage_info.cost_usd if usage_info.cost_usd &gt; 0 else 0,
+        )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数把“无可用 usage 信息”的判定实现为宽松的 falsy 检查（<code>if not usage_info</code>），而不是仅检查 <code>None</code>。这样任何假值输入都会被统一折叠为全 0 结果。</li><li>token 相关三个字段在 truthy 路径上不做额外归一化、类型转换或下界裁剪，而是直接透传对象属性值；因此该函数的归一化策略只覆盖 <code>cost_usd</code>。</li><li>对 <code>cost_usd</code> 采用 <code>&gt; 0</code> 的门槛，意味着非正值都会被压成 0，避免把负值或 0 以原样形式传播到返回结果中。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 外部调用方未由此代码片段直接给出；只能确定任何需要把 <code>usage_info</code> 变为四元组的代码都可调用它</li><li><strong>核心被调用</strong>: 无显式函数调用; 依赖 <code>usage_info</code> 的真值判定协议; 依赖 <code>usage_info.prompt_tokens</code> 属性访问; 依赖 <code>usage_info.completion_tokens</code> / <code>cache_tokens</code> / <code>cost_usd</code> 属性访问</li><li><strong>配置/状态来源</strong>: 无；函数体不读取任何 <code>self._*</code> 配置或 register</li><li><strong>结果去向</strong>: 返回给直接调用者的四元组结果; 其中第一项对应 <code>prompt_tokens</code>; 第二项对应 <code>completion_tokens</code>; 第三项对应 <code>cached_tokens</code>; 第四项对应已归一化的 <code>cost_usd</code></li></ul></div></details><details class="file" id="fn-terminus2_update_subagent_metrics"><summary><span class="chev"></span><code class="fpath">Terminus2._update_subagent_metrics</code><a class="fn-range" href="../code/terminus_2.py.html#L618-L630" title="terminus_2.py:618-630">terminus_2.py:618–630 ↗</a></summary><div class="file-body"><p class="fn-sub">子代理用量累计更新器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 Token &amp; Cost Accounting 这一横切 stage 中，职责是把一次子代理 LLM 调用返回的 usage 信息并入独立的子代理累计器。它通常在 <code>_run_subagent</code> 获得响应 usage 元数据后立即触发。与兄弟函数相比，<code>_extract_usage_metrics</code> 负责把 usage 对象拆成数值元组，而本函数直接把 usage_info 累加到 <code>self._subagent_metrics</code>；二者共同服务于主对话指标与子代理指标分账的设计。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数 <code>_update_subagent_metrics(self, usage_info) -&gt; None</code> 接收一次子代理 LLM 响应的 <code>usage_info</code>。当该参数为 falsy 时，函数直接返回，不产生任何副作用；否则把其中的 <code>prompt_tokens</code>、<code>completion_tokens</code>、<code>cache_tokens</code> 和 <code>cost_usd</code> 累加到 <code>self._subagent_metrics</code> 的对应总量字段。函数本身不返回业务结果，真正产出是对实例内子代理指标累计器的原地更新。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, usage_info) -&gt; None</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — Terminus2 实例，提供子代理指标累计状态 <code>self._subagent_metrics</code>; <code>usage_info</code>: <code>?</code> — 一次子代理 LLM 响应附带的用量信息，包含 token 数与成本字段</li><li>读状态: <code>self._subagent_metrics</code></li><li>返回: 返回 None；实际结果是把本次子代理调用的 token 与成本增量写入累计状态。</li><li>副作用: 修改 <code>self._subagent_metrics.total_prompt_tokens</code>; 修改 <code>self._subagent_metrics.total_completion_tokens</code>; 修改 <code>self._subagent_metrics.total_cached_tokens</code>; 修改 <code>self._subagent_metrics.total_cost_usd</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先检查 <code>usage_info</code> 的真值；若其为 falsy，则立即返回 <code>None</code>，本次不做任何累计。</li><li>若存在 usage 数据，则读取 <code>usage_info.prompt_tokens</code>，并把该值加到 <code>self._subagent_metrics.total_prompt_tokens</code>。</li><li>继续读取 <code>usage_info.completion_tokens</code> 与 <code>usage_info.cache_tokens</code>，分别累计到 <code>total_completion_tokens</code> 和 <code>total_cached_tokens</code>。</li><li>最后读取 <code>usage_info.cost_usd</code>，并把金额增量加到 <code>self._subagent_metrics.total_cost_usd</code>，完成一次子代理用量折叠。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _update_subagent_metrics(self, usage_info) -&gt; None:
+        """Update subagent metrics with usage information from an LLM response.
+
+        Args:
+            usage_info: Usage information from LLM response containing token counts and cost
+        """
+        if not usage_info:
+            return
+
+        self._subagent_metrics.total_prompt_tokens += usage_info.prompt_tokens
+        self._subagent_metrics.total_completion_tokens += usage_info.completion_tokens
+        self._subagent_metrics.total_cached_tokens += usage_info.cache_tokens
+        self._subagent_metrics.total_cost_usd += usage_info.cost_usd</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数对 <code>usage_info</code> 采用显式 falsy 短路返回，而不是在字段访问时依赖异常暴露问题；这表明“无 usage 元数据”被当作可接受情况处理，目标是让缺失统计时退化为 no-op，而不打断子代理执行路径。</li><li>子代理指标被写入 <code>self._subagent_metrics</code> 这一独立累计器，而不是混入主 chat 的计数状态；这与本 stage 对主对话指标和子代理指标分开记账、在 <a href="stage-5.html">stage-5</a> 再统一汇总的设计一致。</li><li>这里直接累加 <code>usage_info</code> 的属性值，没有像兄弟函数 <code>_extract_usage_metrics</code> 那样对 <code>cost_usd</code> 做非正值归零处理；这说明该辅助函数的职责被刻意收窄为“原样并入子代理 usage 记录”，避免在多个入口重复定义清洗规则。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2._run_subagent（在子代理 LLM 响应带回 usage 元数据后调用）</li><li><strong>核心被调用</strong>: 无显式函数调用; 读取 <code>usage_info.prompt_tokens</code>; 读取 <code>usage_info.completion_tokens</code>; 读取 <code>usage_info.cache_tokens</code>; 读取 <code>usage_info.cost_usd</code></li><li><strong>配置/状态来源</strong>: <code>usage_info</code> 参数提供本次增量数据; <code>self._subagent_metrics</code> 提供当前累计基线</li><li><strong>结果去向</strong>: <code>self._subagent_metrics.total_prompt_tokens</code>; <code>self._subagent_metrics.total_completion_tokens</code>; <code>self._subagent_metrics.total_cached_tokens</code>; <code>self._subagent_metrics.total_cost_usd</code>; <a href="stage-5.html">stage-5</a> 的总量汇总逻辑（主对话指标与子代理指标合并）</li><li><strong>同类 sibling</strong>: Terminus2._extract_usage_metrics：也是 usage 读取辅助函数，但返回数值元组且对 falsy 输入给出全零结果；本函数则直接更新子代理累计器。; Terminus2._count_total_tokens：计算 chat 消息 token 总数且无副作用；本函数不计算消息 token，而是累加响应提供的 usage 指标。</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-subagent-metrics"><code>reg-subagent-metrics</code></a> — 把本次子代理 usage 累加进独立指标</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_append_subagent_response_step"><summary><span class="chev"></span><code class="fpath">Terminus2._append_subagent_response_step</code><a class="fn-range" href="../code/terminus_2.py.html#L1705-L1755" title="terminus_2.py:1705-1755">terminus_2.py:1705–1755 ↗</a></summary><div class="file-body"><p class="fn-sub">把子代理响应写入轨迹步骤的封装点</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 Token &amp; Cost Accounting 相关阶段中的一个落点：它在记录子代理响应时，按是否拿到 <code>usage_info</code> 决定是否把 token 与 cost 指标一并挂到 <code>Step.metrics</code>。触发前提是调用方已经拿到一个 <code>LLMResponse</code>，并准备把这次子代理输出追加到某个 <code>steps</code> 列表。它本身不维护累计寄存器，只负责构造并追加单条轨迹记录。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数 <code>_append_subagent_response_step</code> 接收目标步骤列表 <code>steps</code>、新步骤编号 <code>step_id</code>、模型响应 <code>response</code>、可选的 <code>usage_info</code> 与子代理名 <code>subagent_name</code>，向 <code>steps</code> 追加一条 <code>source="agent"</code> 的 <code>Step</code>。当 <code>usage_info</code> 为 truthy 时，追加的步骤会带有 <code>Metrics</code>，其中写入 <code>prompt_tokens</code>、<code>completion_tokens</code>、<code>cached_tokens</code>、<code>cost_usd</code> 以及来自 <code>response</code> 的 token-id / logprobs 字段；当其缺失时，只记录基础响应内容并发出一条 warning 日志。函数返回 <code>None</code>，真正产出是对传入列表的原地追加，以及在缺失用量信息时的日志副作用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, steps: list[Step], step_id: int, response: LLMResponse, usage_info, subagent_name: str) -&gt; None</code></p>
+<ul><li>参数: <code>steps</code>: <code>list[Step]</code> — 被原地追加的目标轨迹步骤列表; <code>step_id</code>: <code>int</code> — 新建 <code>Step</code> 的编号; <code>response</code>: <code>LLMResponse</code> — 响应内容来源；函数读取其 <code>model_name</code>、<code>content</code>、<code>reasoning_content</code>、<code>prompt_token_ids</code>、<code>completion_token_ids</code>、<code>logprobs</code>; <code>usage_info</code>: <code>?</code> — 可选用量对象；若为 truthy，代码要求其暴露 <code>prompt_tokens</code>、<code>completion_tokens</code>、<code>cache_tokens</code>、<code>cost_usd</code> 属性; <code>subagent_name</code>: <code>str</code> — 当 <code>usage_info</code> 缺失时，用于 warning 文案中的子代理名称</li><li>读状态: <code>self._model_name</code>, <code>self.logger</code></li><li>返回: 返回 <code>None</code>；真实产出是向 <code>steps</code> 追加一条带有新鲜 UTC ISO 时间戳的 <code>Step</code>，并在缺失 <code>usage_info</code> 时写出 warning 日志。</li><li>副作用: 原地修改传入的 <code>steps</code> 列表; 调用 <code>self.logger.warning(...)</code> 记录缺失用量信息; 为每条追加的 <code>Step</code> 生成 <code>datetime.now(timezone.utc).isoformat()</code> 时间戳</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先对 <code>usage_info</code> 做真值分支：若其为 truthy，进入“带指标”追加路径；否则进入“仅响应内容”追加路径。</li><li>在带指标路径中，函数构造一个 <code>Step</code> 并追加到 <code>steps</code>：固定写入 <code>step_id</code>、当前 UTC 时间的 ISO 字符串、<code>source="agent"</code>、<code>response.model_name or self._model_name</code>、<code>response.content</code> 与 <code>response.reasoning_content</code>。</li><li>同一带指标路径还会构造 <code>Metrics</code>：把 <code>usage_info.prompt_tokens</code>、<code>usage_info.completion_tokens</code>、<code>usage_info.cache_tokens</code> 写入对应字段；<code>cost_usd</code> 仅在 <code>usage_info.cost_usd &gt; 0</code> 时保留原值，否则写成 <code>None</code>。</li><li>带指标路径中，<code>response.prompt_token_ids</code>、<code>response.completion_token_ids</code> 与 <code>response.logprobs</code> 也被写进 <code>Metrics</code>；因此这些字段只会在 <code>usage_info</code> 为 truthy、且 <code>Step</code> 含有 <code>metrics</code> 时出现。</li><li>若 <code>usage_info</code> 为 falsy，函数先调用 <code>self.logger.warning(f"Failed to get token usage for {subagent_name}")</code> 发出告警，再追加一个不含 <code>metrics</code> 的基础 <code>Step</code>。</li><li>在无指标路径中，追加的 <code>Step</code> 仍包含新鲜 UTC ISO 时间戳、<code>source="agent"</code>、模型名回退逻辑、<code>response.content</code> 与 <code>response.reasoning_content</code>，但不会写入 token 数、cost、token ids 或 logprobs。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _append_subagent_response_step(
+        self,
+        steps: list[Step],
+        step_id: int,
+        response: LLMResponse,
+        usage_info,
+        subagent_name: str,
+    ) -&gt; None:
+        """Append a response step with conditional metrics to trajectory steps.
+
+        Args:
+            steps: List of steps to append to
+            step_id: ID for the new step
+            response: LLM response
+            usage_info: Usage info (may be None)
+            subagent_name: Name of subagent for warning message
+        """
+        if usage_info:
+            steps.append(
+                Step(
+                    step_id=step_id,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    source="agent",
+                    model_name=response.model_name or self._model_name,
+                    message=response.content,
+                    reasoning_content=response.reasoning_content,
+                    metrics=Metrics(
+                        prompt_tokens=usage_info.prompt_tokens,
+                        completion_tokens=usage_info.completion_tokens,
+                        cached_tokens=usage_info.cache_tokens,
+                        cost_usd=usage_info.cost_usd
+                        if usage_info.cost_usd &gt; 0
+                        else None,
+                        prompt_token_ids=response.prompt_token_ids,
+                        completion_token_ids=response.completion_token_ids,
+                        logprobs=response.logprobs,
+                    ),
+                )
+            )
+        else:
+            self.logger.warning(f"Failed to get token usage for {subagent_name}")
+            steps.append(
+                Step(
+                    step_id=step_id,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    source="agent",
+                    model_name=response.model_name or self._model_name,
+                    message=response.content,
+                    reasoning_content=response.reasoning_content,
+                )
+            )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数把 <code>usage_info</code> 缺失视为可容忍情形，而不是抛异常中断；从 <code>if usage_info: ... else: self.logger.warning(...)</code> 可见，其选择是在保留响应轨迹记录的同时，用日志暴露计量缺口。</li><li>模型名采用 <code>response.model_name or self._model_name</code> 的回退策略，说明记录层优先保留响应自带模型标识，但允许在响应未提供时退回实例配置值，避免 <code>Step.model_name</code> 留空。</li><li>成本字段显式做了 <code>usage_info.cost_usd &gt; 0</code> 判断，非正值统一写成 <code>None</code> 而非原样记录；这体现了一个本地数据整形决策：把零或负成本视为“无可用成本值”，避免与有效正成本混淆。</li><li><code>prompt_token_ids</code>、<code>completion_token_ids</code> 与 <code>logprobs</code> 被放在 <code>Metrics(...)</code> 内，而不是 <code>Step</code> 顶层字段；因此一旦缺失 <code>usage_info</code>，这些与细粒度计量绑定的响应附加信息也会整体缺席。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 某个在拿到子代理 <code>LLMResponse</code> 后、希望把结果写入其轨迹列表的上层流程</li><li><strong>核心被调用</strong>: Step; Metrics; datetime.now; timezone.utc; self.logger.warning</li><li><strong>配置/状态来源</strong>: self._model_name; self.logger</li><li><strong>结果去向</strong>: 传入的 <code>steps</code> 列表; 追加生成的 <code>Step.metrics</code>（仅当 <code>usage_info</code> 为 truthy）; 日志输出系统</li></ul></div></details><details class="file" id="fn-terminus2_track_api_request_time"><summary><span class="chev"></span><code class="fpath">Terminus2._track_api_request_time</code><a class="fn-range" href="../code/terminus_2.py.html#L651-L659" title="terminus_2.py:651-659">terminus_2.py:651–659 ↗</a></summary><div class="file-body"><p class="fn-sub">记录单次 API 请求耗时</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数属于 Token &amp; Cost Accounting 阶段中的通用度量辅助逻辑，职责非常单一：把一次调用的耗时样本写入实例上的请求时间列表。与同 stage 的 <code>_count_total_tokens</code>、<code>_extract_usage_metrics</code>、<code>_update_subagent_metrics</code> 类似，它服务于指标采集；但不同于前两者的纯读取/返回模式，这里唯一产出是对 <code>self._api_request_times</code> 的原地追加。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数 <code>_track_api_request_time(self, start_time: float) -&gt; None</code> 接收一个先前保存的起始时间戳 <code>start_time</code>，随后获取当前时间并计算本次经过的毫秒数。它将精确按表达式 <code>(end_time - start_time) * 1000</code> 得到的浮点值追加到 <code>self._api_request_times</code>。函数本身不返回业务值，唯一副作用是向该列表新增一个耗时样本。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, start_time: float) -&gt; None</code></p>
+<ul><li>参数: <code>start_time</code>: <code>float</code> — 先前用 <code>time.time()</code> 记录的请求起始时间戳</li><li>返回: 返回 <code>None</code>；真正产出是向 <code>self._api_request_times</code> 追加一个以毫秒计的浮点耗时样本。</li><li>副作用: 调用 <code>time.time()</code> 读取当前墙钟时间; 通过 <code>.append(...)</code> 原地修改 <code>self._api_request_times</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>调用 <code>time.time()</code> 取得当前时间，并保存到局部变量 <code>end_time</code>。</li><li>用源码中的精确公式 <code>(end_time - start_time) * 1000</code> 计算请求耗时，结果保存为 <code>request_time_ms</code>。</li><li>将 <code>request_time_ms</code> 追加到 <code>self._api_request_times</code> 列表末尾。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _track_api_request_time(self, start_time: float) -&gt; None:
+        """Track API request time from start timestamp.
+
+        Args:
+            start_time: Start time from time.time()
+        """
+        end_time = time.time()
+        request_time_ms = (end_time - start_time) * 1000
+        self._api_request_times.append(request_time_ms)</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数接受外部传入的 <code>start_time</code>，而不是在函数内自行决定起点；这使它只负责“结束计时并记账”这一件事，边界清晰。</li><li>代码把结果以单个样本的形式写入 <code>self._api_request_times</code>，而不是在此处做求和、平均值或聚合；因此该函数只承担原始度量记录，不承担统计汇总。</li><li>耗时单位在写入前直接乘以 <code>1000</code> 转为毫秒，说明该列表保存的是毫秒尺度样本，而非秒值。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未在所给源码片段中展示；可确定其调用方需先提供 <code>start_time</code></li><li><strong>核心被调用</strong>: time.time; self._api_request_times.append</li><li><strong>配置/状态来源</strong>: 参数 <code>start_time</code>; 实例属性 <code>self._api_request_times</code></li><li><strong>结果去向</strong>: 写入 <code>self._api_request_times</code> 供后续统计或对外汇总使用; 对应 state register <a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> 的实例内承载列表</li><li><strong>同类 sibling</strong>: 与 <code>_count_total_tokens</code> 相同点是都服务于指标采集；不同点是本函数不返回计量结果，而是直接写入实例列表。; 与 <code>_extract_usage_metrics</code> 相比，本函数不做字段拆解或归零规则处理，只记录一个简单的耗时样本。; 与 <code>_update_subagent_metrics</code> 相似之处在于都以副作用更新累计度量容器；不同点是这里追加的是单次耗时样本，而非把 token/cost 加总进聚合字段。</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — 追加单次请求毫秒耗时</li></ul></div>
+</div></details><nav class="pn"><a class="pn-prev" href="side-S1.html"><span>← 上一阶段</span><strong>上下文摘要</strong></a><a class="pn-next" href="crosscut-X2.html"><span>下一阶段 →</span><strong>输出长度限制</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

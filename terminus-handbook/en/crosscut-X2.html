@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>crosscut-X2 · Output Length Limiting</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=en"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=en" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>Home</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>State-flow registers</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>Configuration Crystallization</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>Environment Setup</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>Run Onset</a></div><details class="s-node"><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>Iteration Loop</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>Loop Entry Gates</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>Proactive Summarize Probe</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM Query</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>Response Parse</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>Pending Handoff Prompt → User Step (or Split)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>Error Branch</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>Command Execute → Observation → Trajectory Step</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>Completion Gate + Loop Control</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>Parser internal helpers</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>Run Teardown</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>Recording Post-process (External)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>Context Summarization</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token &amp; Cost Accounting</a></div><div class="s-leaf"><a class="s-link cur" href="crosscut-X2.html"><span class="s-num">X2</span>Output Length Limiting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>Logging</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux internal helpers</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">Index</a></nav><div class="stage-head"><h1>Output Length Limiting</h1><div class="meta"><span class="chip mono">crosscut-X2</span><span class="chip">1 functions</span></div></div>
+<h2 class="sec">Opening Explanation</h2>
+<p>This stage exists to stop raw terminal text from overwhelming the LLM. A terminal can easily produce huge output: long logs, file dumps, test failures, or commands that hang and keep printing. If all of that is passed through unchanged, the agent wastes context window, pays more, and can bury the few lines that actually matter. Output Length Limiting owns one simple job: cap terminal output before it becomes model input. It is not a standalone phase of the loop. Instead, it sits anywhere terminal text is about to cross the boundary into the LLM, including initial terminal capture, normal observations, warning paths, and timeout messages. Its value is consistency: every path enforces the same size limit and uses the same truncation signal.</p>
+<h2 class="sec">Main Flow</h2>
+
+<ol><li>Terminal-producing parts of the system gather text from a tmux session (a terminal you can drive remotely) or from command execution paths.</li><li>Before that text is shown to the LLM, <code>_limit_output_length()</code> (trim terminal text to a safe byte size) is called.</li><li>The function keeps the output within a fixed byte budget and adds a <code>[OUTPUT TRUNCATED]</code> marker if cutting was needed.</li><li>The result is a smaller, predictable piece of text that still tells the model two important things:<ul><li>here is the most relevant output we can fit</li><li>more existed, but it was cut</li></ul></li><li>This is used in several places on purpose. The system does not want one observation path to be safe while another accidentally sends a giant blob into the prompt.</li><li>If this helper did not exist, <a href="stage-3.html">stage-3</a>, <a href="stage-4.9.html">stage-4.9</a>, and timeout formatting would each need their own ad hoc limit logic. That would be easy to get wrong and hard to keep consistent.</li></ol>
+<h2 class="sec"> State Flow</h2>
+<ul><li>writes: <code>无</code> — this helper does not write any explicit register in the provided skeleton</li><li>reads: <code>无</code> — no explicit register is listed for this crosscut helper</li><li>clears: <code>无</code> — it does not clear agent state</li><li>triggers downstream: <code>stage-3 / stage-4.9 / subsys-tmux consumers</code> — runs whenever terminal output is about to be embedded into LLM-facing text</li></ul>
+<h2 class="sec">Pipeline Hand-Off</h2>
+<p>Upstream stages produce raw terminal output, often from command execution or terminal-state capture. This helper turns that raw text into bounded, LLM-safe text, which downstream observation-building and prompt-formatting code can include without risking prompt bloat or inconsistent truncation behavior.</p><div class="files-bar"><h2 class="sec">Functions<span class="pill">1</span></h2><span class="spacer"></span><button class="tool" data-x="expand">Expand all</button><button class="tool" data-x="collapse">Collapse all</button></div><details class="file" id="fn-terminus2_limit_output_length"><summary><span class="chev"></span><code class="fpath">Terminus2._limit_output_length</code><a class="fn-range" href="../code/terminus_2.py.html#L530-L566" title="terminus_2.py:530-566">terminus_2.py:530–566 ↗</a></summary><div class="file-body"><p class="fn-sub">UTF-8 byte-based middle truncation helper</p>
+<blockquote><p><strong>Stage context</strong>: This function is a small utility in the owning stage's output-length limiting concern. The body itself only transforms the <code>output</code> argument under a <code>max_bytes</code> threshold and does not show its call sites; it contributes the stage's truncation behavior by returning either the original text or a middle-omitted variant.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_limit_output_length</code> takes a text string <code>output</code> and a byte budget <code>max_bytes</code>, then returns either the original string or a shortened string with a truncation notice inserted between preserved beginning and ending portions. It measures size with <code>output.encode("utf-8")</code>, not with Python character count. It reads no <code>self._*</code> state and writes no state. The <code>max_bytes</code> value bounds the preserved byte slices taken from the original output, not necessarily the byte length of the final returned string after the notice and newline separators are added.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, output: str, max_bytes: int = 10000) -&gt; str</code></p>
+<ul><li>params: <code>output</code>: <code>str</code> — text to return unchanged or truncate; <code>max_bytes</code>: <code>int</code> — byte budget used for the kept prefix and suffix slices</li><li>returns: A <code>str</code>: either the original <code>output</code> if <code>len(output.encode("utf-8")) &lt;= max_bytes</code>, or a new string made from a decoded leading slice, a notice line, and a decoded trailing slice.</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>It encodes <code>output</code> to UTF-8 for the size check and returns <code>output</code> immediately when <code>len(output.encode("utf-8")) &lt;= max_bytes</code>.</li><li>On the truncation path, it sets <code>portion_size = max_bytes // 2</code>, then encodes <code>output</code> again into <code>output_bytes</code> for byte-accurate slicing.</li><li>It takes the first <code>portion_size</code> bytes and the last <code>portion_size</code> bytes from <code>output_bytes</code>, then decodes each slice with <code>errors="ignore"</code> into <code>first_portion</code> and <code>last_portion</code>.</li><li>It computes <code>omitted_bytes</code> as <code>len(output_bytes) - len(first_portion.encode("utf-8")) - len(last_portion.encode("utf-8"))</code>, so the count reflects the re-encoded decodable bytes actually kept after boundary cuts.</li><li>It returns a formatted string that concatenates <code>first_portion</code>, a newline-delimited notice containing <code>max_bytes</code> and <code>omitted_bytes</code>, and <code>last_portion</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _limit_output_length(self, output: str, max_bytes: int = 10000) -&gt; str:
+        """
+        Limit output to specified byte length, keeping first and last portions.
+
+        Args:
+            output: The terminal output to potentially truncate
+            max_bytes: Maximum allowed bytes (default 10000)
+
+        Returns:
+            str: Original output if under limit, or truncated with middle omitted
+        """
+        if len(output.encode("utf-8")) &lt;= max_bytes:
+            return output
+
+        # Calculate portions (half each for first and last)
+        portion_size = max_bytes // 2
+
+        # Convert to bytes for accurate splitting
+        output_bytes = output.encode("utf-8")
+
+        # Get first portion
+        first_portion = output_bytes[:portion_size].decode("utf-8", errors="ignore")
+
+        # Get last portion
+        last_portion = output_bytes[-portion_size:].decode("utf-8", errors="ignore")
+
+        # Calculate omitted bytes
+        omitted_bytes = (
+            len(output_bytes)
+            - len(first_portion.encode("utf-8"))
+            - len(last_portion.encode("utf-8"))
+        )
+
+        return (
+            f"{first_portion}\n[... output limited to {max_bytes} bytes; "
+            f"{omitted_bytes} interior bytes omitted ...]\n{last_portion}"
+        )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The function uses <code>output.encode("utf-8")</code> for both the initial size test and the truncation path, so all limits and slices are based on UTF-8 bytes rather than Python characters. That choice keeps the measurement aligned with the byte-oriented <code>max_bytes</code> parameter visible in the code.</li><li>It preserves approximately half the budget from the front and half from the back by setting <code>portion_size = max_bytes // 2</code>. This favors showing both the start and end of the original byte stream instead of keeping only a prefix or only a suffix.</li><li>It decodes sliced byte ranges with <code>errors="ignore"</code>, which deliberately drops incomplete multibyte characters at slice boundaries instead of raising a decode error. The trade-off is visible in the later <code>omitted_bytes</code> calculation: because it subtracts <code>len(first_portion.encode("utf-8"))</code> and <code>len(last_portion.encode("utf-8"))</code>, ignored boundary bytes count as omitted even though they were inside the raw slices.</li><li>The code does not enforce <code>max_bytes</code> on the final returned string. <code>max_bytes</code> limits only the preserved original byte portions; the inserted notice text and newline separators can make the returned string longer than <code>max_bytes</code>.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: unknown from this function body; external code calls this helper; owning stage utility path for output-length limiting; methods that need a shortened <code>str</code> before passing text onward; any <code>Terminus2</code> method that supplies <code>output</code> and optional <code>max_bytes</code></li><li><strong>Core callees</strong>: <code>str.encode</code> with <code>"utf-8"</code>; byte-slice operations on <code>output_bytes</code>; <code>bytes.decode</code> with <code>errors="ignore"</code>; formatted string construction for the truncation notice</li><li><strong>Config / state sources</strong>: argument <code>output</code>; argument <code>max_bytes</code>; local <code>portion_size = max_bytes // 2</code>; derived local <code>output_bytes = output.encode("utf-8")</code></li><li><strong>Results to</strong>: the caller as the function's return value; either the unchanged <code>output</code> branch result; or the synthesized truncated string with notice; downstream consumers chosen by the caller, not shown here</li></ul></div></details><nav class="pn"><a class="pn-prev" href="crosscut-X1.html"><span>← Previous</span><strong>Token &amp; Cost Accounting</strong></a><a class="pn-next" href="crosscut-X3.html"><span>Next →</span><strong>Logging</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

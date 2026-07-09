@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-1 · 配置固化</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=zh"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 手册</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=zh" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>返回主页</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>状态流寄存器</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link cur" href="stage-1.html"><span class="s-num">1</span>配置固化</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>环境搭建</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>运行起点</a></div><details class="s-node"><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>迭代主循环</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>循环入口门控</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>主动摘要探测</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM 调用</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>响应解析</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>待交接提示 → 用户步骤(或切分)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>错误分支</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>命令执行 → 观察 → 轨迹步骤</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>完成门控与循环控制</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>解析器内部辅助</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>运行收尾</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>录制后处理(外部)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>上下文摘要</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token 与成本核算</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>输出长度限制</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>日志</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux 内部辅助</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">索引</a></nav><div class="stage-head"><h1>配置固化</h1><div class="meta"><span class="chip mono">stage-1</span><span class="chip">Configuration Crystallization</span><span class="chip">6 个函数</span></div></div><p>这个 Stage 在解决什么问题？它把用户传进来的零散配置，一次性定成一个稳定的 Agent 对象，让后面所有 Stage 都能假设“模型、解析器、模板、计数器、会话字段都已经就位”。它只在 <code>Terminus2</code> 实例创建时跑一次，不处理某个具体任务，而是先把“这台 Agent 机器”装好；如果这一步没定清，后面的 Environment Setup 就不知道该按什么规则建环境。</p>
+<ol><li>先读构造参数，并把兼容问题在这里一次处理完。 <p><code>Terminus2.__init__()</code>（创建 Agent 实例）先接住用户给的约 25 个配置项。这里最重要的不是“存起来”，而是先把历史兼容和优先级讲清：比如旧参数 <code>episodes</code> 和新参数 <code>max_episodes</code> 同时出现时，到底听谁的。 这一步存在的原因很直接：配置冲突如果拖到运行中才暴露，后面每个 Stage 都要反复防御；在入口处定一次，后面就能按一个口径工作。</p></li><li>再把核心依赖真的准备好。 <p>然后它初始化 LLM（大语言模型）客户端，也就是后面真正拿去发请求的 Chat 封装；接着按 parser 名称选 parser（把模型输出转成 Agent 可用结果的解析器）。 这一步的意义是：后续 Stage 不该再关心“模型对象有没有建好”“解析器是哪一种”。它们只该直接使用。 这里也有明确的失败边界：如果模型信息无法解析、LLM 起不来，或 parser 名称不合法，本阶段就直接报错并停下，不进入下游。</p></li><li>再把提示词模板的位置定下来。 <p>它会决定 prompt template（提示词模板）和 timeout template（超时场景下用的模板）从哪里读。 为什么这一步要放在这里？因为模板其实也是配置的一部分。先把路径定死，后面运行任务时就不用再猜“该用哪套提示词”，也避免不同任务临时选模板造成行为漂移。</p></li><li>最后把所有“每次运行会变”的字段先放回默认值。 <p>比如轨迹步数、待处理 completion、待处理 subagent（子 Agent，被主 Agent 调用的小 Agent）引用、handoff prompt、asciinema 标记、子 Agent 指标、API 请求时间、总结次数、episode 计数、session id。 这些字段虽然是运行期状态，但它们的“初始空白值”必须在实例创建时就声明清楚。这样同一个 Agent 实例在第一次跑任务前，就是一个干净、可预测的起点。</p></li><li>成功后，才把这个“已经定型”的对象交给下游。 <p>到这一步，系统拿到的已经不是“用户给的一堆参数”，而是“一个状态完整、依赖齐全、默认值明确的 Agent”。下一个 Stage 可以直接开始建环境，而不用回头处理配置细节。</p></li></ol>
+<ul><li>无 register 读写 — 输入说明已明确：本 stage 在 skeleton 中未被任何 register 显式提及，本阶段不产生可验证的 register 流</li><li>触发下游: <code>stage-2 Environment Setup</code> — 仅当构造参数归一化完成、LLM/ parser 初始化成功、模板路径确定、运行期字段默认化完成后进入；若本阶段报错，则不进入下游</li></ul>
+<p>非寄存器对象字段（可验证的实例状态）：</p>
+<ul><li>写: <code>_llm</code> — 在实例创建时写入；把用户的模型配置变成可调用的 Chat 客户端，供后续所有 LLM 请求复用</li><li>读: <code>_parser_name</code> — 在实例创建时读取；用来决定选哪种 parser</li><li>写: prompt template path（由 <code>_get_prompt_template_path()</code> 决定）— 在实例创建时确定；让后续取提示词时有固定位置</li><li>写: timeout template path（由 <code>_get_timeout_template_path()</code> 决定）— 在实例创建时确定；让超时分支也有固定模板</li><li>写: <code>max_episodes</code> — 在实例创建时根据 <code>episodes</code> / <code>max_episodes</code> 的兼容与优先级规则定值；后续运行直接使用统一结果</li><li>写: 运行期默认字段 — 在实例创建时写入默认空值或初值；目的是保证首次任务运行前对象处于干净起点</li></ul>
+<p>上游其实只有一件事：用户传进来的构造参数。这个 Stage 把它们压成稳定的对象状态；下游 Environment Setup 消费的不是原始参数，而是一个已经选好模型、解析器、模板并且带着默认运行字段的 Agent。若这里失败，流水线就在实例创建阶段结束，不会进入环境搭建。</p><div class="files-bar"><h2 class="sec">函数细节<span class="pill">6</span></h2><span class="spacer"></span><button class="tool" data-x="expand">全部展开</button><button class="tool" data-x="collapse">全部折叠</button></div><details class="file" id="fn-terminus2_init"><summary><span class="chev"></span><code class="fpath">Terminus2.__init__</code><a class="fn-range" href="../code/terminus_2.py.html#L144-L331" title="terminus_2.py:144-331">terminus_2.py:144–331 ↗</a></summary><div class="file-body"><p class="fn-sub">代理配置冻结与运行态字段初始化入口</p>
+<blockquote><p><strong>stage 上下文</strong>: 该条目对应 <a href="stage-1.html">stage-1</a> 的首个构造单元：把构造参数与少量兼容性 kwargs 解析为实例上的 <code>self._*</code> 配置和默认运行态字段。触发条件就是外部直接调用 <code>Terminus2(...)</code>。本 stage 目前未给出其他兄弟函数；因此这里承担后续实例方法可依赖的初始配置基线。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p><code>Terminus2.__init__</code> 接收日志目录、模型/解析器/采样/总结/轨迹/tmux/LLM 后端等参数，并把它们固化到实例字段中。函数会先校验 <code>model_name</code>，再解析模型信息、创建 <code>self._llm</code>、选择 <code>self._parser</code>、读取 prompt/timeout 模板文本，然后处理 <code>max_turns</code> 与兼容参数 <code>kwargs['max_episodes']</code>、<code>kwargs['episodes']</code> 的优先级。其真正产出不是返回值，而是对大量 <code>self._*</code> 字段的写入，以及在显式使用废弃或限流参数时通过 <code>self.logger.warning(...)</code> 发出告警。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, logs_dir: Path, model_name: str | None = None, max_turns: int | None = None, parser_name: str = "json", api_base: str | None = None, temperature: float | None = None, reasoning_effort: Literal["none", "minimal", "low", "medium", "high", "xhigh", "max", "default"] | None = None, collect_rollout_details: bool = False, session_id: str | None = None, enable_summarize: bool = True, proactive_summarization_threshold: int = 8000, max_thinking_tokens: int | None = None, model_info: dict | None = None, trajectory_config: TrajectoryConfig | None = None, tmux_pane_width: int = 160, tmux_pane_height: int = 40, store_all_messages: bool = False, record_terminal_session: bool = True, interleaved_thinking: bool = False, suppress_max_turns_warning: bool = False, use_responses_api: bool = False, llm_backend: LLMBackend | str = LLMBackend.LITELLM, llm_kwargs: dict | None = None, llm_call_kwargs: dict[str, Any] | None = None, extra_env: dict[str, str] | None = None, *args, **kwargs)</code></p>
+<ul><li>参数: <code>logs_dir</code>: <code>Path</code> — 传给父类构造函数的日志目录; <code>model_name</code>: <code>str | None</code> — 目标模型名；缺失时直接报错; <code>max_turns</code>: <code>int | None</code> — 新的最大回合/episode 限制入口，优先级最高; <code>parser_name</code>: <code>str</code> — 解析器名称，写入 <code>self._parser_name</code> 并驱动 <code>_get_parser()</code>; <code>api_base</code>: <code>str | None</code> — 传给 <code>_init_llm</code> 的 API 基地址; <code>temperature</code>: <code>float | None</code> — 采样温度；同时写入 <code>self._temperature</code> 并传给 <code>_init_llm</code>; <code>reasoning_effort</code>: <code>Literal[...] | None</code> — 推理力度配置；写入实例并传给 <code>_init_llm</code>; <code>collect_rollout_details</code>: <code>bool</code> — 是否采集 rollout 细节；写入实例并传给 <code>_init_llm</code>; <code>session_id</code>: <code>str | None</code> — 外部提供的会话标识；若为空则生成 UUID; <code>enable_summarize</code>: <code>bool</code> — 是否启用总结能力，写入 <code>self._enable_summarize</code>; <code>proactive_summarization_threshold</code>: <code>int</code> — 主动总结阈值，写入 <code>self._proactive_summarization_threshold</code>; <code>max_thinking_tokens</code>: <code>int | None</code> — 传给 <code>_init_llm</code> 的 thinking token 上限; <code>model_info</code>: <code>dict | None</code> — 可选模型元信息，先经 <code>_resolve_model_info</code> 处理; <code>trajectory_config</code>: <code>TrajectoryConfig | None</code> — 轨迹配置；为空时退化为 <code>{}</code>，否则原样保留引用; <code>tmux_pane_width</code>: <code>int</code> — tmux pane 宽度配置; <code>tmux_pane_height</code>: <code>int</code> — tmux pane 高度配置; <code>store_all_messages</code>: <code>bool</code> — 是否保存全部消息到实例配置; <code>record_terminal_session</code>: <code>bool</code> — 是否记录终端会话; <code>interleaved_thinking</code>: <code>bool</code> — 是否启用交错 thinking 历史; <code>suppress_max_turns_warning</code>: <code>bool</code> — 是否抑制显式最大回合限制告警; <code>use_responses_api</code>: <code>bool</code> — 传给 <code>_init_llm</code> 的 API 选择开关; <code>llm_backend</code>: <code>LLMBackend | str</code> — LLM 后端类型，传给 <code>_init_llm</code>; <code>llm_kwargs</code>: <code>dict | None</code> — LLM 构造附加参数；传给 <code>_init_llm</code> 并保存到 <code>self._llm_kwargs</code>; <code>llm_call_kwargs</code>: <code>dict[str, Any] | None</code> — LLM 调用级附加参数；若非空则复制后保存; <code>extra_env</code>: <code>dict[str, str] | None</code> — 额外环境变量映射，保存到 <code>self._extra_env</code>; <code>args</code>: <code>tuple</code> — 透传给父类构造函数的附加位置参数; <code>kwargs</code>: <code>dict</code> — 透传给父类且用于兼容读取 <code>episodes</code>/<code>max_episodes</code> 的附加关键字参数</li><li>读状态: <code>self.logger</code>, <code>self._resolve_model_info</code>, <code>self._init_llm</code>, <code>self._get_parser</code>, <code>self._get_prompt_template_path</code>, <code>self._get_timeout_template_path</code></li><li>返回: 返回 <code>None</code>；真正产出是实例配置、默认运行态字段与模板文本的初始化。</li><li>副作用: 调用 <code>super().__init__(logs_dir, model_name, *args, **kwargs)</code> 初始化父类状态; 当 <code>model_name is None</code> 时抛出 <code>ValueError('model_name is required for Terminus 2')</code>; 写入 <code>self._extra_env</code>、<code>self._model_name</code>、<code>self._last_response_model_name</code>、<code>self._parser_name</code>、<code>self._collect_rollout_details</code>、<code>self._reasoning_effort</code>; 调用 <code>_resolve_model_info(...)</code> 并把结果传入 <code>_init_llm(...)</code>; 写入 <code>self._llm</code>、<code>self._parser</code>、<code>self._prompt_template</code>、<code>self._timeout_template</code>、<code>self._temperature</code>; 根据 <code>max_turns</code> / <code>kwargs['max_episodes']</code> / <code>kwargs['episodes']</code> 计算并写入 <code>self._max_episodes</code>; 在检测到 <code>kwargs['episodes']</code> 时通过 <code>self.logger.warning(...)</code> 发出废弃参数告警; 在存在显式最大回合限制且未抑制时通过 <code>self.logger.warning(...)</code> 发出限制告警; 写入 <code>self._chat</code>、<code>self._context</code>、<code>self._timestamped_markers</code>、<code>self._pending_completion</code>、<code>self._session</code>、<code>self._api_request_times</code>、<code>self._n_episodes</code>; 写入 <code>self._user_provided_session_id</code> 与 <code>self._session_id</code>（必要时生成 UUID）; 写入 <code>self._trajectory_steps</code>、<code>self._record_terminal_session</code>、<code>self._llm_call_kwargs</code>; 写入 <code>self._summarization_count</code>、<code>self._pending_subagent_refs</code>、<code>self._pending_handoff_prompt</code>、<code>self._subagent_metrics</code>、<code>self._subagent_rollout_details</code>; 写入 <code>self._enable_summarize</code>、<code>self._proactive_summarization_threshold</code>、<code>self._tmux_pane_width</code>、<code>self._tmux_pane_height</code>; 写入 <code>self._trajectory_config</code>、<code>self._save_raw_content_in_trajectory</code>、<code>self._linear_history</code>、<code>self._store_all_messages</code>、<code>self._interleaved_thinking</code>、<code>self._llm_kwargs</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先调用父类构造函数 <code>super().__init__(logs_dir, model_name, *args, **kwargs)</code>，随后保存 <code>extra_env</code>，并对 <code>model_name</code> 做显式空值校验；若为 <code>None</code> 立即抛出 <code>ValueError</code>，不继续初始化。</li><li>把基础模型相关配置冻结到实例：写入 <code>self._model_name</code>、<code>self._parser_name</code>、<code>self._collect_rollout_details</code>、<code>self._reasoning_effort</code>，并通过 <code>_resolve_model_info(model_name, model_info)</code> 取得传给 LLM 初始化的模型元信息。</li><li>调用 <code>_init_llm(...)</code> 构造 <code>self._llm</code>，参数中纳入模型名、温度、rollout 开关、<code>api_base</code>、<code>session_id</code>、<code>max_thinking_tokens</code>、<code>reasoning_effort</code>、解析后的 <code>model_info</code> 以及 <code>use_responses_api</code>；随后经 <code>_get_parser()</code> 生成 <code>self._parser</code>，并从 <code>_get_prompt_template_path()</code>、<code>_get_timeout_template_path()</code> 读取模板文本到 <code>self._prompt_template</code> 与 <code>self._timeout_template</code>。</li><li>处理兼容参数：先读取 <code>kwargs.get('episodes')</code>，若存在则单独发出“已废弃，请改用 <code>max_turns</code>”的告警；然后按 <code>max_turns</code> &gt; <code>kwargs['max_episodes']</code> &gt; <code>kwargs['episodes']</code> 的顺序求出 <code>final_max_episodes</code>。</li><li>若求得显式上限，则在 <code>suppress_max_turns_warning</code> 为假时发出“人为限制 <code>max_turns</code>/<code>max_episodes</code>”的告警，并写入 <code>self._max_episodes</code>；若未提供任何上限，则把 <code>self._max_episodes</code> 设为 <code>1000000</code>。</li><li>声明运行态默认值：把聊天/上下文/tmux/计数器/轨迹/请求计时等字段初始化为空或零值，包括 <code>self._chat = None</code>、<code>self._context = None</code>、<code>self._timestamped_markers = []</code>、<code>self._pending_completion = False</code>、<code>self._session = None</code>、<code>self._api_request_times = []</code>、<code>self._n_episodes = 0</code>、<code>self._trajectory_steps = []</code>。</li><li>完成会话与总结相关配置冻结：保留用户传入的 <code>session_id</code> 到 <code>self._user_provided_session_id</code>，同时把 <code>self._session_id</code> 设为传入值或新生成 UUID；并初始化 <code>self._summarization_count = 0</code>、<code>self._pending_subagent_refs = None</code>、<code>self._pending_handoff_prompt = None</code>、<code>self._subagent_metrics = SubagentMetrics()</code>、<code>self._subagent_rollout_details = []</code>，再写入总结阈值与 tmux 尺寸。</li><li>最后固化轨迹与调用级配置：<code>self._trajectory_config = trajectory_config or {}</code>，从中读取 <code>raw_content</code> 与 <code>linear_history</code> 标志；把 <code>llm_call_kwargs</code> 在非空时复制为新字典后存入 <code>self._llm_call_kwargs</code>，并写入 <code>self._store_all_messages</code>、<code>self._interleaved_thinking</code>、<code>self._llm_kwargs</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def __init__(
+        self,
+        logs_dir: Path,
+        model_name: str | None = None,
+        max_turns: int | None = None,
+        parser_name: str = "json",
+        api_base: str | None = None,
+        temperature: float | None = None,
+        reasoning_effort: Literal[
+            "none", "minimal", "low", "medium", "high", "xhigh", "max", "default"
+        ]
+        | None = None,
+        collect_rollout_details: bool = False,
+        session_id: str | None = None,
+        enable_summarize: bool = True,
+        proactive_summarization_threshold: int = 8000,
+        max_thinking_tokens: int | None = None,
+        model_info: dict | None = None,
+        trajectory_config: TrajectoryConfig | None = None,
+        tmux_pane_width: int = 160,
+        tmux_pane_height: int = 40,
+        store_all_messages: bool = False,
+        record_terminal_session: bool = True,
+        interleaved_thinking: bool = False,
+        suppress_max_turns_warning: bool = False,
+        use_responses_api: bool = False,
+        llm_backend: LLMBackend | str = LLMBackend.LITELLM,
+        llm_kwargs: dict | None = None,
+        llm_call_kwargs: dict[str, Any] | None = None,
+        extra_env: dict[str, str] | None = None,
+        *args,
+        **kwargs,
+    ):
+        """Initialize Terminus 2 agent.
+
+        Args:
+            logs_dir: Directory to store logs
+            model_name: Name of the model to use
+            max_episodes: Maximum number of episodes (default: 1000000)
+            parser_name: Parser to use - "json" or "xml" (default: "json")
+            api_base: Base URL for the API endpoint
+            temperature: Optional sampling temperature. If unset, no temperature is
+                passed to the LLM backend. (default: None)
+            reasoning_effort: Qualitative or quantitative measure of effort (default: None)
+            collect_rollout_details: Whether to collect detailed rollout data including token IDs.
+                NOTE: Rollout details will be incomplete if context summarization occurs.
+                See class docstring for details. (default: False)
+            session_id: Session ID for the agent (default: None)
+            enable_summarize: Whether to enable context summarization (default: True)
+            proactive_summarization_threshold: Number of free tokens below which to trigger
+                proactive summarization. Set to 0 to disable proactive summarization. (default: 8000)
+            max_thinking_tokens: Maximum thinking tokens for Anthropic extended thinking mode.
+                Minimum value is 1024. (default: None)
+            model_info: Optional dict containing model information for custom models.
+                Used to register the model with litellm. Common fields include:
+                - max_input_tokens: Maximum input tokens (context length)
+                - max_output_tokens: Maximum output tokens
+                - input_cost_per_token: Cost per input token (optional)
+                - output_cost_per_token: Cost per output token (optional)
+                (default: None)
+            trajectory_config: Optional TrajectoryConfig containing trajectory-related configurations.
+                Available options:
+                - raw_content (bool): If True, dump raw LLM responses into trajectory without
+                  parsing into tool_calls. Useful for SFT data export. (default: False)
+                - linear_history (bool): If True, split trajectory into separate files when context
+                  summarization occurs, ensuring each trajectory represents a continuous linear
+                  history sent to the LLM. When False, keep all steps from the main agent
+                  in a single trajectory file despite chat history resets. (default: False)
+                (default: None)
+            tmux_pane_width: Starting tmux pane width (maps to `tmux -x`, default: 160)
+            tmux_pane_height: Starting tmux pane height (maps to `tmux -y`, default: 40)
+            record_terminal_session: Whether to capture terminal recordings via asciinema.
+                (default: True)
+            interleaved_thinking: Whether to include reasoning content in chat history
+                and send to litellm in next round's conversation (default: False)
+            suppress_max_turns_warning: Whether to suppress the warning about artificially
+                limiting max_turns (default: False)
+            llm_backend: LLM backend to use. Use LLMBackend.LITELLM or "litellm".
+                (default: LLMBackend.LITELLM)
+            llm_kwargs: Additional kwargs to pass to the LLM constructor.
+                (default: None)
+            llm_call_kwargs: Extra kwargs to forward to LLM calls (e.g., extra_body).
+            **kwargs: Additional arguments
+        """
+        super().__init__(logs_dir, model_name, *args, **kwargs)
+        self._extra_env = extra_env
+
+        if model_name is None:
+            raise ValueError("model_name is required for Terminus 2")
+
+        self._model_name = model_name
+        self._last_response_model_name: str | None = None
+        self._parser_name = parser_name
+        self._collect_rollout_details = collect_rollout_details
+        self._reasoning_effort = reasoning_effort
+        resolved_model_info = self._resolve_model_info(model_name, model_info)
+
+        self._llm = self._init_llm(
+            llm_backend=llm_backend,
+            model_name=model_name,
+            temperature=temperature,
+            collect_rollout_details=collect_rollout_details,
+            llm_kwargs=llm_kwargs,
+            api_base=api_base,
+            session_id=session_id,
+            max_thinking_tokens=max_thinking_tokens,
+            reasoning_effort=reasoning_effort,
+            model_info=resolved_model_info,
+            use_responses_api=use_responses_api,
+        )
+        self._parser = self._get_parser()
+        self._prompt_template = self._get_prompt_template_path().read_text()
+        self._timeout_template = self._get_timeout_template_path().read_text()
+        self._temperature = temperature
+
+        # Handle deprecated 'episodes' kwarg
+        episodes_from_kwargs = kwargs.get("episodes")
+        if episodes_from_kwargs is not None:
+            self.logger.warning(
+                "The 'episodes' parameter is deprecated and will be removed in a future version. "
+                "Please use 'max_turns' instead."
+            )
+
+        # Determine the final max episodes value with proper precedence:
+        # 1. max_turns (new parameter)
+        # 2. max_episodes (deprecated but still supported)
+        # 3. episodes from kwargs (deprecated)
+        # 4. Default value of 1000000
+        final_max_episodes = None
+        if max_turns is not None:
+            final_max_episodes = max_turns
+        elif kwargs.get("max_episodes") is not None:
+            final_max_episodes = kwargs.get("max_episodes")
+        elif episodes_from_kwargs is not None:
+            final_max_episodes = episodes_from_kwargs
+
+        if final_max_episodes is not None:
+            if not suppress_max_turns_warning:
+                self.logger.warning(
+                    f"max_turns (f.k.a. max_episodes) artificially limited to {final_max_episodes}. "
+                    "Consider removing this limit for better task completion."
+                )
+            self._max_episodes = final_max_episodes
+        else:
+            self._max_episodes = 1000000
+        self._chat: Chat | None = None
+        self._context: AgentContext | None = None
+        self._timestamped_markers: list[tuple[float, str]] = []
+        self._pending_completion = False
+        self._session: TmuxSession | None = None
+        self._api_request_times: list[float] = []
+        self._n_episodes: int = 0
+        self._user_provided_session_id: str | None = session_id
+        self._session_id = session_id if session_id else str(uuid.uuid4())
+        self._trajectory_steps: list[Step] = []
+        self._record_terminal_session = record_terminal_session
+        self._llm_call_kwargs = dict(llm_call_kwargs) if llm_call_kwargs else {}
+
+        self._summarization_count: int = (
+            0  # Track number of summarization subagents created
+        )
+        self._pending_subagent_refs: list[SubagentTrajectoryRef] | None = (
+            None  # Track subagent refs to include in next step
+        )
+        self._pending_handoff_prompt: str | None = (
+            None  # Track handoff prompt to include as user step
+        )
+        self._subagent_metrics = SubagentMetrics()  # Track subagent metrics separately
+        self._subagent_rollout_details: list[
+            RolloutDetail
+        ] = []  # Track rollout details for each subagent
+        self._enable_summarize = (
+            enable_summarize  # Toggle for proactive and context limit summarization
+        )
+        self._proactive_summarization_threshold = proactive_summarization_threshold
+        self._tmux_pane_width = tmux_pane_width
+        self._tmux_pane_height = tmux_pane_height
+
+        # Trajectory configuration
+        self._trajectory_config = trajectory_config or {}
+        self._save_raw_content_in_trajectory = self._trajectory_config.get(
+            "raw_content", False
+        )
+        self._linear_history = self._trajectory_config.get("linear_history", False)
+        # Optional: include full chat messages in TrialResult metadata (can be large)
+        self._store_all_messages = store_all_messages
+        self._interleaved_thinking = interleaved_thinking
+        self._llm_kwargs = llm_kwargs</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>对 <code>model_name</code> 使用显式失败策略而非延后容错：代码在完成父类初始化后立刻检查 <code>if model_name is None: raise ValueError(...)</code>。这样避免后续 <code>_resolve_model_info</code>、<code>_init_llm</code> 等路径在缺关键标识时产生更晚且更模糊的错误。</li><li>兼容参数采用双层处理而不是简单别名替换：<code>kwargs['episodes']</code> 仅用于兼容读取，并单独触发废弃告警；真正的上限解析再与 <code>max_turns</code>、<code>kwargs['max_episodes']</code> 一起进入优先级判定。这把“接口迁移提醒”和“人为限制回合数提醒”拆成了两个独立分支，避免一条告警混杂两种含义。</li><li>最大回合数的优先级是显式新参数优先：<code>max_turns</code> 覆盖旧的 <code>max_episodes</code> 与更旧的 <code>episodes</code>，未提供时回退到 <code>1000000</code>。这体现出向新接口迁移同时保留旧调用兼容性的取舍；若不做优先级分层，旧参数可能悄然覆盖新参数。</li><li>会话标识保留“双轨”信息：<code>self._user_provided_session_id</code> 保存外部输入原值，而 <code>self._session_id</code> 保证始终有值（必要时生成 UUID）。这样实例内部总有可用会话 ID，同时不丢失“是否由用户显式提供”的事实。</li><li>配置快照策略并不一致，且是代码中的真实取舍：<code>llm_call_kwargs</code> 在保存前用 <code>dict(...)</code> 复制，避免外部后续修改影响实例；但 <code>trajectory_config</code> 仅做 <code>trajectory_config or {}</code>，当传入真值对象时并未复制，而是保留原引用。也就是说，前者被快照隔离，后者没有完全隔离。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 直接实例化 <code>Terminus2(...)</code> 的外部调用点; 任何子类若未覆盖构造函数而沿用本构造逻辑; 测试代码中创建 <code>Terminus2</code> 实例的入口; 框架/脚本层通过构造器注入配置时的对象创建路径</li><li><strong>核心被调用</strong>: Base/父类 <code>__init__</code>（经 <code>super().__init__(...)</code>）; <code>self._resolve_model_info(model_name, model_info)</code>; <code>self._init_llm(...)</code>; <code>self._get_parser()</code>; <code>self._get_prompt_template_path().read_text()</code>; <code>self._get_timeout_template_path().read_text()</code>; <code>uuid.uuid4()</code>; <code>SubagentMetrics()</code>; <code>self.logger.warning(...)</code></li><li><strong>配置/状态来源</strong>: 构造参数 <code>model_name</code>、<code>parser_name</code>、<code>temperature</code>、<code>reasoning_effort</code>、<code>api_base</code>; 构造参数 <code>enable_summarize</code>、<code>proactive_summarization_threshold</code>、<code>trajectory_config</code>; 构造参数 <code>tmux_pane_width</code>、<code>tmux_pane_height</code>、<code>record_terminal_session</code>、<code>store_all_messages</code>、<code>interleaved_thinking</code>; 构造参数 <code>llm_backend</code>、<code>llm_kwargs</code>、<code>llm_call_kwargs</code>、<code>use_responses_api</code>、<code>max_thinking_tokens</code>; <code>kwargs.get('episodes')</code> 与 <code>kwargs.get('max_episodes')</code> 的兼容输入; <code>_get_prompt_template_path()</code> 与 <code>_get_timeout_template_path()</code> 指向的模板文件文本</li><li><strong>结果去向</strong>: 实例字段 <code>self._llm</code>、<code>self._parser</code>、<code>self._prompt_template</code>、<code>self._timeout_template</code>; 实例字段 <code>self._max_episodes</code>、<code>self._temperature</code>、<code>self._llm_call_kwargs</code>、<code>self._llm_kwargs</code>; 实例字段 <code>self._session_id</code>、<code>self._user_provided_session_id</code>、<code>self._extra_env</code>; 实例字段 <code>self._trajectory_config</code>、<code>self._save_raw_content_in_trajectory</code>、<code>self._linear_history</code>; 实例字段 <code>self._chat</code>、<code>self._context</code>、<code>self._trajectory_steps</code>、<code>self._api_request_times</code>; 实例字段 <code>self._pending_completion</code>、<code>self._pending_subagent_refs</code>、<code>self._pending_handoff_prompt</code>、<code>self._summarization_count</code></li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-pending-completion"><code>reg-pending-completion</code></a> — 构造时置为 False</li><li><a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — 构造时置为 None</li><li><a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a> — 构造时置为 None</li><li><a class="reg" href="registers.html#reg-n-episodes"><code>reg-n-episodes</code></a> — 构造时置为 0</li><li><a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — 构造时置为 0</li><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — 构造时初始化为空列表</li><li><a class="reg" href="registers.html#reg-chat-messages"><code>reg-chat-messages</code></a> — 构造时 <code>self._chat = None</code></li><li><a class="reg" href="registers.html#reg-asciinema-markers"><code>reg-asciinema-markers</code></a> — 构造时初始化为空列表</li><li><a class="reg" href="registers.html#reg-subagent-metrics"><code>reg-subagent-metrics</code></a> — 构造时新建指标对象</li><li><a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — 构造时初始化为空列表</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_resolve_model_info"><summary><span class="chev"></span><code class="fpath">Terminus2._resolve_model_info</code><a class="fn-range" href="../code/terminus_2.py.html#L333-L345" title="terminus_2.py:333-345">terminus_2.py:333–345 ↗</a></summary><div class="file-body"><p class="fn-sub">模型元信息选择与告警入口</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数是一个很小的配置裁决点：在两个输入源之间决定返回哪份模型元信息，或明确返回 <code>None</code>。与同阶段里负责固化大量实例字段的兄弟函数相比，它本身不写入实例状态，只提供一个可被上层采用的返回值。其特殊性仅体现在对 <code>model_name</code> 中 <code>"hosted_vllm"</code> 模式的告警处理。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数 <code>_resolve_model_info</code> 接收 <code>model_name</code> 与 <code>provided_model_info</code>，优先返回真值的 <code>provided_model_info</code>。若 <code>provided_model_info</code> 为假值，则在 <code>model_name</code> 为真值且包含子串 <code>"hosted_vllm"</code><code> 时，通过 </code>self.logger.warning(...)<code> 发出一条配置告警。除此之外它不修改任何实例字段，最终返回值要么是传入的那份字典，要么是 </code>None`；空字典等假值不会被直接返回，而会继续落入后续分支。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, model_name: str | None, provided_model_info: dict | None) -&gt; dict | None</code></p>
+<ul><li>参数: <code>model_name</code>: <code>str | None</code> — 候选模型名称；仅在其为真值且包含 <code>hosted_vllm</code> 时参与告警判断; <code>provided_model_info</code>: <code>dict | None</code> — 调用方传入的模型元信息；只有在其为真值时才被原样返回</li><li>读状态: <code>self.logger</code></li><li>返回: 返回 <code>dict | None</code>：若 <code>provided_model_info</code> 为真值则返回该对象；否则返回 <code>None</code>。</li><li>副作用: 当 <code>model_name</code> 为真值且包含 <code>hosted_vllm</code>，并且 <code>provided_model_info</code> 为假值时，调用 <code>self.logger.warning(...)</code> 输出一条告警日志</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先检查 <code>provided_model_info</code> 的真值性；若条件 <code>if provided_model_info:</code> 成立，则立即返回该参数本身，不再执行后续逻辑。</li><li>若前一步未返回，再检查 <code>model_name</code> 的真值性以及表达式 <code>"hosted_vllm" in model_name</code> 是否成立；只有两者同时满足时，才调用 <code>self.logger.warning(...)</code> 记录告警。</li><li>无论是否发出告警，只要没有走到首个提前返回分支，函数最后都执行 <code>return None</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _resolve_model_info(
+        self, model_name: str | None, provided_model_info: dict | None
+    ) -&gt; dict | None:
+        if provided_model_info:
+            return provided_model_info
+        if model_name and "hosted_vllm" in model_name:
+            self.logger.warning(
+                "Model info is required when using hosted_vllm models. "
+                "Please set `model_info` in your Terminus 2 configuration with "
+                "`max_input_tokens`, `max_output_tokens`, and cost fields. "
+                "Falling back to LiteLLM defaults, which may cause context or pricing issues."
+            )
+        return None</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数把“接受调用方给出的模型信息”写成 <code>if provided_model_info:</code>，这意味着只有真值字典才会被采用；空字典 <code>{}</code> 虽然类型上仍是 <code>dict</code>，但会被当作未命中而继续走后续判断。这是一个不那么显眼但非常具体的取舍。</li><li>对 <code>hosted_vllm</code> 的处理选择了“告警但不阻断”：代码只记录 warning，没有抛异常、没有补写默认值、也没有在本函数内执行任何回退逻辑。关于“Falling back to LiteLLM defaults, which may cause context or pricing issues.” 的表述仅出现在告警消息文本中，是提示语义，而不是该函数额外实现的行为。</li><li>特殊分支采用简单的子串匹配 <code>"hosted_vllm" in model_name</code>，而不是更严格的结构化解析；因此它只依据名称模式触发提醒，保持函数职责局限在轻量判定与提示。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 上层配置装配代码，向其请求本次应采用的模型元信息; 任何持有 <code>self</code>、<code>model_name</code> 与 <code>provided_model_info</code> 的实例方法</li><li><strong>核心被调用</strong>: self.logger.warning</li><li><strong>配置/状态来源</strong>: 参数 <code>model_name</code>; 参数 <code>provided_model_info</code>; 实例上的 <code>self.logger</code></li><li><strong>结果去向</strong>: 返回给调用方的一份 <code>dict</code> 模型元信息; 返回给调用方的 <code>None</code>; 日志系统中的一条 warning 记录</li><li><strong>同类 sibling</strong>: Terminus2.__init__：兄弟函数负责把大量配置写入实例字段；本函数只做一处模型元信息选择并可能发出告警。</li></ul></div></details><details class="file" id="fn-terminus2_init_llm"><summary><span class="chev"></span><code class="fpath">Terminus2._init_llm</code><a class="fn-range" href="../code/terminus_2.py.html#L73-L142" title="terminus_2.py:73-142">terminus_2.py:73–142 ↗</a></summary><div class="file-body"><p class="fn-sub">LLM 后端实例化分发点</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数处于 <a href="stage-1.html">stage-1</a> 的早段，负责把 <code>Terminus2.__init__</code> 已接收但尚未固化的 LLM 相关配置，收束为一个可直接使用的聊天后端对象。触发条件是构造器初始化期间需要建立 <code>self._llm</code>。与同 stage 的 <code>_resolve_model_info</code> 相比，它不再判断模型元信息来源，而是消费这些已解析配置并完成后端分派。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数 <code>_init_llm</code> 根据 <code>llm_backend</code> 选择具体的 LLM 客户端实现，并返回一个 <code>BaseLLM</code> 兼容实例。它只读取传入参数：后端选择、模型名、采样温度、rollout 细节开关、通用 <code>llm_kwargs</code>，以及 LiteLLM 专属的 <code>api_base</code>、<code>session_id</code>、<code>max_thinking_tokens</code>、<code>reasoning_effort</code>、<code>model_info</code>、<code>use_responses_api</code>。函数本身不写入任何 <code>self</code> 状态；其产出会被 <code>__init__</code> 用来赋给 <code>self._llm</code>。若后端值不在支持列表内，则抛出带支持项清单的 <code>ValueError</code>。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, llm_backend: LLMBackend | str, model_name: str, temperature: float | None, collect_rollout_details: bool, llm_kwargs: dict | None, api_base: str | None, session_id: str | None, max_thinking_tokens: int | None, reasoning_effort: str | None, model_info: dict | None, use_responses_api: bool) -&gt; BaseLLM</code></p>
+<ul><li>参数: <code>llm_backend</code>: <code>LLMBackend | str</code> — 后端选择器；既接受枚举值也接受字符串值，用于决定实例化 <code>LiteLLM</code> 还是 <code>TinkerLLM</code>; <code>model_name</code>: <code>str</code> — 传给具体 LLM 构造器的模型标识; <code>temperature</code>: <code>float | None</code> — 显式配置的采样温度；仅在非 <code>None</code> 时并入构造参数; <code>collect_rollout_details</code>: <code>bool</code> — 是否收集 token id / logprob 等 rollout 细节，向各后端透传; <code>llm_kwargs</code>: <code>dict | None</code> — 调用方提供的通用后端构造参数，会先复制再补充专门字段; <code>api_base</code>: <code>str | None</code> — LiteLLM 分支的 API 基址; <code>session_id</code>: <code>str | None</code> — LiteLLM 分支的会话标识; <code>max_thinking_tokens</code>: <code>int | None</code> — LiteLLM 扩展 thinking 配额控制; <code>reasoning_effort</code>: <code>str | None</code> — LiteLLM 推理强度等级; <code>model_info</code>: <code>dict | None</code> — LiteLLM 自定义模型信息字典；通常来自兄弟函数 <code>_resolve_model_info</code> 的结果; <code>use_responses_api</code>: <code>bool</code> — LiteLLM 是否改走 Responses API</li><li>返回: 返回一个已初始化的 <code>BaseLLM</code> 兼容对象：当后端为 <code>litelm</code> 时返回 <code>LiteLLM</code>，当后端为 <code>tinker</code> 时返回 <code>TinkerLLM</code>。</li><li>副作用: 无 <code>self</code> 状态写入; 在 <code>tinker</code> 分支发生一次延迟导入：<code>from harbor.llms.tinker import TinkerLLM</code>; 非法后端时抛出 <code>ValueError</code> 终止初始化流程</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先把 <code>llm_backend</code> 规范化为可匹配的字符串 <code>backend_value</code>：若传入的是 <code>LLMBackend</code> 枚举，则取其 <code>.value</code>，否则直接使用原字符串。</li><li>基于 <code>llm_kwargs or {}</code> 构造一份新的 <code>constructor_kwargs</code>，避免直接复用调用方传入字典；若 <code>temperature is not None</code>，再把 <code>temperature</code> 显式并入该字典。</li><li>进入 <code>match backend_value</code> 分派：当值等于 <code>LLMBackend.LITELLM.value</code> 时，实例化并返回 <code>LiteLLM</code>，同时传入 LiteLLM 专属参数 <code>api_base</code>、<code>session_id</code>、<code>max_thinking_tokens</code>、<code>reasoning_effort</code>、<code>model_info</code>、<code>use_responses_api</code>，以及通用的 <code>model_name</code>、<code>collect_rollout_details</code> 和展开后的 <code>constructor_kwargs</code>。</li><li>当值等于 <code>LLMBackend.TINKER.value</code> 时，先在分支内延迟导入 <code>TinkerLLM</code>，再用 <code>model_name</code>、<code>collect_rollout_details</code> 和 <code>constructor_kwargs</code> 实例化并返回。</li><li>若 <code>backend_value</code> 不匹配任何已知分支，则抛出 <code>ValueError</code>；错误消息同时包含原始 <code>llm_backend</code> 表示值和 <code>[b.value for b in LLMBackend]</code> 生成的支持后端列表。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _init_llm(
+        self,
+        llm_backend: LLMBackend | str,
+        model_name: str,
+        temperature: float | None,
+        collect_rollout_details: bool,
+        llm_kwargs: dict | None,
+        # LiteLLM-specific args
+        api_base: str | None,
+        session_id: str | None,
+        max_thinking_tokens: int | None,
+        reasoning_effort: str | None,
+        model_info: dict | None,
+        use_responses_api: bool,
+    ) -&gt; BaseLLM:
+        """Initialize the LLM backend based on llm_backend parameter.
+
+        Args:
+            llm_backend: The LLM backend to use.
+            model_name: Name of the model.
+            temperature: Sampling temperature, if explicitly configured.
+            collect_rollout_details: Whether to collect token IDs and logprobs.
+            llm_kwargs: Additional kwargs passed to the LLM constructor.
+            api_base: Base URL for LiteLLM API endpoint.
+            session_id: Session ID for LiteLLM.
+            max_thinking_tokens: Max thinking tokens for LiteLLM extended thinking.
+            reasoning_effort: Reasoning effort level for LiteLLM.
+            model_info: Model info dict for LiteLLM custom models.
+            use_responses_api: Whether to use the Responses API.
+
+        Returns:
+            An initialized LLM instance.
+
+        Raises:
+            ValueError: If llm_backend is not a recognized backend.
+        """
+        # Normalize enum to string value for matching
+        backend_value = (
+            llm_backend.value if isinstance(llm_backend, LLMBackend) else llm_backend
+        )
+        constructor_kwargs = dict(llm_kwargs or {})
+        if temperature is not None:
+            constructor_kwargs["temperature"] = temperature
+
+        match backend_value:
+            case LLMBackend.LITELLM.value:
+                return LiteLLM(
+                    model_name=model_name,
+                    api_base=api_base,
+                    collect_rollout_details=collect_rollout_details,
+                    session_id=session_id,
+                    max_thinking_tokens=max_thinking_tokens,
+                    reasoning_effort=reasoning_effort,
+                    model_info=model_info,
+                    use_responses_api=use_responses_api,
+                    **constructor_kwargs,
+                )
+            case LLMBackend.TINKER.value:
+                from harbor.llms.tinker import TinkerLLM
+
+                return TinkerLLM(
+                    model_name=model_name,
+                    collect_rollout_details=collect_rollout_details,
+                    **constructor_kwargs,
+                )
+            case _:
+                raise ValueError(
+                    f"Unknown llm_backend: {llm_backend!r}. "
+                    f"Supported backends: {[b.value for b in LLMBackend]}"
+                )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>该函数同时接受 <code>LLMBackend</code> 枚举和裸字符串，并在开头统一折叠到 <code>backend_value</code>。这样调用方可以保留更宽松的配置入口，而后续匹配逻辑只需处理一种比较形式；若不先规范化，<code>match</code> 分支就必须同时覆盖枚举对象与字符串两套形态。</li><li><code>constructor_kwargs = dict(llm_kwargs or {})</code> 体现的是“复制后增强”而非“原地修改”。这避免了把 <code>temperature</code> 等补充参数回写到调用方持有的原始字典里，使 <code>_init_llm</code> 保持纯构造语义。</li><li>对 <code>temperature</code> 使用显式 <code>is not None</code> 检查，而不是泛真值判断。这保证了像 <code>0</code> 这样的合法配置不会被误判为缺省值，从而能够被真实传入后端构造器。</li><li><code>TinkerLLM</code> 放在对应分支里延迟导入，说明该依赖只在选择 tinker 后端时才需要解析。这样可以减少无关后端的导入负担，也避免在未使用 tinker 时因为缺少相关依赖而过早失败。</li><li>未知后端不是静默回退，而是立即抛出附带支持项列表的 <code>ValueError</code>。这一取舍把配置错误暴露在初始化阶段，避免实例进入半初始化状态；同时错误信息直接给出合法候选值，降低排查成本。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2.__init__：在实例初始化时调用本函数并把结果写入 <code>self._llm</code></li><li><strong>核心被调用</strong>: LiteLLM(...); harbor.llms.tinker.TinkerLLM(...); LLMBackend 枚举值比较; ValueError(...)</li><li><strong>配置/状态来源</strong>: 来自 <code>Terminus2.__init__</code> 形参的 <code>llm_backend</code> 配置; 来自 <code>Terminus2.__init__</code> 形参的 <code>model_name</code> 与 <code>temperature</code>; 来自 <code>Terminus2.__init__</code> 形参的 <code>collect_rollout_details</code> 与 <code>llm_kwargs</code>; 来自 <code>_resolve_model_info</code> 产出的 <code>model_info</code>，再经 <code>__init__</code> 传入本函数; 来自 <code>Terminus2.__init__</code> 形参的 LiteLLM 专属设置：<code>api_base</code>、<code>session_id</code>、<code>max_thinking_tokens</code>、<code>reasoning_effort</code>、<code>use_responses_api</code></li><li><strong>结果去向</strong>: <code>Terminus2.__init__</code> 的 <code>self._llm</code> 字段初始化; 后续 stage 中所有经 <code>self._llm</code> 发起的模型请求路径; 与 <code>_get_parser</code> 并列，作为 agent 运行时依赖装配的一部分</li><li><strong>同类 sibling</strong>: Terminus2.__init__：负责汇总用户配置并消费本函数返回值; Terminus2._resolve_model_info：先决定 <code>model_info</code>，再把结果提供给本函数中的 LiteLLM 分支</li></ul></div></details><details class="file" id="fn-terminus2_get_parser"><summary><span class="chev"></span><code class="fpath">Terminus2._get_parser</code><a class="fn-range" href="../code/terminus_2.py.html#L375-L384" title="terminus_2.py:375-384">terminus_2.py:375–384 ↗</a></summary><div class="file-body"><p class="fn-sub">按解析器名称分派解析实例</p>
+<blockquote><p><strong>stage 上下文</strong>: 该单元位于配置固化阶段中，职责很窄：把实例上已有的 <code>self._parser_name</code> 解释为一个具体解析器对象。触发条件从函数体本身只能确认是“当外部代码调用 <code>_get_parser()</code> 时”。与同 stage 的 <code>_resolve_model_info</code>、<code>_init_llm</code> 类似，它本身不写入实例状态，而是返回一个供外部继续使用的组件对象。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数 <code>_get_parser</code> 读取 <code>self._parser_name</code>，仅支持两种取值：<code>"json"</code> 与 <code>"xml"</code>。当值分别匹配时，它返回一个新建的 <code>TerminusJSONPlainParser()</code> 或 <code>TerminusXMLPlainParser()</code> 实例；除此之外不产生任何状态写入。若配置值不在这两个分支内，则立即抛出 <code>ValueError</code>，并在错误信息中直接列出允许值。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self)</code></p>
+<ul><li>参数: <code>self</code>: <code>Terminus2</code> — 提供实例配置状态，函数仅从中读取 <code>self._parser_name</code></li><li>读状态: <code>self._parser_name</code></li><li>返回: 返回一个新建的解析器实例：当 <code>self._parser_name == "json"</code> 时返回 <code>TerminusJSONPlainParser()</code>；当 <code>self._parser_name == "xml"</code> 时返回 <code>TerminusXMLPlainParser()</code>；若两者都不是，则不返回而是抛出 <code>ValueError("Unknown parser_name: {self._parser_name}. Use 'json' or 'xml'.")</code>。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先读取实例字段 <code>self._parser_name</code>，判断其是否等于字符串 <code>"json"</code>。</li><li>若为 <code>"json"</code>，立即构造并返回一个新的 <code>TerminusJSONPlainParser()</code> 实例。</li><li>否则继续判断 <code>self._parser_name</code> 是否等于字符串 <code>"xml"</code>。</li><li>若为 <code>"xml"</code>，立即构造并返回一个新的 <code>TerminusXMLPlainParser()</code> 实例。</li><li>若前述两个分支都不匹配，则进入 <code>else</code>，抛出 <code>ValueError</code>；错误文本会插入当前的 <code>self._parser_name</code>，并明确提示只允许 <code>'json'</code> 或 <code>'xml'</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _get_parser(self):
+        """Return the appropriate parser instance for this format."""
+        if self._parser_name == "json":
+            return TerminusJSONPlainParser()
+        elif self._parser_name == "xml":
+            return TerminusXMLPlainParser()
+        else:
+            raise ValueError(
+                f"Unknown parser_name: {self._parser_name}. Use 'json' or 'xml'."
+            )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>代码采用封闭式二选一分派，而不是默认回退到某个解析器；这样未识别配置会被 <code>ValueError</code> 立刻拒绝，不会静默降级。</li><li>异常消息不是泛泛报错，而是把实际收到的 <code>self._parser_name</code> 与允许值 <code>'json'</code>、<code>'xml'</code> 一并写出，便于直接定位配置错误。</li><li>两个成功分支都通过直接调用类构造器返回新对象，说明该函数选择“每次调用新建实例”，而不是复用共享单例。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未知外部调用方：源码片段本身未显示谁调用 <code>_get_parser</code></li><li><strong>核心被调用</strong>: TerminusJSONPlainParser(); TerminusXMLPlainParser(); ValueError(...)</li><li><strong>配置/状态来源</strong>: self._parser_name</li><li><strong>结果去向</strong>: 返回给 <code>_get_parser</code> 的直接调用者; 异常路径返回给调用栈上的错误处理方</li><li><strong>同类 sibling</strong>: Terminus2._resolve_model_info：同样是读取输入/状态后返回结果，本体不写实例字段; Terminus2._init_llm：同样承担组件选择/构造职责，但 <code>_get_parser</code> 的分派集合更小且只依赖 <code>self._parser_name</code></li></ul></div></details><details class="file" id="fn-terminus2_get_prompt_template_path"><summary><span class="chev"></span><code class="fpath">Terminus2._get_prompt_template_path</code><a class="fn-range" href="../code/terminus_2.py.html#L386-L395" title="terminus_2.py:386-395">terminus_2.py:386–395 ↗</a></summary><div class="file-body"><p class="fn-sub">按解析器名选择 prompt 模板路径</p>
+<blockquote><p><strong>stage 上下文</strong>: 该单元是一个纯查询式辅助函数：根据当前 <code>self._parser_name</code> 计算模板文件路径。它本身不写入实例状态，只在当前模块目录下的 <code>templates</code> 子目录中二选一返回文件路径；若配置值不受支持，则立即报错。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数 <code>_get_prompt_template_path</code> 读取 <code>self._parser_name</code>，并基于模块文件位置 <code>__file__</code> 组装对应 prompt 模板的 <code>Path</code>。当解析器名为 <code>"json"</code> 时返回 <code>terminus-json-plain.txt</code>，为 <code>"xml"</code> 时返回 <code>terminus-xml-plain.txt</code>。除返回值外无其他产出；若取值不是这两者，则抛出 <code>ValueError</code>。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self) -&gt; Path</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 提供实例配置字段 <code>self._parser_name</code>; <code>__file__</code>: <code>str</code> — 当前模块文件路径；经 <code>Path(__file__).parent</code> 作为模板目录定位基准</li><li>读状态: <code>self._parser_name</code>, <code>__file__</code></li><li>返回: 返回一个 <code>pathlib.Path</code>，其共同模式为 <code>Path(__file__).parent / "templates" / &lt;filename&gt;</code>；当 <code>self._parser_name</code> 不为 <code>json</code> 或 <code>xml</code> 时改为抛出 <code>ValueError</code>。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先读取 <code>self._parser_name</code> 并判断是否等于字符串 <code>"json"</code>。</li><li>若为 <code>"json"</code>，返回 <code>Path(__file__).parent / "templates" / "terminus-json-plain.txt"</code>。</li><li>否则继续判断 <code>self._parser_name</code> 是否等于字符串 <code>"xml"</code>。</li><li>若为 <code>"xml"</code>，返回 <code>Path(__file__).parent / "templates" / "terminus-xml-plain.txt"</code>。</li><li>若上述两种取值都不匹配，则抛出 <code>ValueError</code>；异常消息同时包含实际值 <code>self._parser_name</code> 与允许值 <code>"json"</code>、<code>"xml"</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _get_prompt_template_path(self) -&gt; Path:
+        """Return the path to the prompt template for this format."""
+        if self._parser_name == "json":
+            return Path(__file__).parent / "templates" / "terminus-json-plain.txt"
+        elif self._parser_name == "xml":
+            return Path(__file__).parent / "templates" / "terminus-xml-plain.txt"
+        else:
+            raise ValueError(
+                f"Unknown parser_name: {self._parser_name}. Use 'json' or 'xml'."
+            )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>模板路径采用 <code>Path(__file__).parent</code> 作为基准，而不是依赖外部传入目录；这使查找位置固定为当前模块旁的 <code>templates</code> 子目录。</li><li>成功分支只接受两种显式字符串：<code>"json"</code> 与 <code>"xml"</code>；代码没有默认回退模板，未知取值会直接失败。</li><li>异常信息不是泛化报错，而是把非法的 <code>self._parser_name</code> 实际值嵌入消息，并明确给出可用选项 <code>Use 'json' or 'xml'.</code>，便于定位配置错误。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未知；给定源码片段未显示调用点</li><li><strong>核心被调用</strong>: Path(__file__)</li><li><strong>配置/状态来源</strong>: self._parser_name; __file__</li><li><strong>结果去向</strong>: 函数调用方接收返回的 <code>Path</code>; 异常路径下由调用方接收 <code>ValueError</code></li></ul></div></details><details class="file" id="fn-terminus2_get_timeout_template_path"><summary><span class="chev"></span><code class="fpath">Terminus2._get_timeout_template_path</code><a class="fn-range" href="../code/terminus_2.py.html#L397-L399" title="terminus_2.py:397-399">terminus_2.py:397–399 ↗</a></summary><div class="file-body"><p class="fn-sub">超时模板路径构造器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数本体只证明一件事：基于当前源码文件位置构造一个固定模板路径并返回。它不读取任何 <code>self</code> 实例状态，也不执行文件存在性检查或内容加载。就可见代码而言，它是一个纯路径定位辅助函数。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数 <code>_get_timeout_template_path</code> 接收 <code>self</code>，但函数体并未使用任何实例字段。它直接返回表达式 <code>Path(__file__).parent / "templates" / "timeout.txt"</code> 生成的 <code>Path</code> 对象。除该返回值外无其他产出，也不会修改对象状态。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self: Terminus2) -&gt; Path</code></p>
+<ul><li>参数: <code>self</code>: <code>Terminus2</code> — 方法接收者；在此函数体内未被读取</li><li>返回: 返回精确由 <code>Path(__file__).parent / "templates" / "timeout.txt"</code> 构造出的 <code>Path</code>；不读取文件、不验证路径是否存在。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>调用 <code>Path(__file__)</code> 取得当前模块源码文件对应的路径对象。</li><li>取其 <code>.parent</code> 作为基目录，并依次拼接子路径 <code>"templates"</code> 与 <code>"timeout.txt"</code>。</li><li>返回得到的 <code>Path</code> 对象作为超时模板文件路径。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _get_timeout_template_path(self) -&gt; Path:
+        """Return the path to the timeout template for this format."""
+        return Path(__file__).parent / "templates" / "timeout.txt"</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>路径锚定在 <code>__file__</code> 所在目录，而不是当前工作目录或实例配置；这一选择使返回值仅由模块物理位置决定。</li><li>函数只负责构造路径，不在此处检查文件是否存在、是否可读，因而职责被限定为定位而非验证。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未在该函数体内体现；外部任意需要超时模板路径的调用点</li><li><strong>核心被调用</strong>: pathlib.Path; Path.parent; Path.__truediv__</li><li><strong>配置/状态来源</strong>: __file__ 模块级文件路径常量</li><li><strong>结果去向</strong>: 返回给调用方作为 <code>templates/timeout.txt</code> 的路径值</li></ul></div></details><nav class="pn"><span></span><a class="pn-next" href="stage-2.html"><span>下一阶段 →</span><strong>环境搭建</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

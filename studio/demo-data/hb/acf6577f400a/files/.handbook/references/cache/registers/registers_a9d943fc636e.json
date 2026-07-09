@@ -1,0 +1,770 @@
+[
+  {
+    "id": "reg-process-environment",
+    "semantics": "The process-wide environment and argv/arg0-derived launch context that is sanitized, augmented, and then reused by later startup and runtime code.",
+    "stages": [
+      "stage-1",
+      "stage-2",
+      "stage-3",
+      "stage-5",
+      "stage-8",
+      "stage-19"
+    ]
+  },
+  {
+    "id": "reg-codex-home-install-context",
+    "semantics": "The discovered installation layout, CODEX_HOME location, bundled assets, helper binaries, and machine-local installation facts shared across startup and maintenance flows.",
+    "stages": [
+      "stage-3",
+      "stage-4",
+      "stage-6",
+      "stage-7",
+      "stage-8",
+      "stage-17",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-helper-binaries-materialization",
+    "semantics": "The versioned shared helper-binary materialization state under codex_home that later execution and sandbox paths rely on.",
+    "stages": [
+      "stage-3",
+      "stage-4",
+      "stage-8",
+      "stage-14"
+    ]
+  },
+  {
+    "id": "reg-shell-environment-snapshot",
+    "semantics": "The captured shell snapshot and validated execution-environment objects used to reproduce local or remote command environments across sessions and executors.",
+    "stages": [
+      "stage-3",
+      "stage-9",
+      "stage-11",
+      "stage-14"
+    ]
+  },
+  {
+    "id": "reg-host-platform-facts",
+    "semantics": "Normalized host identity and platform probe results such as hostname, shell, locale, editor, pager, and cloud-environment facts reused by diagnostics and runtime decisions.",
+    "stages": [
+      "stage-3",
+      "stage-9",
+      "stage-12",
+      "stage-13",
+      "stage-20"
+    ]
+  },
+  {
+    "id": "reg-effective-config",
+    "semantics": "The merged, validated effective configuration assembled from managed, cloud, user, project, thread, and CLI layers with provenance.",
+    "stages": [
+      "stage-1",
+      "stage-4",
+      "stage-5",
+      "stage-7",
+      "stage-8",
+      "stage-9",
+      "stage-11",
+      "stage-12",
+      "stage-14"
+    ]
+  },
+  {
+    "id": "reg-feature-flags",
+    "semantics": "The resolved experimental-feature and startup feature-enablement state that gates runtime behavior and can be surfaced or updated through server APIs.",
+    "stages": [
+      "stage-4",
+      "stage-8",
+      "stage-10",
+      "stage-20"
+    ]
+  },
+  {
+    "id": "reg-permission-policy",
+    "semantics": "The compiled permission profiles, sandbox mode, filesystem/network ACLs, and related enforcement policy shared by sessions, tools, and transports.",
+    "stages": [
+      "stage-4",
+      "stage-8",
+      "stage-11",
+      "stage-12",
+      "stage-14",
+      "stage-19"
+    ]
+  },
+  {
+    "id": "reg-tool-catalog",
+    "semantics": "The runtime-visible catalog of executable tools and their normalized schemas, exposure rules, and metadata used for dispatch and prompt assembly.",
+    "stages": [
+      "stage-4",
+      "stage-10",
+      "stage-12",
+      "stage-13",
+      "stage-14"
+    ]
+  },
+  {
+    "id": "reg-plugin-and-skill-catalog",
+    "semantics": "The resolved plugin, marketplace, hook, and skill configuration plus loaded skill/plugin metadata shared across startup, prompt assembly, and execution.",
+    "stages": [
+      "stage-4",
+      "stage-7",
+      "stage-11",
+      "stage-12",
+      "stage-14",
+      "stage-15",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-mcp-server-catalog",
+    "semantics": "The materialized MCP declarations, runtime server metadata, and contribution overlays used for connection setup, routing, and prompt/tool exposure.",
+    "stages": [
+      "stage-4",
+      "stage-7",
+      "stage-8",
+      "stage-10",
+      "stage-11",
+      "stage-14"
+    ]
+  },
+  {
+    "id": "reg-model-catalog",
+    "semantics": "The merged bundled, cached, local-provider, and remotely fetched model inventory and presets used for picker, routing, and turn execution.",
+    "stages": [
+      "stage-4",
+      "stage-7",
+      "stage-9",
+      "stage-11",
+      "stage-12",
+      "stage-13",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-auth-state",
+    "semantics": "The active authentication mode and loaded credential state selected from storage or environment, including refresh and mode restrictions.",
+    "stages": [
+      "stage-5",
+      "stage-7",
+      "stage-8",
+      "stage-9",
+      "stage-19",
+      "stage-20"
+    ]
+  },
+  {
+    "id": "reg-token-store",
+    "semantics": "The persisted token payloads, JWT/account metadata, and revocation/restore state backing login and whoami behavior.",
+    "stages": [
+      "stage-5",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-installation-identity",
+    "semantics": "The stable per-installation identity used to distinguish this machine/runtime instance across auth, backend, and telemetry flows.",
+    "stages": [
+      "stage-5",
+      "stage-7",
+      "stage-13",
+      "stage-20"
+    ]
+  },
+  {
+    "id": "reg-sandbox-user-credentials",
+    "semantics": "The Windows sandbox local-account and protected-credential state used to run isolated commands safely.",
+    "stages": [
+      "stage-5",
+      "stage-14",
+      "stage-20",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-state-runtime",
+    "semantics": "The shared SQLite-backed runtime handle and opened databases that provide durable local state services to higher layers.",
+    "stages": [
+      "stage-6",
+      "stage-8",
+      "stage-11",
+      "stage-16",
+      "stage-20",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-rollout-and-thread-store",
+    "semantics": "The durable rollout transcript and thread-store persistence layer used for resume, reconstruction, metadata sync, archive, and repair.",
+    "stages": [
+      "stage-6",
+      "stage-11",
+      "stage-16",
+      "stage-17",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-thread-metadata-index",
+    "semantics": "The structured thread metadata, reconciliation, spawn-edge, and listing state maintained in SQLite for thread ownership and browsing.",
+    "stages": [
+      "stage-6",
+      "stage-11",
+      "stage-15",
+      "stage-16",
+      "stage-17",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-cloud-config-cache",
+    "semantics": "The cached and refreshable cloud-configuration bundle state used to hydrate startup policy and remote-backed settings.",
+    "stages": [
+      "stage-4",
+      "stage-7",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-connector-catalog",
+    "semantics": "The refreshed connector/app directory and workspace enablement state that determines which integrations are visible and usable.",
+    "stages": [
+      "stage-7",
+      "stage-11",
+      "stage-12",
+      "stage-14",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-rate-limit-account-snapshot",
+    "semantics": "The current account, plan, usage, and rate-limit snapshot fetched from backends and replayed into UI and reconnecting clients.",
+    "stages": [
+      "stage-7",
+      "stage-13",
+      "stage-16",
+      "stage-20"
+    ]
+  },
+  {
+    "id": "reg-update-metadata",
+    "semantics": "The cached release/update availability state used by doctor, TUI startup, and daemon-managed updater flows.",
+    "stages": [
+      "stage-7",
+      "stage-9",
+      "stage-17",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-app-server-connections",
+    "semantics": "The live app-server transport/listener/connection registry and per-connection routing state that all RPC handling depends on.",
+    "stages": [
+      "stage-8",
+      "stage-10",
+      "stage-16",
+      "stage-17"
+    ]
+  },
+  {
+    "id": "reg-remote-control-state",
+    "semantics": "The persisted and live remote-control desired state, pairing/enrollment records, and reconnecting remote-session state.",
+    "stages": [
+      "stage-8",
+      "stage-10",
+      "stage-17",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-exec-server-runtime",
+    "semantics": "The exec-server listener, client, process-control, and environment-discovery runtime state shared across request processing and execution.",
+    "stages": [
+      "stage-8",
+      "stage-10",
+      "stage-14",
+      "stage-19"
+    ]
+  },
+  {
+    "id": "reg-mcp-runtime-connections",
+    "semantics": "The live MCP runtime sessions and transport connections maintained for tool routing and integration access.",
+    "stages": [
+      "stage-8",
+      "stage-10",
+      "stage-14",
+      "stage-19"
+    ]
+  },
+  {
+    "id": "reg-frontend-session-ui-state",
+    "semantics": "The user-facing frontend session state including startup decisions, terminal ownership, visible chat/transcript state, and loaded thread view.",
+    "stages": [
+      "stage-9",
+      "stage-10",
+      "stage-16"
+    ]
+  },
+  {
+    "id": "reg-live-thread-registry",
+    "semantics": "The in-memory registry of active threads and reconstructed thread runtimes that stabilizes ownership across resumes, forks, and UI switching.",
+    "stages": [
+      "stage-10",
+      "stage-11",
+      "stage-15",
+      "stage-16",
+      "stage-17"
+    ]
+  },
+  {
+    "id": "reg-live-session-object",
+    "semantics": "The long-lived session object and shared services that own turn submission, event delivery, approvals, persistence, and runtime configuration.",
+    "stages": [
+      "stage-10",
+      "stage-11",
+      "stage-12",
+      "stage-13",
+      "stage-14",
+      "stage-15",
+      "stage-16"
+    ]
+  },
+  {
+    "id": "reg-session-state",
+    "semantics": "The mutable session-wide state that survives across turns, including conversation history, token/rate-limit accounting, connector selections, and sticky grants.",
+    "stages": [
+      "stage-11",
+      "stage-12",
+      "stage-13",
+      "stage-14",
+      "stage-16"
+    ]
+  },
+  {
+    "id": "reg-turn-state",
+    "semantics": "The mutable active-turn coordination state including pending approvals, waiters, mailbox-delivery phase, and per-turn permission/review flags.",
+    "stages": [
+      "stage-11",
+      "stage-12",
+      "stage-13",
+      "stage-14",
+      "stage-16"
+    ]
+  },
+  {
+    "id": "reg-input-queues",
+    "semantics": "The buffered pending-input and mailbox queues that coordinate user steering, inter-agent delivery, and turn scheduling.",
+    "stages": [
+      "stage-11",
+      "stage-13",
+      "stage-15"
+    ]
+  },
+  {
+    "id": "reg-turn-context-snapshot",
+    "semantics": "The immutable per-turn context snapshot derived from session settings, environments, permissions, model metadata, and runtime services before model calls.",
+    "stages": [
+      "stage-11",
+      "stage-12",
+      "stage-13",
+      "stage-14"
+    ]
+  },
+  {
+    "id": "reg-auto-compact-window",
+    "semantics": "The session-scoped auto-compaction window state that tracks context-growth baselines and rollover across turns and resumptions.",
+    "stages": [
+      "stage-11",
+      "stage-13",
+      "stage-16"
+    ]
+  },
+  {
+    "id": "reg-prompt-context-assembly",
+    "semantics": "The assembled prompt fragments, injected context, normalized history, and final prompt state produced for the current turn.",
+    "stages": [
+      "stage-12",
+      "stage-13"
+    ]
+  },
+  {
+    "id": "reg-approval-state",
+    "semantics": "The live approval/review decision state for guarded actions, including requested, granted, denied, and sticky approval outcomes.",
+    "stages": [
+      "stage-13",
+      "stage-14",
+      "stage-16"
+    ]
+  },
+  {
+    "id": "reg-unified-exec-processes",
+    "semantics": "The tracked process-execution state and exit/failure snapshots for spawned commands and related unified-exec handles.",
+    "stages": [
+      "stage-14",
+      "stage-16",
+      "stage-17"
+    ]
+  },
+  {
+    "id": "reg-agent-registry",
+    "semantics": "The in-memory registry of active agents, spawn reservations, path/nickname allocation, and concurrency/residency limits for multi-agent work.",
+    "stages": [
+      "stage-11",
+      "stage-15",
+      "stage-17"
+    ]
+  },
+  {
+    "id": "reg-agent-job-pipeline",
+    "semantics": "The persisted and live background workflow state for agent-job batches, worker progress, and other longer-lived asynchronous pipelines.",
+    "stages": [
+      "stage-15",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-memory-pipeline-state",
+    "semantics": "The durable and runtime state for memory extraction/consolidation jobs and filesystem-backed memory artifacts.",
+    "stages": [
+      "stage-7",
+      "stage-12",
+      "stage-15",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-thread-projections",
+    "semantics": "The projected user-visible thread state derived from events and persisted records, including item views, statuses, summaries, and replayed token usage.",
+    "stages": [
+      "stage-10",
+      "stage-16"
+    ]
+  },
+  {
+    "id": "reg-connection-shutdown-gates",
+    "semantics": "The per-connection shutdown acceptance flags, running-handler tracking, and cleanup-task registries used for graceful drain and teardown.",
+    "stages": [
+      "stage-10",
+      "stage-17"
+    ]
+  },
+  {
+    "id": "reg-network-transport-policy",
+    "semantics": "The shared outbound networking/proxy/TLS/cookie and local-IPC policy state that governs how clients and transports may connect.",
+    "stages": [
+      "stage-4",
+      "stage-7",
+      "stage-8",
+      "stage-14",
+      "stage-19"
+    ]
+  },
+  {
+    "id": "reg-extension-runtime-state",
+    "semantics": "The host-seeded and extension-owned typed attachment stores that let extensions keep shared runtime state across lifecycle callbacks.",
+    "stages": [
+      "stage-11",
+      "stage-12",
+      "stage-14",
+      "stage-15"
+    ]
+  },
+  {
+    "id": "reg-observability-context",
+    "semantics": "The global tracing/logging/metrics context and stable session-turn-auth-model-tool tags attached to emitted telemetry throughout runtime.",
+    "stages": [
+      "stage-8",
+      "stage-10",
+      "stage-13",
+      "stage-14",
+      "stage-16",
+      "stage-17",
+      "stage-20"
+    ]
+  },
+  {
+    "id": "reg-analytics-pipeline",
+    "semantics": "The in-memory and batched analytics facts/events pipeline that reduces observations into product events and ships or captures them.",
+    "stages": [
+      "stage-13",
+      "stage-14",
+      "stage-16",
+      "stage-20"
+    ]
+  },
+  {
+    "id": "reg-runtime-log-store",
+    "semantics": "The durable runtime log and feedback artifact store used for diagnostics, support capture, and later investigation.",
+    "stages": [
+      "stage-6",
+      "stage-16",
+      "stage-20",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-http-client-connection-pools",
+    "semantics": "Shared outbound HTTP/WebSocket client instances with their connection pools, cookie jars, and retry-capable transport state reused across backend, cloud, and integration calls.",
+    "stages": [
+      "stage-7",
+      "stage-19"
+    ]
+  },
+  {
+    "id": "reg-request-serialization-queues",
+    "semantics": "Per-resource/per-thread ordering queues that serialize conflicting RPC or session requests while allowing unrelated work to proceed concurrently.",
+    "stages": [
+      "stage-10"
+    ]
+  },
+  {
+    "id": "reg-token-budget-state",
+    "semantics": "The live token-budget and remaining-context-window accounting used to shape prompt assembly, compaction decisions, and user-visible budget indicators across turns.",
+    "stages": [
+      "stage-12",
+      "stage-13",
+      "stage-16"
+    ]
+  },
+  {
+    "id": "reg-goals-store",
+    "semantics": "The persisted and live per-thread goal state, including current goals and related structured goal metadata surfaced in sessions and UI.",
+    "stages": [
+      "stage-6",
+      "stage-11",
+      "stage-16",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-skills-watch-state",
+    "semantics": "The background file-watch and invalidation state that monitors skill sources and marks cached skill data stale for later reload.",
+    "stages": [
+      "stage-15"
+    ]
+  },
+  {
+    "id": "reg-startup-refresh-jobs",
+    "semantics": "Background startup refresh tasks and their cached latest results for cloud config, model/catalog sync, plugin snapshots, memories guards, and similar early-runtime hydrators.",
+    "stages": [
+      "stage-7"
+    ]
+  },
+  {
+    "id": "reg-daemon-update-loop-state",
+    "semantics": "The daemon’s long-lived updater loop state, including periodic check scheduling, managed-installer refresh progress, and pending restart/re-exec decisions.",
+    "stages": [
+      "stage-17"
+    ]
+  },
+  {
+    "id": "reg-core-plugin-snapshot-cache",
+    "semantics": "The locally cached curated core-plugin snapshot and shared-plugin path mapping reused across startup sync, plugin resolution, and offline/runtime reads.",
+    "stages": [
+      "stage-7",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-remote-catalog-caches",
+    "semantics": "Persistent local caches for fetched remote catalogs such as connectors, models, and plugin/marketplace metadata that survive restarts and seed startup hydration.",
+    "stages": [
+      "stage-7",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-prewarmed-session-state",
+    "semantics": "The session prewarm/warm-start state prepared ahead of turns and then reused by turn execution to avoid rebuilding expensive session resources.",
+    "stages": [
+      "stage-11",
+      "stage-13"
+    ]
+  },
+  {
+    "id": "reg-feedback-upload-buffer",
+    "semantics": "The queued/redacted feedback submission state, including pending attachments and thread/log references, held until feedback is uploaded or persisted for retry.",
+    "stages": [
+      "stage-16",
+      "stage-20"
+    ]
+  },
+  {
+    "id": "reg-rollout-trace-buffer",
+    "semantics": "The active rollout-tracing capture state that accumulates deterministic execution traces for later replay, export, or debugging.",
+    "stages": [
+      "stage-13",
+      "stage-20"
+    ]
+  },
+  {
+    "id": "reg-backfill-lease-state",
+    "semantics": "The durable coordination/lease state for one-time or resumable metadata backfills and startup repair work that blocks or gates higher-level initialization.",
+    "stages": [
+      "stage-6",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-auth-transport-adapters",
+    "semantics": "The runtime-ready outbound authentication material derived from auth state, such as bearer headers, agent assertions, or SigV4 signing context, reused by backend clients and transports.",
+    "stages": [
+      "stage-5",
+      "stage-7",
+      "stage-19"
+    ]
+  },
+  {
+    "id": "reg-realtime-session-state",
+    "semantics": "The live per-thread realtime conversation/session state, including active start/append/stop lifecycle and associated transport/session bookkeeping.",
+    "stages": [
+      "stage-10",
+      "stage-11",
+      "stage-13"
+    ]
+  },
+  {
+    "id": "reg-command-exec-pty-sessions",
+    "semantics": "The registry of long-lived interactive command/process sessions, including PTY handles, stdin/write channels, resize/terminate control, and streamed output subscribers.",
+    "stages": [
+      "stage-10",
+      "stage-14",
+      "stage-16"
+    ]
+  },
+  {
+    "id": "reg-extension-contribution-cache",
+    "semantics": "The cached resolved outputs of extension contributors—such as prompt fragments, MCP overlays, tool/thread lifecycle contributions, and user instructions—reused across thread and turn assembly.",
+    "stages": [
+      "stage-11",
+      "stage-12",
+      "stage-14"
+    ]
+  },
+  {
+    "id": "reg-import-tracking-state",
+    "semantics": "The persistent record of previously imported external-session sources and their normalized ingestion outcomes used to avoid duplicate imports and support resume/inspection.",
+    "stages": [
+      "stage-16",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-daemon-process-registry",
+    "semantics": "The persisted and live daemon/app-server process-discovery state, including PID files, readiness probes, and launched detached server instances reused across client attach and restart flows.",
+    "stages": [
+      "stage-8",
+      "stage-17"
+    ]
+  },
+  {
+    "id": "reg-connection-pending-initialization",
+    "semantics": "Per-connection initialization/handshake state that gates which RPC methods are allowed before a transport session is fully initialized.",
+    "stages": [
+      "stage-8",
+      "stage-10",
+      "stage-17"
+    ]
+  },
+  {
+    "id": "reg-listener-subscriptions",
+    "semantics": "The per-thread and per-connection listener/subscription registry that tracks who is watching which thread or process streams for ordered notifications.",
+    "stages": [
+      "stage-8",
+      "stage-10",
+      "stage-16",
+      "stage-17"
+    ]
+  },
+  {
+    "id": "reg-shell-command-cache",
+    "semantics": "The session-visible cache of user-run shell command records and approved command-prefix memory that is reused for prompt context and later turns.",
+    "stages": [
+      "stage-11",
+      "stage-12",
+      "stage-16"
+    ]
+  },
+  {
+    "id": "reg-connector-selection-state",
+    "semantics": "The mutable per-session or per-thread selection/enablement state for which connectors/apps are currently chosen for use and prompt injection.",
+    "stages": [
+      "stage-11",
+      "stage-12",
+      "stage-14",
+      "stage-16"
+    ]
+  },
+  {
+    "id": "reg-tool-runtime-concurrency",
+    "semantics": "The live concurrency, cancellation, and in-flight execution coordination state for parallel tool calls and other dispatched runtime tasks.",
+    "stages": [
+      "stage-10",
+      "stage-13",
+      "stage-14",
+      "stage-17"
+    ]
+  },
+  {
+    "id": "reg-background-watchers-and-timers",
+    "semantics": "Long-lived watcher/timer task state such as code-mode timers and other runtime background loops that persist across requests until shutdown.",
+    "stages": [
+      "stage-13",
+      "stage-15",
+      "stage-17"
+    ]
+  },
+  {
+    "id": "reg-token-usage-accumulator",
+    "semantics": "The accumulated per-turn and per-thread token-usage accounting buffer that is persisted, replayed to reconnecting clients, and surfaced in UI/account views.",
+    "stages": [
+      "stage-13",
+      "stage-16"
+    ]
+  },
+  {
+    "id": "reg-hook-runtime-state",
+    "semantics": "The runtime hook execution state and recent hook results/notifications used to mediate tool lifecycle events and expose hook summaries to clients.",
+    "stages": [
+      "stage-14",
+      "stage-16"
+    ]
+  },
+  {
+    "id": "reg-memories-startup-guard",
+    "semantics": "The startup and runtime guard state that tracks whether memories functionality is currently allowed, blocked, or degraded based on prerequisite checks.",
+    "stages": [
+      "stage-7",
+      "stage-11",
+      "stage-12",
+      "stage-14"
+    ]
+  },
+  {
+    "id": "reg-message-history-log",
+    "semantics": "The separate append-only global message-history file/state that records cross-session message history outside per-thread rollout storage.",
+    "stages": [
+      "stage-16",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-local-secrets-store",
+    "semantics": "The encrypted local secrets persistence used to retain sensitive integration or runtime secrets across startup and execution flows.",
+    "stages": [
+      "stage-5",
+      "stage-14",
+      "stage-21"
+    ]
+  },
+  {
+    "id": "reg-agent-graph-store",
+    "semantics": "The durable graph of thread spawn relationships and lifecycle edges exposed independently of live thread metadata for agent-tree queries and teardown consistency.",
+    "stages": [
+      "stage-11",
+      "stage-15",
+      "stage-17",
+      "stage-21"
+    ]
+  }
+]

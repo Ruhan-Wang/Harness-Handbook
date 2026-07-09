@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core/src/tasks/regular.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">core/src/tasks/regular.rs</code>
+<span class="code-meta">89 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=k>use</b> std::sync::Arc;</i><i id="L2"></i><i id="L3"><b class=k>use</b> tokio_util::sync::CancellationToken;</i><i id="L4"></i><i id="L5"><b class=k>use</b> <b class=k>crate</b>::session::TurnInput;</i><i id="L6"><b class=k>use</b> <b class=k>crate</b>::session::turn::run_turn;</i><i id="L7"><b class=k>use</b> <b class=k>crate</b>::session::turn_context::TurnContext;</i><i id="L8"><b class=k>use</b> <b class=k>crate</b>::session_startup_prewarm::SessionStartupPrewarmResolution;</i><i id="L9"><b class=k>use</b> <b class=k>crate</b>::state::TaskKind;</i><i id="L10"><b class=k>use</b> codex_protocol::protocol::EventMsg;</i><i id="L11"><b class=k>use</b> codex_protocol::protocol::TurnStartedEvent;</i><i id="L12"><b class=k>use</b> tracing::Instrument;</i><i id="L13"><b class=k>use</b> tracing::trace_span;</i><i id="L14"></i><i id="L15"><b class=k>use</b> <b class=k>super</b>::SessionTask;</i><i id="L16"><b class=k>use</b> <b class=k>super</b>::SessionTaskContext;</i><i id="L17"></i><i id="L18"><b class=m>#[derive(Default)]</b></i><i id="L19"><b class=k>pub</b>(<b class=k>crate</b>) <b class=k>struct</b> RegularTask;</i><i id="L20"></i><i id="L21"><b class=k>impl</b> RegularTask {</i><i id="L22">    <b class=k>pub</b>(<b class=k>crate</b>) <b class=k>fn</b> new() -&gt; <b class=k>Self</b> {</i><i id="L23">        <b class=k>Self</b></i><i id="L24">    }</i><i id="L25">}</i><i id="L26"></i><i id="L27"><b class=k>impl</b> SessionTask <b class=k>for</b> RegularTask {</i><i id="L28">    <b class=k>fn</b> kind(&amp;<b class=k>self</b>) -&gt; TaskKind {</i><i id="L29">        TaskKind::Regular</i><i id="L30">    }</i><i id="L31"></i><i id="L32">    <b class=k>fn</b> span_name(&amp;<b class=k>self</b>) -&gt; &amp;<b class=m>'static</b> str {</i><i id="L33">        <b class=s>"session_task.turn"</b></i><i id="L34">    }</i><i id="L35"></i><i id="L36">    <b class=k>async</b> <b class=k>fn</b> run(</i><i id="L37">        <b class=k>self</b>: Arc&lt;<b class=k>Self</b>&gt;,</i><i id="L38">        session: Arc&lt;SessionTaskContext&gt;,</i><i id="L39">        ctx: Arc&lt;TurnContext&gt;,</i><i id="L40">        input: Vec&lt;TurnInput&gt;,</i><i id="L41">        cancellation_token: CancellationToken,</i><i id="L42">    ) -&gt; Option&lt;String&gt; {</i><i id="L43">        <b class=k>let</b> sess = session.clone_session();</i><i id="L44">        <b class=k>let</b> turn_extension_data = session.turn_extension_data();</i><i id="L45">        <b class=k>let</b> run_turn_span = <b class=m>trace_span!</b>(<b class=s>"run_turn"</b>);</i><i id="L46">        <b class=c>// Regular turns emit `TurnStarted` inline so first-turn lifecycle does</b></i><i id="L47">        <b class=c>// not wait on startup prewarm resolution.</b></i><i id="L48">        <b class=k>let</b> prewarmed_client_session = <b class=k>async</b> {</i><i id="L49">            <b class=k>let</b> event = EventMsg::TurnStarted(TurnStartedEvent {</i><i id="L50">                turn_id: ctx.sub_id.clone(),</i><i id="L51">                trace_id: ctx.trace_id.clone(),</i><i id="L52">                started_at: ctx.turn_timing_state.started_at_unix_secs().<b class=k>await</b>,</i><i id="L53">                model_context_window: ctx.model_context_window(),</i><i id="L54">                collaboration_mode_kind: ctx.collaboration_mode.mode,</i><i id="L55">            });</i><i id="L56">            sess.send_event(ctx.as_ref(), event).<b class=k>await</b>;</i><i id="L57">            sess.set_server_reasoning_included(<b class=c>/*included*/</b> <b class=k>false</b>).<b class=k>await</b>;</i><i id="L58">            sess.consume_startup_prewarm_for_regular_turn(&amp;cancellation_token)</i><i id="L59">                .<b class=k>await</b></i><i id="L60">        }</i><i id="L61">        .instrument(<b class=m>trace_span!</b>(<b class=s>"regular_task.prepare_run_turn"</b>))</i><i id="L62">        .<b class=k>await</b>;</i><i id="L63">        <b class=k>let</b> prewarmed_client_session = <b class=k>match</b> prewarmed_client_session {</i><i id="L64">            SessionStartupPrewarmResolution::Cancelled =&gt; <b class=k>return</b> None,</i><i id="L65">            SessionStartupPrewarmResolution::Unavailable { .. } =&gt; None,</i><i id="L66">            SessionStartupPrewarmResolution::Ready(prewarmed_client_session) =&gt; {</i><i id="L67">                Some(*prewarmed_client_session)</i><i id="L68">            }</i><i id="L69">        };</i><i id="L70">        <b class=k>let</b> <b class=k>mut</b> next_input = input;</i><i id="L71">        <b class=k>let</b> <b class=k>mut</b> prewarmed_client_session = prewarmed_client_session;</i><i id="L72">        <b class=k>loop</b> {</i><i id="L73">            <b class=k>let</b> last_agent_message = run_turn(</i><i id="L74">                Arc::clone(&amp;sess),</i><i id="L75">                Arc::clone(&amp;ctx),</i><i id="L76">                Arc::clone(&amp;turn_extension_data),</i><i id="L77">                next_input,</i><i id="L78">                prewarmed_client_session.take(),</i><i id="L79">                cancellation_token.child_token(),</i><i id="L80">            )</i><i id="L81">            .instrument(run_turn_span.clone())</i><i id="L82">            .<b class=k>await</b>;</i><i id="L83">            <b class=k>if</b> !sess.input_queue.has_pending_input(&amp;sess.active_turn).<b class=k>await</b> {</i><i id="L84">                <b class=k>return</b> last_agent_message;</i><i id="L85">            }</i><i id="L86">            next_input = Vec::new();</i><i id="L87">        }</i><i id="L88">    }</i><i id="L89">}</i></pre></div>
+</main>
+<script src="../../../../assets/app.js"></script>
+</body>
+</html>

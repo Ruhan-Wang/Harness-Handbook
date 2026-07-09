@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Standalone light-theme export. Generated from the theme-aware version in script.js — keep in sync. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 358" role="img" aria-label="BGPD narrows a request through stages and units to L3 behavior-unit evidence and an edit plan">
+<style>text{font-family:Inter,"Source Sans 3",system-ui,sans-serif}</style>
+  <text x="20" y="40" font-size="11" font-weight="650" fill="#8d887e" letter-spacing=".1em">1 · REQUEST</text>
+  <text x="220" y="40" font-size="11" font-weight="650" fill="#8d887e" letter-spacing=".1em">2 · L1 SYSTEM OVERVIEW</text>
+  <text x="430" y="40" font-size="11" font-weight="650" fill="#8d887e" letter-spacing=".1em">3 · L2 UNIT OVERVIEW</text>
+  <text x="640" y="40" font-size="11" font-weight="650" fill="#8d887e" letter-spacing=".1em">4 · L3 UNIT DETAIL</text>
+  <text x="850" y="40" font-size="11" font-weight="650" fill="#8d887e" letter-spacing=".1em">5 · EDIT PLAN</text>
+
+  <!-- 1 · request -->
+  <rect x="20" y="102" width="160" height="88" rx="10" fill="#f9efe3" stroke="color-mix(in srgb, #bd5f16 34%, #e6e2d8)"></rect>
+  <text x="100" y="138" font-size="13" fill="#4a463f" text-anchor="middle" font-style="italic">“Add confirmation</text>
+  <text x="100" y="158" font-size="13" fill="#4a463f" text-anchor="middle" font-style="italic">before delete.”</text>
+
+  <!-- 2 · stages -->
+  <g opacity="0.42">
+        <rect x="220" y="58" width="160" height="30" rx="7" fill="#fdfcfa" stroke="#e6e2d8" stroke-width="1"></rect>
+        <text x="234" y="77.5" font-size="12.5" font-weight="500" fill="#4a463f">input</text>
+      </g><g opacity="1">
+        <rect x="220" y="96" width="160" height="30" rx="7" fill="#eaf1fb" stroke="color-mix(in srgb, #2a78d6 55%, #e6e2d8)" stroke-width="1.4"></rect>
+        <text x="234" y="115.5" font-size="12.5" font-weight="650" fill="#1c5cab">plan</text>
+      </g><g opacity="1">
+        <rect x="220" y="134" width="160" height="30" rx="7" fill="#eaf1fb" stroke="color-mix(in srgb, #2a78d6 55%, #e6e2d8)" stroke-width="1.4"></rect>
+        <text x="234" y="153.5" font-size="12.5" font-weight="650" fill="#1c5cab">act</text>
+      </g><g opacity="0.42">
+        <rect x="220" y="172" width="160" height="30" rx="7" fill="#fdfcfa" stroke="#e6e2d8" stroke-width="1"></rect>
+        <text x="234" y="191.5" font-size="12.5" font-weight="500" fill="#4a463f">observe</text>
+      </g><g opacity="0.42">
+        <rect x="220" y="210" width="160" height="30" rx="7" fill="#fdfcfa" stroke="#e6e2d8" stroke-width="1"></rect>
+        <text x="234" y="229.5" font-size="12.5" font-weight="500" fill="#4a463f">finalize</text>
+      </g>
+
+  <!-- 3 · units -->
+  <g opacity="1">
+        <rect x="430" y="77" width="170" height="30" rx="7" fill="#eaf1fb" stroke="color-mix(in srgb, #2a78d6 55%, #e6e2d8)" stroke-width="1.4"></rect>
+        <text x="444" y="96.5" font-size="12.5" font-weight="650" fill="#1c5cab">Delete guard</text>
+      </g><g opacity="1">
+        <rect x="430" y="115" width="170" height="30" rx="7" fill="#eaf1fb" stroke="color-mix(in srgb, #2a78d6 55%, #e6e2d8)" stroke-width="1.4"></rect>
+        <text x="444" y="134.5" font-size="12.5" font-weight="650" fill="#1c5cab">Prompt rule</text>
+      </g><g opacity="1">
+        <rect x="430" y="153" width="170" height="30" rx="7" fill="#fdfcfa" stroke="#e6e2d8" stroke-width="1"></rect>
+        <text x="444" y="172.5" font-size="12.5" font-weight="500" fill="#4a463f">Tool wrapper</text>
+      </g><g opacity="0.42">
+        <rect x="430" y="191" width="170" height="30" rx="7" fill="#fdfcfa" stroke="#e6e2d8" stroke-width="1"></rect>
+        <text x="444" y="210.5" font-size="12.5" font-weight="500" fill="#4a463f">Fallback path</text>
+      </g>
+
+  <!-- 4 · L3 behavior-unit detail -->
+  <g opacity="1">
+        <rect x="640" y="58" width="170" height="28" rx="7" fill="#eaf1fb" stroke="color-mix(in srgb, #2a78d6 55%, #e6e2d8)" stroke-width="1.4"></rect>
+        <text x="652" y="76.5" font-size="11.3" fill="#1c5cab">Confirm before delete</text>
+      </g><g opacity="1">
+        <rect x="640" y="94" width="170" height="28" rx="7" fill="#eaf1fb" stroke="color-mix(in srgb, #2a78d6 55%, #e6e2d8)" stroke-width="1.4"></rect>
+        <text x="652" y="112.5" font-size="11.3" fill="#1c5cab">trigger: delete_file()</text>
+      </g><g opacity="1">
+        <rect x="640" y="130" width="170" height="28" rx="7" fill="#eaf1fb" stroke="color-mix(in srgb, #2a78d6 55%, #e6e2d8)" stroke-width="1.4"></rect>
+        <text x="652" y="148.5" font-size="11.3" fill="#1c5cab">permission: high risk</text>
+      </g><g opacity="1">
+        <rect x="640" y="166" width="170" height="28" rx="7" fill="#fdfcfa" stroke="#e6e2d8" stroke-width="1"></rect>
+        <text x="652" y="184.5" font-size="11.3" fill="#6f6a61">state: confirmation</text>
+      </g><g opacity="0.42">
+        <rect x="640" y="202" width="170" height="28" rx="7" fill="#fdfcfa" stroke="#e6e2d8" stroke-width="1"></rect>
+        <text x="652" y="220.5" font-size="11.3" fill="#6f6a61">evidence: 5 sites</text>
+      </g>
+
+  <!-- 5 · edit plan -->
+  <rect x="850" y="58" width="140" height="150" rx="10" fill="#fdfcfa" stroke="#e6e2d8"></rect>
+  
+      <text x="866" y="92" font-size="14" font-weight="700" fill="#0a700a">+</text>
+      <text x="882" y="91" font-size="11.6" fill="#4a463f">confirm check</text>
+  
+      <text x="866" y="122" font-size="14" font-weight="700" fill="#0a700a">+</text>
+      <text x="882" y="121" font-size="11.6" fill="#4a463f">prompt rule</text>
+  
+      <text x="866" y="152" font-size="14" font-weight="700" fill="#9a4a0b">−</text>
+      <text x="882" y="151" font-size="11.6" fill="#4a463f">direct delete</text>
+  <text x="866" y="190" font-size="11" fill="#6f6a61">scoped, minimal</text>
+
+  <!-- arrows -->
+  <path d="M186 146 H207" stroke="#2a78d6" stroke-width="1.6" fill="none"></path><polygon points="206,141.5 214,146 206,150.5" fill="#2a78d6"></polygon>
+  <path d="M386 146 H417" stroke="#2a78d6" stroke-width="1.6" fill="none"></path><polygon points="416,141.5 424,146 416,150.5" fill="#2a78d6"></polygon>
+  <path d="M606 146 H627" stroke="#2a78d6" stroke-width="1.6" fill="none"></path><polygon points="626,141.5 634,146 626,150.5" fill="#2a78d6"></polygon>
+  <path d="M816 146 H837" stroke="#2a78d6" stroke-width="1.6" fill="none"></path><polygon points="836,141.5 844,146 836,150.5" fill="#2a78d6"></polygon>
+
+  <!-- coarse → fine axis -->
+  <path d="M220 296 H960" stroke="#e6e2d8" stroke-width="1"></path>
+  <polygon points="960,292 968,296 960,300" fill="#8d887e"></polygon>
+  <text x="220" y="320" font-size="12" fill="#6f6a61">coarse — the whole system</text>
+  <text x="968" y="320" font-size="12" fill="#6f6a61" text-anchor="end">fine — one edit</text>
+  <text x="594" y="348" font-size="12.5" fill="#6f6a61" text-anchor="middle" font-style="italic">Each step reveals only what the current decision needs — the repository stays the ground truth.</text>
+</svg>

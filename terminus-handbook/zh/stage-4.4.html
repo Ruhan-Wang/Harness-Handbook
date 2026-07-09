@@ -1,0 +1,1043 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-4.4 · 响应解析</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=zh"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 手册</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=zh" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>返回主页</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>状态流寄存器</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>配置固化</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>环境搭建</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>运行起点</a></div><details class="s-node" open><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>迭代主循环</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>循环入口门控</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>主动摘要探测</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM 调用</a></div><div class="s-leaf"><a class="s-link cur" href="stage-4.4.html"><span class="s-num">4.4</span>响应解析</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>待交接提示 → 用户步骤(或切分)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>错误分支</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>命令执行 → 观察 → 轨迹步骤</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>完成门控与循环控制</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>解析器内部辅助</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>运行收尾</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>录制后处理(外部)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>上下文摘要</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token 与成本核算</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>输出长度限制</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>日志</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux 内部辅助</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">索引</a><span class="sep">›</span><a href="stage-4.html">迭代主循环</a></nav><div class="stage-head"><h1>响应解析</h1><div class="meta"><span class="chip mono">stage-4.4</span><span class="chip">Response Parse</span><span class="chip">16 个函数</span></div></div>
+<h2 class="sec">开场解释</h2>
+<p>这个 Stage 在解决一个很实际的问题：LLM（大模型）刚回来的文本还不能直接驱动 Agent，必须先把它变成“可判定、可执行、可反馈”的结果。它的职责就是把回复拆成三类东西：要不要继续做、要敲什么命令、有没有格式或内容问题。它夹在 LLM Query 之后，是一次“落地检查”。没有它，后面就只能拿着一段自由文本硬猜，系统既不稳，也很难把错误原样喂回给下一轮。</p>
+<h2 class="sec">主流程</h2>
+
+<ol><li>先收下 LLM 的原始回复 <p>入口很简单：上游给来 <code>llm_response.content</code>，也就是模型吐出的整段文本。 这一段文本可能是 JSON，也可能是 XML，格式由构造时选好的 parser（解析器）决定。解析器就是“把模型文本翻成结构化结果”的小部件。</p></li><li>把自由文本拆成结构化结果 <p><code>parse_response()</code>（把 LLM 文本解析成统一的 <code>ParseResult</code>）是这一步的核心。 它产出六类信息：</p>
+<ul><li><code>commands</code>：模型要 Agent 去敲的命令 </li><li><code>is_task_complete</code>：模型是否认为任务已完成 </li><li><code>error</code>：这次回复有没有硬错误，严重到不能当正常输出用 </li><li><code>warning</code>：有没有轻一点的问题，能继续但要提醒 </li><li><code>analysis</code>、<code>plan</code>：（给系统留的说明文字，这里略） </li></ul>
+<p>为什么要先变成 <code>ParseResult</code>？因为后面的分支判断只该看“结构化事实”，不该再去读原始字符串。</p></li><li>解析器内部先做“能不能救回来”的检查 <p>JSON 路线里，<code>TerminusJSONPlainParser.parse_response()</code> 会先尝试抽出 JSON、修一点混杂文本、检查字段结构和命令列表。 XML 路线里，<code>TerminusXMLPlainParser.parse_response()</code> 会检查额外杂文本、抽出各 section（分段）、检查顺序和命令。</p>
+<p>这里的重点不是“严格验格式”本身，而是： 模型输出常常差一点点就能用。这个 Stage 选择先尽量修，再决定报 warning 还是 error。 这样做的价值是少丢轮次。能救回来的输出，不必立刻重问模型。</p></li><li>解析完成后，再统一折叠成下游能消费的交接物 <p><code>_handle_llm_interaction()</code>（承接一次 LLM 交互，并把解析结果整理给后续 Stage）在拿到 <code>ParseResult</code> 后，会做两件关键事：</p>
+<ul><li>把 <code>error</code> 和 <code>warning</code> 合成一个 <code>feedback</code> 字符串 里面会带 <code>"ERROR: ..."</code> 和/或 <code>"WARNINGS: ..."</code> 标记。 这样下游不用理解 parser 的内部细节，只要看一段标准化反馈文本就行。 这也是为什么 error/warning 不直接原样散落传递：要给后面的补救或重试逻辑一个统一接口。</li></ul>
+<ul><li>把每个 <code>ParsedCommand</code> 包成 <code>Command(...)</code> 同时把 <code>duration_sec</code> 限制为最多 60 秒。 这一步不是形式转换而已。它是在给后面的实际执行加护栏： 命令对象统一了字段，时间上限避免模型给出过长等待，拖垮整轮控制流。</li></ul></li><li>然后按结果分支，决定后面拿什么继续走 <p>这个 Stage 自己不做“执行命令”或“问用户”，它只负责把路口分清楚。核心分支有三层：</p>
+<ul><li>解析成功，且没有 warning 产物是：结构化 <code>commands</code>、<code>is_task_complete</code>、空或无 <code>feedback</code>。 这会直接交给下一步 handoff（交接），由后续 Stage 判断是走“用户确认/继续”还是别的分流。</li></ul>
+<ul><li>解析成功，但有 warning 产物仍然是可用的 <code>commands</code> / <code>is_task_complete</code>，外加带 <code>"WARNINGS: ..."</code> 的 <code>feedback</code>。 也就是说：能继续走，但系统会把“这次回复哪里不太对”带到后面。 这样既不浪费一轮，又不把风险静默吞掉。</li></ul>
+<ul><li>解析出 error 产物是错误型 <code>feedback</code>，通常带 <code>"ERROR: ..."</code>；命令侧要么为空，要么不再可信。 这时重点不再是执行，而是把错误明确交给后面的补救路径。 也就是：先把“模型这次没按协议说话”这件事表达清楚，再由后续 Stage 决定如何回问或修正。</li></ul></li><li>任务完成标记和命令列表会一起向后传 <p>这两个信号缺一不可：</p>
+<ul><li>只有 <code>is_task_complete</code>，系统才知道模型想不想收尾 </li><li>只有 <code>commands</code>，系统才知道接下来有没有终端动作 </li></ul>
+<p>特别要注意： “任务完成”不等于“这里就结束”。 这个 Stage 只负责把这个判断解析出来，真正怎么收尾是后面 Stage 的事。</p></li></ol>
+<h2 class="sec"> 状态流动</h2>
+<ul><li>读: 无 — 本 stage 在给定 skeleton 中不直接读任何显式 register；它的输入是上游以局部变量形式传入的 <code>llm_response.content</code></li><li>写: 无 — 本 stage 不把结果写入显式 register；<code>ParseResult</code>、<code>feedback</code>、<code>Command(...)</code> 列表都先作为当前调用栈里的局部产物返回/传递</li><li>清: 无 — 代码与输入都没有显示本 stage 清理任何 register</li><li>触发下游: <code>stage-4.6 Pending Handoff Prompt → User Step (or Split)</code> — 交出的是本地整理后的 handoff 产物：<code>commands</code>、<code>is_task_complete</code>、<code>feedback</code></li><li>触发下游: <code>stage-4.6 Pending Handoff Prompt → User Step (or Split)</code> — 成功解析且无 warning 时，交出可执行命令列表与完成标记，<code>feedback</code> 为空或缺省</li><li>触发下游: <code>stage-4.6 Pending Handoff Prompt → User Step (or Split)</code> — 成功解析但有 warning 时，交出同样的命令/完成标记，并额外交出带 <code>WARNINGS:</code> 标记的 <code>feedback</code></li><li>触发下游: <code>stage-4.6 Pending Handoff Prompt → User Step (or Split)</code> — 解析 error 时，交出以 <code>ERROR:</code> 为主的 <code>feedback</code>，命令结果视为不可用或为空，由下游进入补救/分流判断</li></ul>
+<h2 class="sec">与前后 Stage 的衔接</h2>
+<p>上游 <code>stage-4.3 LLM Query</code> 给的是一段原始模型文本；本 Stage 把它压成三种可交接物：命令列表、任务完成标记、统一格式的反馈字符串。紧接着 <code>stage-4.6 Pending Handoff Prompt → User Step (or Split)</code> 接收的就是这组三元结果，再决定是继续推进、提示用户，还是沿错误/警告分支处理。</p><div class="files-bar"><h2 class="sec">函数细节<span class="pill">16</span></h2><span class="spacer"></span><button class="tool" data-x="expand">全部展开</button><button class="tool" data-x="collapse">全部折叠</button></div><details class="file" id="fn-terminus2_handle_llm_interaction"><summary><span class="chev"></span><code class="fpath">Terminus2._handle_llm_interaction</code><a class="fn-range" href="../code/terminus_2.py.html#L1190-L1219" title="terminus_2.py:1190-1219">terminus_2.py:1190–1219 ↗</a></summary><div class="file-body"><p class="fn-sub">将模型文本整理为结构化回传</p>
+<blockquote><p><strong>stage 上下文</strong>: 该片段位于 <code>_handle_llm_interaction</code> 的响应整理区段，职责是把 <code>llm_response.content</code> 交给 <code>self._parser</code>，再将解析结果改写为本方法的统一返回元组。它不在此处修改实例级寄存状态；除调试日志外，主要产出是命令列表、完成标记、反馈文本，以及解析器给出的附带字段。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>代码首先读取 <code>llm_response.content</code> 并调用 <code>self._parser.parse_response(...)</code> 获得 <code>result</code>。随后基于 <code>result.error</code> 与 <code>result.warning</code> 组装单个 <code>feedback</code> 字符串；若存在 warning，还会写一条 <code>self.logger.debug(...)</code>。最后，它把 <code>result.commands</code> 中的每个项转换为 <code>Command</code>，并将 <code>duration</code> 截断到 60 秒，连同 <code>result.is_task_complete</code>、解析器提供的 <code>analysis</code> / <code>plan</code> 以及原始 <code>llm_response</code> 一并返回。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, llm_response) -&gt; tuple</code></p>
+<ul><li>参数: <code>self</code>: <code>Terminus2</code> — 提供解析器 <code>self._parser</code> 与日志器 <code>self.logger</code> 的实例对象; <code>llm_response</code>: <code>?</code> — 输入响应对象；本段代码读取其 <code>.content</code> 字段作为解析输入，并将该对象原样作为返回元组第六项返回</li><li>读状态: <code>self._parser</code>, <code>self.logger</code></li><li>返回: 返回六元组：<code>(commands, result.is_task_complete, feedback, result.analysis, result.plan, llm_response)</code>；其中 <code>commands</code> 为新建的 <code>Command</code> 列表，<code>analysis</code> 与 <code>plan</code> 为解析器提供的不透明值，<code>llm_response</code> 未被改写。</li><li>副作用: 当 <code>result.warning</code> 为真时调用 <code>self.logger.debug(...)</code> 记录解析警告</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>调用 <code>self._parser.parse_response(llm_response.content)</code>，以响应文本生成包含 <code>commands</code>、<code>is_task_complete</code>、<code>error</code>、<code>warning</code>、<code>analysis</code>、<code>plan</code> 等字段的 <code>result</code>。</li><li>以空字符串初始化 <code>feedback</code>，然后按分支读取 <code>result.error</code> 与 <code>result.warning</code>：若有 <code>error</code>，先写入 <code>ERROR: ...</code>，并在同一分支下仅当也有 <code>warning</code> 时追加换行后的 <code>WARNINGS: ...</code>；若无 <code>error</code> 但有 <code>warning</code>，则仅写入 <code>WARNINGS: ...</code>。</li><li>若 <code>result.warning</code> 存在，额外调用 <code>self.logger.debug(f"Parser warnings: {result.warning}")</code> 记录调试日志。</li><li>遍历 <code>result.commands</code>，对每个 <code>parsed_cmd</code> 新建一个 <code>Command</code>；其中 <code>keystrokes</code> 直接沿用 <code>parsed_cmd.keystrokes</code>，<code>duration_sec</code> 使用 <code>min(parsed_cmd.duration, 60)</code> 做上限截断。</li><li>返回六个值：构造好的 <code>commands</code> 列表、<code>result.is_task_complete</code>、<code>feedback</code>、<code>result.analysis</code>、<code>result.plan</code>，以及原始 <code>llm_response</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>        result = self._parser.parse_response(llm_response.content)
+
+        feedback = ""
+        if result.error:
+            feedback += f"ERROR: {result.error}"
+            if result.warning:
+                feedback += f"\nWARNINGS: {result.warning}"
+        elif result.warning:
+            feedback += f"WARNINGS: {result.warning}"
+
+        if result.warning:
+            self.logger.debug(f"Parser warnings: {result.warning}")
+
+        commands = []
+        for parsed_cmd in result.commands:
+            commands.append(
+                Command(
+                    keystrokes=parsed_cmd.keystrokes,
+                    duration_sec=min(parsed_cmd.duration, 60),
+                )
+            )
+
+        return (
+            commands,
+            result.is_task_complete,
+            feedback,
+            result.analysis,
+            result.plan,
+            llm_response,
+        )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>反馈文本被折叠为单一字符串 <code>feedback</code>，而不是分别返回 <code>error</code> 与 <code>warning</code> 两个字段；从代码可见，这里采用固定前缀 <code>ERROR:</code> / <code>WARNINGS:</code> 做内嵌标记，以保留两类信息但维持单一返回槽位。</li><li>在 <code>if result.error</code> 分支中，格式化顺序是先错误、后警告，且二者之间显式插入换行；这说明当两者并存时，代码固定采用该输出顺序，而不是让 warning 独立占用其他位置。</li><li><code>result.warning</code> 既会进入 <code>feedback</code>，又会单独写入 <code>self.logger.debug(...)</code>；这是把返回给调用方的文本信息与调试日志并行保留，而不是二选一。</li><li>命令转换时对 <code>parsed_cmd.duration</code> 施加 <code>min(..., 60)</code> 上限，属于显式边界约束；代码只限制最大值，不在此处做最小值校正或其他合法性检查。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: _handle_llm_interaction` 的其余未展示代码（当前片段所属函数）</li><li><strong>核心被调用</strong>: self._parser.parse_response; self.logger.debug; Command</li><li><strong>配置/状态来源</strong>: self._parser（本段读取的实例字段）; self.logger（本段读取的实例字段）; llm_response.content（本段读取的输入字段）; result.error / result.warning / result.commands / result.is_task_complete / result.analysis / result.plan（本段读取的解析结果字段）</li><li><strong>结果去向</strong>: 本方法的返回元组第 1 项 <code>commands</code>; 本方法的返回元组第 2 项 <code>result.is_task_complete</code>; 本方法的返回元组第 3 项 <code>feedback</code>; 本方法的返回元组第 4、5 项 <code>result.analysis</code> 与 <code>result.plan</code>; 本方法的返回元组第 6 项原始 <code>llm_response</code></li></ul></div></details><details class="file" id="fn-terminusjsonplainparser_parse_response"><summary><span class="chev"></span><code class="fpath">TerminusJSONPlainParser.parse_response</code><a class="fn-range" href="../code/terminus_json_plain_parser.py.html#L29-L62" title="terminus_json_plain_parser.py:29-62">terminus_json_plain_parser.py:29–62 ↗</a></summary><div class="file-body"><p class="fn-sub">响应文本容错解析入口</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数是本解析器对外的统一入口：先做一次常规解析，再在首轮解析报错时按顺序尝试自动修复。相较于同 stage 中负责消费解析结果的兄弟函数，这里只负责把原始字符串变成 <code>ParseResult</code>，不处理后续封装或反馈拼接。它本身不维护跨调用状态，职责集中在“尽量解析成功，但保留首个原始失败结果”。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收一个响应字符串 <code>response</code>，先调用 <code>self._try_parse_response(response)</code> 得到首个 <code>ParseResult</code>。若该结果含有 <code>error</code>，它会依次尝试 <code>self._get_auto_fixes()</code> 提供的修复方案；每个修复函数都基于原始 <code>response</code> 与原始 <code>result.error</code> 生成候选文本，并仅在重解析后的 <code>corrected_result.error == ""</code> 时接受该修复。若全部修复都未得到无错误结果，则返回第一次解析得到的原始 <code>result</code> 对象不变；唯一可能的对象修改是成功修复路径上对 <code>corrected_result.warning</code> 的赋值。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, response: str) -&gt; ParseResult</code></p>
+<ul><li>参数: <code>response</code>: <code>str</code> — 待解析的完整响应字符串，也是所有自动修复尝试的原始输入</li><li>读状态: <code>self._try_parse_response</code>, <code>self._get_auto_fixes</code>, <code>self._combine_warnings</code></li><li>返回: 返回一个 <code>ParseResult</code>：若首轮解析成功则直接返回该结果；若某个自动修复后的重解析得到 <code>error == ""</code>，则返回该修复结果；若所有修复都失败，则返回第一次 <code>_try_parse_response(response)</code> 得到的原始 <code>result</code> 对象且不做修改。</li><li>副作用: 无 <code>self</code> 状态写入; 成功自动修复时会给局部变量 <code>corrected_result.warning</code> 重新赋值</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先对原始 <code>response</code> 调用 <code>self._try_parse_response(response)</code>，得到首轮解析结果 <code>result</code>。</li><li>若 <code>result.error</code> 为真值，则进入自动修复流程；否则跳过修复逻辑并在末尾直接返回该 <code>result</code>。</li><li>遍历 <code>self._get_auto_fixes()</code> 返回的每个 <code>(fix_name, fix_function)</code>；对每个候选修复，都以原始 <code>response</code> 和原始 <code>result.error</code> 调用 <code>fix_function(response, result.error)</code>，得到 <code>corrected_response, was_fixed</code>。</li><li>只有当 <code>was_fixed</code> 为真时，才对该 <code>corrected_response</code> 再次调用 <code>self._try_parse_response(...)</code> 得到 <code>corrected_result</code>；若这次仍有错误，则不覆盖原始 <code>result</code>，而是继续尝试下一个修复方案。</li><li>一旦某个 <code>corrected_result.error == ""</code>，就构造 <code>AUTO-CORRECTED: {fix_name} - please fix this in future responses</code> 警告文本，并通过 <code>self._combine_warnings(auto_warning, corrected_result.warning)</code> 合并进 <code>corrected_result.warning</code>。</li><li>在首个成功修复处立即返回该 <code>corrected_result</code>；若循环结束仍无成功修复，则返回最开始的原始 <code>result</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def parse_response(self, response: str) -&gt; ParseResult:
+        """
+        Parse a terminus JSON plain response and extract commands.
+
+        Args:
+            response: The full LLM response string
+
+        Returns:
+            ParseResult with commands, completion status, errors and warnings
+        """
+
+        # Try normal parsing first
+        result = self._try_parse_response(response)
+
+        if result.error:
+            # Try auto-fixes in order until one works
+            for fix_name, fix_function in self._get_auto_fixes():
+                corrected_response, was_fixed = fix_function(response, result.error)
+                if was_fixed:
+                    corrected_result = self._try_parse_response(corrected_response)
+
+                    if corrected_result.error == "":
+                        # Success! Add auto-correction warning
+                        auto_warning = (
+                            f"AUTO-CORRECTED: {fix_name} - "
+                            "please fix this in future responses"
+                        )
+                        corrected_result.warning = self._combine_warnings(
+                            auto_warning, corrected_result.warning
+                        )
+                        return corrected_result
+
+        # Return original result if no fix worked
+        return result</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>自动修复只在首轮解析出现 <code>result.error</code> 时启动，避免对本已可接受的解析结果做额外变换；这体现了“常规解析优先、容错补救后置”的取舍。</li><li>每个修复函数都接收原始 <code>response</code> 与原始 <code>result.error</code>，而不是串联使用上一个修复的输出或后续错误信息；这使各修复方案彼此独立，避免连续修补造成来源混杂。</li><li>函数仅在 <code>corrected_result.error == ""</code> 时接受修复结果，说明其判定标准是“完全消除解析错误”，而不是接受部分改善或不同错误形态。</li><li>当修复成功时，不静默吞掉这一步，而是通过 <code>AUTO-CORRECTED: ...</code> 警告并与既有 warning 合并；这保留了结果可用性，同时显式暴露输入格式曾有问题。</li><li>若所有修复都未成功，函数明确回退到第一次解析得到的 <code>result</code>，而不是返回最后一次失败的重解析结果；这保留了最初失败上下文，也避免修复尝试污染原始诊断。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 解析器使用方对本解析器实例的统一响应解析调用; 任何需要把原始响应字符串转换为 <code>ParseResult</code> 的上层流程</li><li><strong>核心被调用</strong>: TerminusJSONPlainParser._try_parse_response; TerminusJSONPlainParser._get_auto_fixes; 自动修复函数 <code>fix_function(response, result.error)</code>; TerminusJSONPlainParser._combine_warnings</li><li><strong>配置/状态来源</strong>: <code>self._get_auto_fixes()</code> 提供修复策略顺序; <code>self._try_parse_response</code> 的错误判定结果驱动是否进入修复分支</li><li><strong>结果去向</strong>: 返回给本解析器调用方的 <code>ParseResult</code>; 成功修复路径中带有合并后 <code>warning</code> 的 <code>corrected_result</code>; 总失败路径中原始首轮解析 <code>result</code> 对象</li><li><strong>同类 sibling</strong>: 与 <code>Terminus2._handle_llm_interaction</code> 相比，本函数只负责生成 <code>ParseResult</code>；后者才继续读取其中字段并做后续组织。</li></ul></div></details><details class="file" id="fn-terminusjsonplainparser_try_parse_response"><summary><span class="chev"></span><code class="fpath">TerminusJSONPlainParser._try_parse_response</code><a class="fn-range" href="../code/terminus_json_plain_parser.py.html#L64-L163" title="terminus_json_plain_parser.py:64-163">terminus_json_plain_parser.py:64–163 ↗</a></summary><div class="file-body"><p class="fn-sub">JSON 响应的首轮容错解析入口</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数承担 JSON plain 响应的单次解析工作：从原始字符串中抽取 JSON、完成解码与结构核验，再整理出命令、完成状态、分析与计划。它是 <code>parse_response</code> 内部的底层尝试函数；与兄弟函数相比，这里不做多轮修复，只给出当前文本的一次解析结果。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收 <code>response: str</code>，返回一个 <code>ParseResult</code>，其中包含命令列表、任务完成标志、错误字符串、警告字符串以及 <code>analysis</code>/<code>plan</code>。它先通过 <code>_extract_json_content</code> 抽出 JSON 片段并累计格式警告，再依次进行 JSON 解码、结构校验与命令解析。所有失败路径都会返回明确的默认值：命令为空；早期失败时完成状态为 <code>False</code>；在未成功读到结构化字段前，<code>analysis</code> 与 <code>plan</code> 为空字符串。函数本身不写入实例状态，唯一可变数据是局部 <code>warnings</code> 列表，且该列表会被作为参数传入辅助函数以便间接追加告警。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, response: str) -&gt; ParseResult</code></p>
+<ul><li>参数: <code>response</code>: <code>str</code> — 待解析的完整 LLM 响应文本</li><li>返回: 返回 <code>ParseResult(commands, is_task_complete, error, warning, analysis, plan)</code>。若 <code>json_content</code> 为空、JSON 解码失败或结构校验失败，则返回 <code>commands=[]</code>、<code>is_task_complete=False</code>，并把 <code>analysis</code> 与 <code>plan</code> 置为 <code>""</code>。若命令解析失败但 <code>task_complete</code> 为真，则返回 <code>commands=[]</code>、<code>is_task_complete=True</code>、<code>error=""</code>，同时保留已提取的 <code>analysis</code>/<code>plan</code> 并把命令问题降级进 warning；若命令解析失败且未完成，则返回 <code>commands=[]</code>、<code>is_task_complete=False</code>，但同样保留已提取的 <code>analysis</code>/<code>plan</code>。所有返回分支中的 <code>warning</code> 都使用同一格式模式：有告警时为 <code>"- " + "\n- ".join(warnings)</code>，无告警时为空字符串。</li><li>副作用: 无实例状态写入; 局部 <code>warnings</code> 列表会被 <code>_validate_json_structure(parsed_data, json_content, warnings)</code> 与 <code>_parse_commands(commands_data, warnings)</code> 以可变参数方式间接追加内容</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>初始化局部 <code>warnings = []</code>，随后调用 <code>_extract_json_content(response)</code>；该调用同时返回抽取出的 <code>json_content</code> 与 <code>extra_text_warnings</code>，后者立即经 <code>warnings.extend(...)</code> 纳入本次解析的告警累积器。</li><li>若 <code>json_content</code> 为空，则直接返回失败结果：<code>commands=[]</code>、<code>is_task_complete=False</code>、<code>error='No valid JSON found in response'</code>、<code>analysis=''</code>、<code>plan=''</code>，并把当前 <code>warnings</code> 统一格式化为 warning 字符串。</li><li>若存在 JSON 文本，则尝试 <code>json.loads(json_content)</code>；一旦触发 <code>json.JSONDecodeError</code>，构造 <code>error_msg = 'Invalid JSON: ...'</code>。这里会按 <code>len(json_content) &lt; 200</code> 分支附加完整内容或前 100 字符预览，然后返回同样以空命令、未完成、空 <code>analysis/plan</code> 为默认值的失败结果。</li><li>JSON 解码成功后，调用 <code>_validate_json_structure(parsed_data, json_content, warnings)</code> 做结构核验；该辅助函数除返回 <code>validation_error</code> 外，还可能通过传入的 <code>warnings</code> 列表间接追加警告。若返回非空错误，则立即以空命令、未完成、空 <code>analysis/plan</code> 返回。</li><li>结构通过后，从 <code>parsed_data</code> 读取 <code>task_complete</code>、<code>analysis</code>、<code>plan</code> 与 <code>commands</code>；其中 <code>task_complete</code> 缺省为 <code>False</code>，且若其值是字符串，会按小写后是否属于 <code>('true', '1', 'yes')</code> 强制归一为布尔值。</li><li>接着调用 <code>_parse_commands(commands_data, warnings)</code> 将命令载荷转成命令对象；该调用同样可能通过传入的 <code>warnings</code> 列表补充告警，并返回 <code>(commands, parse_error)</code>。</li><li>若 <code>parse_error</code> 非空，则根据 <code>is_complete</code> 分流：任务已完成时，把该错误追加进 <code>warnings</code>，返回 <code>commands=[]</code>、<code>is_task_complete=True</code>、<code>error=''</code>，同时保留先前抽取的 <code>analysis</code> 与 <code>plan</code>；任务未完成时，则把该问题作为 <code>error</code> 返回，<code>is_task_complete=False</code>，也同样保留 <code>analysis</code> 与 <code>plan</code>。</li><li>若命令解析无误，则返回成功结果：<code>commands</code> 为解析所得命令列表，<code>is_task_complete</code> 为归一化后的完成状态，<code>error=''</code>，warning 仍采用统一的项目符号字符串格式，<code>analysis</code> 与 <code>plan</code> 原样透传。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _try_parse_response(self, response: str) -&gt; ParseResult:
+        """
+        Try to parse a terminus JSON plain response.
+
+        Args:
+            response: The full LLM response string
+
+        Returns:
+            ParseResult with commands, completion status, errors and warnings
+        """
+        warnings = []
+
+        # Check for extra text before/after JSON
+        json_content, extra_text_warnings = self._extract_json_content(response)
+        warnings.extend(extra_text_warnings)
+
+        if not json_content:
+            return ParseResult(
+                [],
+                False,
+                "No valid JSON found in response",
+                "- " + "\n- ".join(warnings) if warnings else "",
+                "",
+                "",
+            )
+
+        # Parse JSON
+        try:
+            parsed_data = json.loads(json_content)
+        except json.JSONDecodeError as e:
+            # Add debug info
+            error_msg = f"Invalid JSON: {str(e)}"
+            if len(json_content) &lt; 200:
+                error_msg += f" | Content: {repr(json_content)}"
+            else:
+                error_msg += f" | Content preview: {repr(json_content[:100])}..."
+            return ParseResult(
+                [],
+                False,
+                error_msg,
+                "- " + "\n- ".join(warnings) if warnings else "",
+                "",
+                "",
+            )
+
+        # Validate structure
+        validation_error = self._validate_json_structure(
+            parsed_data, json_content, warnings
+        )
+        if validation_error:
+            return ParseResult(
+                [],
+                False,
+                validation_error,
+                "- " + "\n- ".join(warnings) if warnings else "",
+                "",
+                "",
+            )
+
+        # Check if task is complete
+        is_complete = parsed_data.get("task_complete", False)
+        if isinstance(is_complete, str):
+            is_complete = is_complete.lower() in ("true", "1", "yes")
+
+        # Extract analysis and plan for reasoning content
+        analysis = parsed_data.get("analysis", "")
+        plan = parsed_data.get("plan", "")
+
+        # Parse commands
+        commands_data = parsed_data.get("commands", [])
+        commands, parse_error = self._parse_commands(commands_data, warnings)
+        if parse_error:
+            # If task is complete, parse errors are just warnings
+            if is_complete:
+                warnings.append(parse_error)
+                return ParseResult(
+                    [],
+                    True,
+                    "",
+                    "- " + "\n- ".join(warnings) if warnings else "",
+                    analysis,
+                    plan,
+                )
+            return ParseResult(
+                [],
+                False,
+                parse_error,
+                "- " + "\n- ".join(warnings) if warnings else "",
+                analysis,
+                plan,
+            )
+
+        return ParseResult(
+            commands,
+            is_complete,
+            "",
+            "- " + "\n- ".join(warnings) if warnings else "",
+            analysis,
+            plan,
+        )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>该函数把告警与致命错误明确分层：<code>warnings</code> 从开头即独立累积，而 <code>error</code> 只在无法继续可信解析时返回。这一点体现在“额外文本”仅入 warning、结构错误直接终止、以及命令解析错误在 <code>is_complete</code> 为真时被降级为 warning。</li><li>对 <code>warnings</code> 采用“单个可变列表贯穿全流程”的策略，而不是让各辅助函数各自返回独立告警集合；代码通过将同一个 <code>warnings</code> 传给 <code>_validate_json_structure(..., warnings)</code> 与 <code>_parse_commands(..., warnings)</code>，允许辅助函数在原位追加，从而保证最终 warning 输出覆盖抽取、校验与命令解析三个阶段。</li><li>JSON 解码失败时没有无条件回显完整内容，而是按长度做诊断裁剪：<code>len(json_content) &lt; 200</code> 时附上完整 <code>repr(json_content)</code>，否则只附上前 100 个字符预览。这是在诊断可读性与错误消息体积之间做出的显式取舍。</li><li>对 <code>task_complete</code> 做字符串布尔归一化是一个容错决策：当上游给出 <code>'true'</code>、<code>'1'</code>、<code>'yes'</code> 这类字符串时，函数仍将其解释为完成，而不是把它视为结构错误。这扩大了解析接受面，但仍将可接受取值限制在代码列出的有限集合中。</li><li>即使命令解析失败，函数也不会丢弃已经成功读取的 <code>analysis</code> 与 <code>plan</code>；两条 <code>parse_error</code> 分支都把这两个字段继续放入返回值。这表明代码将“推理文本可保留”与“命令是否可执行”区分对待。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: TerminusJSONPlainParser.parse_response（兄弟单元已说明其首先调用本函数取得首个 ParseResult）</li><li><strong>核心被调用</strong>: self._extract_json_content; json.loads; self._validate_json_structure; self._parse_commands; ParseResult</li><li><strong>配置/状态来源</strong>: 输入参数 <code>response</code>; 局部累积器 <code>warnings</code>; <code>parsed_data['task_complete']</code> / <code>parsed_data.get('task_complete', False)</code>; <code>parsed_data.get('analysis', '')</code>; <code>parsed_data.get('plan', '')</code>; <code>parsed_data.get('commands', [])</code></li><li><strong>结果去向</strong>: 返回给当前类的 <code>parse_response</code> 作为本轮原始解析结果; 封装为 <code>ParseResult.warning</code> 的项目符号字符串; 封装为 <code>ParseResult.error</code> 的结构化失败信息; 封装为 <code>ParseResult.commands</code> / <code>is_task_complete</code> / <code>analysis</code> / <code>plan</code></li><li><strong>同类 sibling</strong>: TerminusJSONPlainParser.parse_response：后者围绕本函数结果决定是否尝试自动修复；本函数只负责单次解析，不执行修复循环。</li></ul></div></details><details class="file" id="fn-terminusjsonplainparser_extract_json_content"><summary><span class="chev"></span><code class="fpath">TerminusJSONPlainParser._extract_json_content</code><a class="fn-range" href="../code/terminus_json_plain_parser.py.html#L165-L212" title="terminus_json_plain_parser.py:165-212">terminus_json_plain_parser.py:165–212 ↗</a></summary><div class="file-body"><p class="fn-sub">响应文本中的花括号片段提取器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 Response Parse 阶段内，职责是把一段原始响应按花括号与引号状态扫描，截出首个平衡的 <code>{...}</code> 候选子串。它只处理当前传入的 <code>response</code> 文本，不读取实例状态，也不做语义级 JSON 校验；在本 stage 中属于更底层的文本边界识别步骤。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收 <code>response: str</code>，逐字符扫描，寻找首个处于非字符串上下文中的、花括号计数从 0 开始并回到 0 的 <code>{...}</code> 片段。成功时返回该子串及告警列表；告警仅用于指出该片段前后是否还存在非空额外文本，数量可能为 0、1 或 2 条。若未同时找到起止边界，则返回空字符串和 <code>['No valid JSON object found']</code>。函数本身无任何对象状态写入或外部副作用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, response: str) -&gt; tuple[str, List[str]]</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 实例方法接收者；本函数实际未读取其属性; <code>response</code>: <code>str</code> — 待扫描的原始响应文本来源</li><li>返回: 返回二元组 <code>(extracted_text, warnings)</code>：成功时 <code>extracted_text</code> 为首个平衡花括号包围的候选 <code>{...}</code> 子串，<code>warnings</code> 为前后额外文本告警列表（0 到 2 条）；失败时返回 <code>('', ['No valid JSON object found'])</code>。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>初始化局部变量：<code>warnings</code> 为空列表，边界记录 <code>json_start/json_end</code> 设为 <code>-1</code>，并建立 <code>brace_count</code>、<code>in_string</code>、<code>escape_next</code> 三个扫描状态。</li><li>按 <code>enumerate(response)</code> 逐字符遍历；若上一字符触发了转义（<code>escape_next</code> 为真），则当前字符只用于清除该标记，随后直接跳过，不参与任何结构判断。</li><li>遇到反斜杠 <code>\</code> 时，将 <code>escape_next</code> 置为真并继续；遇到双引号 <code>"</code> 且当前不处于“转义后跳过”分支时，翻转 <code>in_string</code>，用于区分字符串内部与外部。</li><li>仅当 <code>in_string</code> 为假时才处理花括号：遇到 <code>{</code> 时，若当前 <code>brace_count == 0</code> 就把当前位置记为 <code>json_start</code>，随后递增计数；遇到 <code>}</code> 时先递减计数，若此时计数回到 0 且 <code>json_start != -1</code>，则把 <code>json_end</code> 记为 <code>i + 1</code> 并立即结束扫描。</li><li>扫描完成后，若 <code>json_start == -1</code> 或 <code>json_end == -1</code>，说明没有找到同时具备起点和终点的平衡片段，直接返回空字符串和固定错误告警 <code>['No valid JSON object found']</code>。</li><li>若成功得到边界，则分别对 <code>response[:json_start]</code> 与 <code>response[json_end:]</code> 做 <code>strip()</code>；前段非空时加入 <code>Extra text detected before JSON object</code>，后段非空时加入 <code>Extra text detected after JSON object</code>。</li><li>最后返回 <code>response[json_start:json_end]</code> 这一候选子串，以及累计得到的 <code>warnings</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _extract_json_content(self, response: str) -&gt; tuple[str, List[str]]:
+        """Extract JSON content from response, handling extra text."""
+        warnings = []
+
+        # Try to find JSON object boundaries
+        json_start = -1
+        json_end = -1
+        brace_count = 0
+        in_string = False
+        escape_next = False
+
+        for i, char in enumerate(response):
+            if escape_next:
+                escape_next = False
+                continue
+
+            if char == "\\":
+                escape_next = True
+                continue
+
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+
+            if not in_string:
+                if char == "{":
+                    if brace_count == 0:
+                        json_start = i
+                    brace_count += 1
+                elif char == "}":
+                    brace_count -= 1
+                    if brace_count == 0 and json_start != -1:
+                        json_end = i + 1
+                        break
+
+        if json_start == -1 or json_end == -1:
+            return "", ["No valid JSON object found"]
+
+        # Check for extra text
+        before_text = response[:json_start].strip()
+        after_text = response[json_end:].strip()
+
+        if before_text:
+            warnings.append("Extra text detected before JSON object")
+        if after_text:
+            warnings.append("Extra text detected after JSON object")
+
+        return response[json_start:json_end], warnings</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>该实现只做基于 <code>brace_count</code>、<code>in_string</code>、<code>escape_next</code> 的边界提取，而不验证提取结果是否为语义上正确的 JSON；因此它保证的是“首个平衡花括号包围的候选 <code>{...}</code> 子串”，不是已验证合法的 JSON 对象。</li><li>代码显式区分字符串内外状态，并在 <code>escape_next</code> 分支中直接 <code>continue</code>，使被转义字符完全跳过结构处理；这样可避免字符串内容中的 <code>"</code>、<code>{</code>、<code>}</code> 干扰片段边界识别。</li><li>函数要求同时找到 <code>json_start</code> 与 <code>json_end</code> 才算成功，任何只有起点没有闭合、或根本未进入有效平衡区间的情况，都统一落入 <code>('', ['No valid JSON object found'])</code>，从返回值层面保持失败信号明确。</li><li>额外文本不阻断提取，而是通过 <code>before_text</code>、<code>after_text</code> 的 <code>strip()</code> 结果转化为告警；这是一种“保留主片段、附带报告噪声”的策略。</li><li>一个不太显眼但确实存在的取舍是：在字符串外遇到 <code>}</code><code> 时，代码会无条件执行 </code>brace_count -= 1<code>，即使此前尚未看到任何 </code>{<code>；因此 </code>brace_count` 可能变成负数，函数并未对这种情况做保护或纠正。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未知；提供源码中未出现直接调用点</li><li><strong>核心被调用</strong>: enumerate(response); response[:json_start].strip(); response[json_end:].strip()</li><li><strong>配置/状态来源</strong>: response 参数文本; 局部扫描状态 <code>brace_count</code>; 局部扫描状态 <code>in_string</code>; 局部扫描状态 <code>escape_next</code></li><li><strong>结果去向</strong>: 返回给其直接调用者的提取子串; 返回给其直接调用者的告警列表</li></ul></div></details><details class="file" id="fn-terminusjsonplainparser_validate_json_structure"><summary><span class="chev"></span><code class="fpath">TerminusJSONPlainParser._validate_json_structure</code><a class="fn-range" href="../code/terminus_json_plain_parser.py.html#L214-L249" title="terminus_json_plain_parser.py:214-249">terminus_json_plain_parser.py:214–249 ↗</a></summary><div class="file-body"><p class="fn-sub">JSON结构与字段约束校验点</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数是一个纯校验辅助例程，职责限于检查传入 <code>data</code> 与 <code>json_content</code> 是否满足本解析器期望的 JSON 结构。它在本体内不构造结果对象，也不操作实例级运行状态；可见输出只有返回的错误字符串与对 <code>warnings</code> 列表的追加。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收 <code>data</code>、原始 <code>json_content</code> 与可变 <code>warnings</code> 列表，先做对象形态与必填字段检查，再对若干字段类型做硬错误或软告警判定。结构性硬失败时返回非空错误字符串；通过硬校验时返回空字符串。其副作用仅限于向 <code>warnings</code> 追加本函数直接生成的三类字段类型告警，以及调用 <code>_check_field_order(...)</code> 委托顺序相关检查继续追加告警。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, data: dict, json_content: str, warnings: List[str]) -&gt; str</code></p>
+<ul><li>参数: <code>data</code>: <code>dict</code> — 待校验的已解析 JSON 数据；虽有 <code>dict</code> 注解，但函数运行时仍显式拒绝非字典值; <code>json_content</code>: <code>str</code> — 原始 JSON 文本，传给 <code>_check_field_order(...)</code> 作为顺序检查输入; <code>warnings</code>: <code>List[str]</code> — 可变告警列表；本函数会直接追加字段类型告警，并传递给 <code>_check_field_order(...)</code> 继续填充</li><li>读状态: <code>self.required_fields</code></li><li>返回: 返回结构校验结果字符串：硬校验失败时为具体错误信息，全部硬校验通过时返回空字符串 <code>""</code>。</li><li>副作用: 当 <code>data.get("analysis", "")</code> 不是 <code>str</code> 时，向 <code>warnings</code> 追加 <code>"Field 'analysis' should be a string"</code>; 当 <code>data.get("plan", "")</code> 不是 <code>str</code> 时，向 <code>warnings</code> 追加 <code>"Field 'plan' should be a string"</code>; 当 <code>data.get("task_complete")</code> 的值不是 <code>None</code> 且也不是 <code>bool</code> 或 <code>str</code> 时，向 <code>warnings</code> 追加 <code>"Field 'task_complete' should be a boolean or string"</code>; 调用 <code>self._check_field_order(data, json_content, warnings)</code>，把顺序相关告警的写入委托给该辅助函数</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先做最外层形态防御：若 <code>data</code> 运行时不是 <code>dict</code>，立即返回 <code>"Response must be a JSON object"</code>，后续所有字段检查都不再执行。</li><li>遍历 <code>self.required_fields</code> 收集缺失键；若 <code>missing_fields</code> 非空，返回 <code>"Missing required fields: ..."</code>，这是第二类硬失败出口。</li><li>对 <code>analysis</code> 与 <code>plan</code> 做软类型检查：分别通过 <code>data.get("analysis", "")</code>、<code>data.get("plan", "")</code> 取值；值不是字符串时，仅向 <code>warnings</code> 追加告警，不中断校验。</li><li>读取 <code>commands = data.get("commands", [])</code>；若其不是列表，则返回 <code>"Field 'commands' must be an array"</code>，这是第三类硬失败出口。</li><li>在 <code>commands</code> 通过类型检查后，调用 <code>self._check_field_order(data, json_content, warnings)</code>，把字段顺序相关的检查委托给该函数处理。</li><li>读取 <code>task_complete = data.get("task_complete")</code>；仅当该值不是 <code>None</code> 且其类型既非 <code>bool</code> 也非 <code>str</code> 时，追加一条软告警。若值为 <code>None</code>（包括 JSON 中显式 <code>null</code> 导致的情况），该分支不会报错也不会告警。</li><li>若以上硬校验均未触发返回，函数最终返回空字符串 <code>""</code>，表示结构层面的强约束已通过。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _validate_json_structure(
+        self, data: dict, json_content: str, warnings: List[str]
+    ) -&gt; str:
+        """Validate the JSON structure has required fields."""
+        if not isinstance(data, dict):
+            return "Response must be a JSON object"
+
+        # Check for required fields
+        missing_fields = []
+        for field in self.required_fields:
+            if field not in data:
+                missing_fields.append(field)
+
+        if missing_fields:
+            return f"Missing required fields: {', '.join(missing_fields)}"
+
+        # Validate field types
+        if not isinstance(data.get("analysis", ""), str):
+            warnings.append("Field 'analysis' should be a string")
+
+        if not isinstance(data.get("plan", ""), str):
+            warnings.append("Field 'plan' should be a string")
+
+        commands = data.get("commands", [])
+        if not isinstance(commands, list):
+            return "Field 'commands' must be an array"
+
+        # Check for correct order of fields (analysis, plan, commands)
+        self._check_field_order(data, json_content, warnings)
+
+        # Validate task_complete if present
+        task_complete = data.get("task_complete")
+        if task_complete is not None and not isinstance(task_complete, (bool, str)):
+            warnings.append("Field 'task_complete' should be a boolean or string")
+
+        return ""</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>尽管形参注解写的是 <code>data: dict</code>，函数仍首先用 <code>isinstance(data, dict)</code> 做运行时防御；这表明注解不被视为充分保障，非对象载荷会被显式拒绝而不是交给后续 <code>get(...)</code> 调用隐式出错。</li><li>该函数把问题分成硬失败与软告警两档：顶层不是对象、缺失必填字段、<code>commands</code> 不是数组都会直接返回错误；而 <code>analysis</code>、<code>plan</code>、<code>task_complete</code> 的类型不匹配只会记录到 <code>warnings</code>。这是函数体内直接可见的校验强度分层。</li><li><code>task_complete</code> 的判定使用 <code>task_complete is not None</code> 作为前置门槛，而不是简单按键是否存在判断；因此当该字段取到 <code>None</code> 时不会产生任何告警。换言之，显式 <code>null</code> 会被静默接受，这是此处条件写法带来的非显然后果。</li><li>字段顺序检查没有内联在本函数，而是统一委托给 <code>_check_field_order(...)</code>；本函数只负责在调用点保证前置硬校验已通过，并共享同一个 <code>warnings</code> 容器承接其输出。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未知；当前源码片段未显示谁调用该函数</li><li><strong>核心被调用</strong>: self._check_field_order</li><li><strong>配置/状态来源</strong>: self.required_fields</li><li><strong>结果去向</strong>: 返回给直接调用者的错误字符串; 由调用者持有并继续使用的 <code>warnings</code> 列表</li><li><strong>同类 sibling</strong>: 与 <code>_extract_json_content</code> 相比，本函数不负责抽取 JSON 片段，只消费已提供的 <code>data</code>/<code>json_content</code> 做结构约束检查。; 与 <code>parse_response</code>、<code>_try_parse_response</code> 这类更高层入口相比，本函数职责更窄，只产生字符串错误与列表告警，不组装更高层解析结果。</li></ul></div></details><details class="file" id="fn-terminusjsonplainparser_check_field_order"><summary><span class="chev"></span><code class="fpath">TerminusJSONPlainParser._check_field_order</code><a class="fn-range" href="../code/terminus_json_plain_parser.py.html#L352-L393" title="terminus_json_plain_parser.py:352-393">terminus_json_plain_parser.py:352–393 ↗</a></summary><div class="file-body"><p class="fn-sub">响应文本字段顺序软校验器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数是 JSON 结构校验链路中的一个辅助检查点，职责仅限于观察原始 <code>response</code> 文本里若干字段名的出现顺序。它不决定解析是否成功，只可能向传入的 <code>warnings</code> 列表追加一条顺序告警。就同组兄弟函数分工看，<code>_validate_json_structure(...)</code> 负责调用它，而它专注于顺序这一项软性格式问题。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数围绕局部常量 <code>expected_order = ["analysis", "plan", "commands"]</code> 检查这三个字段在原始字符串 <code>response</code> 中的文本出现顺序。它对每个字段执行一次 <code>re.search</code>，匹配模式是带双引号的字段名、后接可选空白和冒号；若至少找到两个字段，就把实际顺序与该字段子集的期望顺序比较。函数返回 <code>None</code>，真正产出是必要时向可变参数 <code>warnings</code> 追加一条人类可读的告警；参数 <code>data</code> 在本实现中未被使用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, data: dict, response: str, warnings: List[str]) -&gt; None</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 解析器实例；本函数未读取其实例属性; <code>data</code>: <code>dict</code> — 传入的已解析数据对象；在本函数体内未被使用; <code>response</code>: <code>str</code> — 原始响应文本；字段位置完全从这里通过 <code>re.search(...)</code> 的首个匹配位置取得; <code>warnings</code>: <code>List[str]</code> — 可变告警列表；若顺序不符则在末尾追加一条描述字符串</li><li>返回: 返回 <code>None</code>；真实输出是可能发生的 <code>warnings.append(...)</code>。</li><li>副作用: 可能向传入的 <code>warnings</code> 列表追加一条字段顺序告警</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先定义目标顺序 <code>expected_order = ["analysis", "plan", "commands"]</code>，作为后续比较基准。</li><li>遍历 <code>expected_order</code> 中的每个字段，为每个字段构造模式 <code>"({field})"\s*:</code>，并对 <code>response</code> 调用一次 <code>re.search(...)</code>；若有匹配，则把该字段记录到 <code>positions[field] = match.start()</code>。这里使用的是每个字段在全文中的首个匹配位置，后续重复出现不会再被考虑。</li><li>若 <code>positions</code> 中找到的字段少于两个，则直接 <code>return</code>，因为此时没有足够信息进行顺序比较。</li><li>按 <code>expected_order</code> 过滤出实际出现过的字段，组成 <code>present_fields</code>，然后按记录的起始位置排序，得到文本中的实际出现顺序 <code>actual_order</code>。</li><li>再按 <code>expected_order</code> 的原始次序抽取当前已出现字段，形成仅针对已出现字段子集的期望顺序 <code>expected_present</code>。</li><li>若 <code>actual_order != expected_present</code>，则把两边分别用 <code>→</code> 连接成字符串，并向 <code>warnings</code> 追加 <code>Fields appear in wrong order...</code> 告警；若相同则不产生任何输出。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _check_field_order(
+        self, data: dict, response: str, warnings: List[str]
+    ) -&gt; None:
+        """Check if fields appear in the correct order: analysis, plan, commands."""
+        # Expected order for required fields
+        expected_order = ["analysis", "plan", "commands"]
+
+        # Find positions of each field in the original response
+        positions = {}
+        for field in expected_order:
+            # Look for the field name in quotes
+            pattern = f'"({field})"\\s*:'
+            match = re.search(pattern, response)
+            if match:
+                positions[field] = match.start()
+
+        # Check if we have at least 2 fields to compare order
+        if len(positions) &lt; 2:
+            return
+
+        # Get fields that are present, in the order they appear
+        present_fields = []
+        for field in expected_order:
+            if field in positions:
+                present_fields.append((field, positions[field]))
+
+        # Sort by position to get actual order
+        actual_order = [
+            field for field, pos in sorted(present_fields, key=lambda x: x[1])
+        ]
+
+        # Get expected order for present fields only
+        expected_present = [f for f in expected_order if f in positions]
+
+        # Compare orders
+        if actual_order != expected_present:
+            actual_str = " → ".join(actual_order)
+            expected_str = " → ".join(expected_present)
+            warnings.append(
+                f"Fields appear in wrong order. Found: {actual_str}, "
+                f"expected: {expected_str}"
+            )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>实现以 <code>response</code> 中的文本位置而非 <code>data</code> 的键顺序为判据；这使检查对象明确落在原始响应呈现顺序上，也解释了为何虽然签名接收了 <code>data</code>，函数体却完全未使用它。</li><li>每个字段只做一次 <code>re.search(...)</code>，因此只采信首个匹配位置；如果同名字段在后文再次出现，或文本中有重复提及，本实现不会尝试综合多个位置。</li><li>当找到的字段不足两个时直接返回，表明该检查被设计为“可比较时才发声”的软校验，而不是在信息不足时制造额外告警。</li><li>比较时使用 <code>expected_present</code> 而不是完整 <code>expected_order</code>，意味着缺失字段本身不在这里被报告；本函数只处理“已出现字段之间的相对顺序”这一件事。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: TerminusJSONPlainParser._validate_json_structure</li><li><strong>核心被调用</strong>: re.search; warnings.append; sorted; " → ".join</li><li><strong>配置/状态来源</strong>: 局部常量 <code>expected_order</code> 提供唯一顺序规则; 输入参数 <code>response</code> 提供字段文本位置来源; 输入参数 <code>warnings</code> 提供告警输出容器; 输入参数 <code>data</code> 被传入但在本实现中未使用</li><li><strong>结果去向</strong>: 传入的 <code>warnings</code> 列表; 调用方 <code>TerminusJSONPlainParser._validate_json_structure</code> 的后续处理; 本函数的隐式完成信号：未追加告警即表示顺序检查未发现问题; 返回值固定为 <code>None</code>，不经由返回通道传递结果</li><li><strong>同类 sibling</strong>: TerminusJSONPlainParser._validate_json_structure：负责更广义的结构校验，并把顺序检查委托给本函数。; TerminusJSONPlainParser._try_parse_response：在更上层收集 <code>warnings</code>，本函数只贡献其中可能的一条。; TerminusJSONPlainParser._extract_json_content：同样生成告警，但关注点是 JSON 片段提取而非字段顺序。</li></ul></div></details><details class="file" id="fn-terminusjsonplainparser_parse_commands"><summary><span class="chev"></span><code class="fpath">TerminusJSONPlainParser._parse_commands</code><a class="fn-range" href="../code/terminus_json_plain_parser.py.html#L251-L303" title="terminus_json_plain_parser.py:251-303">terminus_json_plain_parser.py:251–303 ↗</a></summary><div class="file-body"><p class="fn-sub">命令数组校验与对象化入口</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 <a href="stage-4.4.html">stage-4.4</a> 的响应解析链路中，负责把已通过 JSON 解码与结构校验的 <code>commands</code> 数组进一步细化为 <code>ParsedCommand</code> 列表。触发条件是上游 <code>_try_parse_response</code> 已成功取出 <code>commands_data</code>，并把同一个可变 <code>warnings</code> 列表传入本函数。与同阶段兄弟函数相比，<code>_extract_json_content</code> 处理文本包裹问题，<code>_validate_json_structure</code> 处理顶层形态与字段约束，而本函数专门处理单条命令对象的字段级合法性与默认化。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收 <code>commands_data: List[dict]</code> 与调用方提供的 <code>warnings</code> 列表，逐项验证每个命令对象是否可转换为 <code>ParsedCommand</code>。它对命令对象形态、必填字段 <code>keystrokes</code> 及其类型执行硬校验；一旦失败，立即返回空命令列表和错误字符串。对 <code>duration</code> 缺失或类型不合法、出现未知字段、以及多条命令间缺少结尾换行等情况，仅追加告警并继续产出命令对象，因此其副作用主要是原位扩充 <code>warnings</code>。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, commands_data: List[dict], warnings: List[str]) -&gt; tuple[List[ParsedCommand], str]</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 实例方法接收者；本函数实现中未读取实例属性; <code>commands_data</code>: <code>List[dict]</code> — 来自上游解析结果中的 <code>commands</code> 数组候选值，待逐条校验并转换; <code>warnings</code>: <code>List[str]</code> — 由调用方传入的可变告警累积器，本函数会向其中追加非致命问题说明</li><li>返回: 返回二元组 <code>(commands, error_message)</code>：成功时 <code>commands</code> 为 <code>ParsedCommand</code> 列表且 <code>error_message</code> 为空字符串；发生硬校验失败时返回空列表和对应错误文本。</li><li>副作用: 向传入的 <code>warnings</code> 列表追加关于默认 duration、未知字段、换行建议的告警信息</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>初始化局部列表 <code>commands = []</code>，作为成功解析出的 <code>ParsedCommand</code> 累积容器。</li><li>按顺序遍历 <code>commands_data</code> 中的每一项 <code>cmd_data</code>，并用 <code>i + 1</code> 生成人类可读的命令序号；若某项不是 <code>dict</code>，立刻返回 <code>([], "Command N must be an object")</code>。</li><li>检查每条命令是否含有必填字段 <code>keystrokes</code>，且其值必须是 <code>str</code>；缺失或类型不符都属于硬错误，立即中止整个命令数组解析并返回空列表与错误字符串。</li><li>处理可选字段 <code>duration</code>：若字段存在且值是 <code>int</code> 或 <code>float</code>，直接采用；若存在但类型非法，则向 <code>warnings</code> 追加“Invalid duration value, using default 1.0”并回退到 <code>1.0</code>；若字段缺失，也追加“Missing duration field, using default 1.0”并同样使用 <code>1.0</code>。</li><li>计算 <code>unknown_fields = set(cmd_data.keys()) - {"keystrokes", "duration"}</code>；若存在未知字段，则仅记录一条告警，不阻止该命令继续被接受。</li><li>若当前命令后面还有下一条命令，但 <code>keystrokes</code> 不以换行符 <code>\n</code> 结尾，则追加一条关于两条命令可能被拼接到同一行的告警；这仍然不视为解析失败。</li><li>把当前命令转换为 <code>ParsedCommand(keystrokes=keystrokes, duration=float(duration))</code> 加入 <code>commands</code>；全部遍历完成后返回 <code>(commands, "")</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _parse_commands(
+        self, commands_data: List[dict], warnings: List[str]
+    ) -&gt; tuple[List[ParsedCommand], str]:
+        """Parse commands array into ParsedCommand objects."""
+        commands = []
+
+        for i, cmd_data in enumerate(commands_data):
+            if not isinstance(cmd_data, dict):
+                return [], f"Command {i + 1} must be an object"
+
+            # Check for required keystrokes field
+            if "keystrokes" not in cmd_data:
+                return [], f"Command {i + 1} missing required 'keystrokes' field"
+
+            keystrokes = cmd_data["keystrokes"]
+            if not isinstance(keystrokes, str):
+                return [], f"Command {i + 1} 'keystrokes' must be a string"
+
+            # Parse optional fields with defaults
+            if "duration" in cmd_data:
+                duration = cmd_data["duration"]
+                if not isinstance(duration, (int, float)):
+                    warnings.append(
+                        f"Command {i + 1}: Invalid duration value, using default 1.0"
+                    )
+                    duration = 1.0
+            else:
+                warnings.append(
+                    f"Command {i + 1}: Missing duration field, using default 1.0"
+                )
+                duration = 1.0
+
+            # Check for unknown fields
+            known_fields = {"keystrokes", "duration"}
+            unknown_fields = set(cmd_data.keys()) - known_fields
+            if unknown_fields:
+                warnings.append(
+                    f"Command {i + 1}: Unknown fields: {', '.join(unknown_fields)}"
+                )
+
+            # Check for newline at end of keystrokes if followed by another command
+            if i &lt; len(commands_data) - 1 and not keystrokes.endswith("\n"):
+                warnings.append(
+                    f"Command {i + 1} should end with newline when followed "
+                    "by another command. Otherwise the two commands will be "
+                    "concatenated together on the same line."
+                )
+
+            commands.append(
+                ParsedCommand(keystrokes=keystrokes, duration=float(duration))
+            )
+
+        return commands, ""</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>该函数把 <code>keystrokes</code> 视为唯一真正不可恢复的核心字段：缺失或类型错误即整体失败返回，而不是跳过坏命令继续保留其余命令。这种取舍保证下游执行层拿到的命令序列不存在“没有实际输入内容”的空壳项。</li><li><code>duration</code> 采取宽容降级而非硬失败：无论是缺失还是类型不合法，都统一回退为 <code>1.0</code> 并留下告警。代码显式区分“字段缺失”和“值非法”两类文案，说明这里优先追求命令可执行性，而非要求模型输出完全规范。</li><li>未知字段只告警、不报错，体现出对模型输出冗余信息的兼容策略；这与上游 <code>_validate_json_structure</code> 对顶层关键字段的硬性约束形成分层：顶层结构严格，命令对象局部附加信息宽容。</li><li>对“除最后一条外的命令最好以换行结束”的检查仅给出 advisory warning，因为缺少换行带来的风险是 shell 拼接语义歧义，而不是对象本身无法构造。代码通过 <code>i &lt; len(commands_data) - 1</code> 明确排除了最后一条命令，避免把单条命令的无换行误报为问题。</li><li>在构造 <code>ParsedCommand</code> 时统一执行 <code>float(duration)</code>，即便前面允许 <code>int</code> 或 <code>float</code> 输入，也将输出规格收敛为单一浮点类型，降低后续调用方处理多种数值类型的复杂度。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: TerminusJSONPlainParser._try_parse_response; 经由 TerminusJSONPlainParser.parse_response 的首次解析路径; 经由 TerminusJSONPlainParser.parse_response 的自动修复后重解析路径</li><li><strong>核心被调用</strong>: ParsedCommand(...) 构造函数; warnings.append(...); float(duration); cmd_data.keys()</li><li><strong>配置/状态来源</strong>: 参数 <code>commands_data</code>：来自模型响应中 <code>commands</code> 字段的已解码数组; 参数 <code>warnings</code>：由上游 <code>_try_parse_response</code> 创建并跨子步骤共享的告警容器; 局部常量 <code>known_fields = {"keystrokes", "duration"}</code>：定义命令对象允许字段集合</li><li><strong>结果去向</strong>: 返回给 TerminusJSONPlainParser._try_parse_response，参与组装最终 <code>ParseResult.commands</code> 与 <code>ParseResult.error</code>; 经由 TerminusJSONPlainParser.parse_response 进入可能的自动修复接受/拒绝判定; 经由 Terminus2._handle_llm_interaction 被包装为 <code>Command(keystrokes, duration_sec=min(duration, 60))</code>; 追加到 <code>warnings</code> 的文本最终可能被 <code>_handle_llm_interaction</code> 汇总进 <code>feedback</code> 字符串</li><li><strong>同类 sibling</strong>: TerminusJSONPlainParser._extract_json_content：先抽取 JSON 片段并产生包裹文本告警，再由本函数处理命令项细节; TerminusJSONPlainParser._validate_json_structure：先验证顶层对象与字段类型，本函数继续验证 <code>commands</code> 内部每个元素; TerminusJSONPlainParser._try_parse_response：负责串联 JSON 提取、解码、结构校验与本函数的命令解析</li></ul></div></details><details class="file" id="fn-terminusjsonplainparser_fix_mixed_content"><summary><span class="chev"></span><code class="fpath">TerminusJSONPlainParser._fix_mixed_content</code><a class="fn-range" href="../code/terminus_json_plain_parser.py.html#L330-L343" title="terminus_json_plain_parser.py:330-343">terminus_json_plain_parser.py:330–343 ↗</a></summary><div class="file-body"><p class="fn-sub">混合内容中的 JSON 候选提取器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数是一个局部容错辅助项，职责是在 <code>response</code> 文本中寻找可能的 JSON 子串，并返回首个可被 <code>json.loads(...)</code> 接受的候选。就这段源码可见信息而言，它本身不参与状态管理，也不直接组装 <code>ParseResult</code>；与同 stage 的其他解析函数相比，这里只处理“混合内容中的候选抽取与验证”这一窄职责。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收 <code>response: str</code> 与 <code>error: str</code>，但实际只使用 <code>response</code> 作为搜索源，在其中提取若干由花括号包围的候选片段。它按 <code>re.findall(...)</code> 产出的顺序逐个尝试 <code>json.loads(match)</code>，一旦某个候选可成功解码，就立即返回该候选字符串和 <code>True</code>。若所有候选都触发 <code>json.JSONDecodeError</code>，则返回原始 <code>response</code> 与 <code>False</code>。函数不读取或写入任何实例状态，也没有除解析尝试外的外部副作用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, response: str, error: str) -&gt; tuple[str, bool]</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 实例方法接收者；本函数体内未读取实例属性; <code>response</code>: <code>str</code> — 待扫描的完整响应文本，既是候选提取源，也是失败时的原样返回值; <code>error</code>: <code>str</code> — 调用方传入的错误信息；本函数体内未被使用</li><li>返回: 返回二元组 <code>(text, success)</code>：成功时，<code>text</code> 是 <code>re.findall(json_pattern, response, re.DOTALL)</code> 结果中第一个能被 <code>json.loads(...)</code> 成功解析的候选字符串，<code>success</code> 为 <code>True</code>；若没有任何候选通过该校验，则返回原始 <code>response</code> 与 <code>False</code>。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>定义局部正则 <code>json_pattern = r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}"</code>，把搜索目标限定为基于花括号形态的候选片段，而不是直接把整段 <code>response</code> 当作 JSON 解析。</li><li>调用 <code>re.findall(json_pattern, response, re.DOTALL)</code> 收集全部匹配到的候选子串，并存入局部变量 <code>matches</code>。</li><li>按 <code>matches</code> 的迭代顺序逐个处理 <code>match</code>，对每个候选执行 <code>json.loads(match)</code> 作为有效性验证。</li><li>若某个 <code>match</code> 未抛出异常，则立即返回该 <code>match</code> 与 <code>True</code>，因此成功结果总是“找到顺序上的第一个可解析候选”。</li><li>若 <code>json.loads(match)</code> 抛出 <code>json.JSONDecodeError</code>，则通过 <code>except ...: continue</code> 忽略该候选并继续尝试下一个。</li><li>当所有候选都未通过验证时，返回原始 <code>response</code> 与 <code>False</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _fix_mixed_content(self, response: str, error: str) -&gt; tuple[str, bool]:
+        """Extract JSON from response with mixed content."""
+        # Look for JSON-like patterns
+        json_pattern = r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}"
+        matches = re.findall(json_pattern, response, re.DOTALL)
+
+        for match in matches:
+            try:
+                json.loads(match)
+                return match, True
+            except json.JSONDecodeError:
+                continue
+
+        return response, False</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>候选提取与合法性判定被拆成两步：先用 <code>json_pattern</code> 做花括号启发式筛选，再用 <code>json.loads(...)</code> 做真正的 JSON 校验。这说明正则的职责只是缩小搜索范围，而不是完整表达 JSON 文法；否则单靠该模式无法可靠判断语法有效性。</li><li>成功路径采用“首个通过即返回”的早停策略，代码上体现为 <code>for match in matches:</code> 内部的 <code>return match, True</code>。这避免了继续扫描后续候选，也明确把返回值绑定为 <code>re.findall(...)</code> 顺序中的第一个合法项。</li><li>异常容忍被刻意收窄到 <code>json.JSONDecodeError</code>：只有 JSON 解码失败会被吞掉并继续尝试，其他异常类型在本函数中不会被捕获。这一点由 <code>except json.JSONDecodeError:</code> 的精确异常类型可直接看出。</li><li>形参 <code>error</code> 虽出现在签名中，但函数体完全未引用它，说明当前实现不根据上游错误内容调整提取策略；行为只由 <code>response</code> 决定。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 此片段未展示直接调用者</li><li><strong>核心被调用</strong>: re.findall; json.loads</li><li><strong>配置/状态来源</strong>: response 形参; error 形参（未使用）; 局部常量 json_pattern</li><li><strong>结果去向</strong>: 返回给直接调用方的 <code>(text, success)</code> 二元组; 成功时提供首个可解析候选字符串; 失败时回传原始 response; 布尔标志用于区分是否找到可解析候选</li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_parse_response"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser.parse_response</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L28-L60" title="terminus_xml_plain_parser.py:28-60">terminus_xml_plain_parser.py:28–60 ↗</a></summary><div class="file-body"><p class="fn-sub">XML 响应解析与自动修复入口</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数是 XML plain parser 对外的统一解析入口：先对原始 <code>response</code> 做一次标准解析，再在首轮出现 <code>result.error</code> 时尝试内建修复。它与同类辅助函数形成分工：真正的解析由 <code>self._try_parse_response(...)</code> 完成，修复候选由 <code>self._get_auto_fixes()</code> 提供，告警拼接由 <code>self._combine_warnings(...)</code> 完成。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收原始响应字符串 <code>response</code>，先调用 <code>self._try_parse_response(response)</code> 得到首个 <code>ParseResult</code>。若该结果带有错误，则按顺序尝试自动修复；只有当某个修复后的文本再次解析得到空错误字符串时，才接受该修复结果。成功接受修复时，函数会在返回前把自动修复说明并入 <code>corrected_result.warning</code>；除此之外不写入实例状态。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, response: str) -&gt; ParseResult</code></p>
+<ul><li>参数: <code>response</code>: <code>str</code> — 待解析的完整 LLM 响应字符串</li><li>读状态: <code>self._try_parse_response</code>, <code>self._get_auto_fixes</code>, <code>self._combine_warnings</code></li><li>返回: 一个 <code>ParseResult</code>：要么是对原始 <code>response</code> 的首次解析结果，要么是某个成功自动修复后重新解析得到的结果。</li><li>副作用: 在自动修复成功分支中，返回前会修改 <code>corrected_result.warning</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先对输入 <code>response</code> 执行一次 <code>self._try_parse_response(response)</code>，保存为 <code>result</code>，作为默认返回候选。</li><li>若 <code>result.error</code> 为真，进入自动修复流程，并按 <code>self._get_auto_fixes()</code> 给出的顺序遍历每个 <code>(fix_name, fix_function)</code>。</li><li>对每个修复函数，调用 <code>fix_function(response, result.error)</code>；这里传入的始终是原始 <code>response</code> 和首轮解析得到的错误信息，而不是前一个修复产物。</li><li>只有在 <code>was_fixed</code> 为真时，才会对 <code>corrected_response</code> 再次调用 <code>self._try_parse_response(...)</code> 进行重解析。</li><li>若重解析结果满足 <code>corrected_result.error == ""</code>，则构造 <code>AUTO-CORRECTED: {fix_name} - please fix this in future responses</code> 告警，并通过 <code>self._combine_warnings(...)</code> 与已有告警合并后写回 <code>corrected_result.warning</code>，随后立即返回该结果。</li><li>若所有修复都未产出无错误结果，则放弃修复路径，返回最开始得到的 <code>result</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def parse_response(self, response: str) -&gt; ParseResult:
+        """
+        Parse a terminus XML plain response and extract commands.
+
+        Args:
+            response: The full LLM response string
+
+        Returns:
+            ParseResult with commands, completion status, errors and warnings
+        """
+        # Try normal parsing first
+        result = self._try_parse_response(response)
+
+        if result.error:
+            # Try auto-fixes in order until one works
+            for fix_name, fix_function in self._get_auto_fixes():
+                corrected_response, was_fixed = fix_function(response, result.error)
+                if was_fixed:
+                    corrected_result = self._try_parse_response(corrected_response)
+
+                    if corrected_result.error == "":
+                        # Success! Add auto-correction warning
+                        auto_warning = (
+                            f"AUTO-CORRECTED: {fix_name} - "
+                            "please fix this in future responses"
+                        )
+                        corrected_result.warning = self._combine_warnings(
+                            auto_warning, corrected_result.warning
+                        )
+                        return corrected_result
+
+        # Return original result if no fix worked
+        return result</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>自动修复只在首轮解析失败时触发，因为分支条件明确是 <code>if result.error:</code>；这避免了对已成功解析的响应做额外改写。</li><li>每个修复尝试都基于原始 <code>response</code> 与原始 <code>result.error</code> 调用，而不是串联前一个修复结果；这一选择使各修复方案彼此独立，避免级联修补引入新的偏差。</li><li>修复结果的接受条件是严格的：必须重解析后满足 <code>corrected_result.error == ""</code> 才算成功；仅仅 <code>was_fixed</code> 为真并不足以被采纳。</li><li>成功修复时不会静默掩盖问题，而是显式向 <code>corrected_result.warning</code> 追加 <code>AUTO-CORRECTED: ...</code> 提示，使返回结果保留“解析成功但原始响应有缺陷”的信息。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 外部通过 XML plain parser 实例调用的响应解析入口; 任何需要把原始响应字符串转换为 <code>ParseResult</code> 的上层解析调用点</li><li><strong>核心被调用</strong>: TerminusXMLPlainParser._try_parse_response; TerminusXMLPlainParser._get_auto_fixes; 各自动修复函数 <code>fix_function(response, result.error)</code>; TerminusXMLPlainParser._combine_warnings</li><li><strong>配置/状态来源</strong>: <code>self._get_auto_fixes()</code> 提供的修复策略顺序; <code>self._try_parse_response</code> 的错误判定结果 <code>result.error</code></li><li><strong>结果去向</strong>: 调用方获得返回的 <code>ParseResult</code>; 成功修复分支返回带合并告警的 <code>corrected_result</code>; 失败时返回首次解析得到的 <code>result</code></li><li><strong>同类 sibling</strong>: 与 <code>TerminusJSONPlainParser.parse_response</code> 属于同名入口职责：先常规解析，再在失败时尝试自动修复；本条目仅描述当前 XML 实现中该函数体明确体现的行为。</li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_try_parse_response"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser._try_parse_response</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L62-L169" title="terminus_xml_plain_parser.py:62-169">terminus_xml_plain_parser.py:62–169 ↗</a></summary><div class="file-body"><p class="fn-sub">XML 回复分支判定与结果组装</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数负责把一段 XML 形式的回复文本整理为 <code>ParseResult</code>。它本身不直接解析命令语义细节，而是串联若干辅助方法，并依据 <code>response_content</code>、<code>is_complete</code>、<code>sections</code>、<code>parse_error</code> 的不同取值决定返回哪一种结果。与同类入口函数相比，这里呈现的是一次“尝试解析”的具体分支逻辑。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收 <code>response: str</code>，尝试从中提取 <code>&lt;response&gt;</code> 包裹内容、完成标记、分析/计划文本以及命令区段，并返回一个 <code>ParseResult</code>。它显式处理几类情况：缺少 <code>&lt;response&gt;</code>、<code>&lt;commands&gt;</code> 区段缺失、<code>&lt;commands&gt;</code> 存在但为空、命令解析报错、以及正常成功。函数体内不直接写入实例状态；其可见产出仅为返回的 <code>ParseResult</code>，其中错误与警告字段按分支分别填充。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, response: str) -&gt; ParseResult</code></p>
+<ul><li>参数: <code>response</code>: <code>str</code> — 待解析的完整回复字符串</li><li>读状态: <code>本函数体没有直接读取 </code>self<code> 上的数据属性；行为依赖于对 </code>self._check_extra_text<code>、</code>self._extract_response_content<code>、</code>self._check_task_complete<code>、</code>self._extract_sections<code>、</code>self._parse_xml_commands<code> 的调用结果</code></li><li>返回: 返回一个 <code>ParseResult</code>。主要分支包括：<code>response_content</code> 为假值时返回 <code>commands=[]、is_task_complete=False、error='No &lt;response&gt; tag found'</code>；<code>commands_content</code> 为假值且 <code>'commands' in sections</code> 时返回空命令、空错误，并保留 <code>is_complete</code>；<code>commands</code> 区段完全缺失且 <code>is_complete=False</code> 时返回 <code>error='Missing &lt;commands&gt; section'</code>；<code>_parse_xml_commands(...)</code> 得到 <code>parse_error</code> 时，若 <code>is_complete=True</code> 则将该错误降级为警告并返回空错误，否则将其作为 <code>error</code> 返回；成功时返回解析出的 <code>commands</code>、<code>is_complete</code>、空错误，以及提取出的 <code>analysis</code>/<code>plan</code>。</li><li>副作用: 无直接实例状态写入; 原位追加局部列表 <code>warnings</code>，并将其格式化后写入返回值的 <code>warning</code> 字段</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>初始化局部 <code>warnings = []</code>，随后调用 <code>self._check_extra_text(response, warnings)</code>；该调用的结果不直接决定控制流，但后续会把累计告警拼接进返回的 <code>warning</code> 字段。</li><li>调用 <code>response_content = self._extract_response_content(response)</code>；若 <code>if not response_content</code> 成立，则立即返回 <code>ParseResult([], False, 'No &lt;response&gt; tag found', 格式化告警, '', '')</code>。</li><li>对已提取的 <code>response_content</code> 调用 <code>self._check_task_complete(response_content)</code> 得到 <code>is_complete</code>，再调用 <code>sections = self._extract_sections(response_content, warnings)</code>；随后用 <code>sections.get('analysis', '')</code> 与 <code>sections.get('plan', '')</code> 提取 <code>analysis</code>、<code>plan</code>。</li><li>读取 <code>commands_content = sections.get('commands', '')</code>；若 <code>if not commands_content</code> 成立且 <code>'commands' in sections</code>，表示命令区段存在但为空。此时仅在 <code>not is_complete</code> 时追加一条关于空命令区段的特定警告，并返回空命令、空错误、当前完成标志以及 <code>analysis</code>/<code>plan</code>。</li><li>若 <code>if not commands_content</code> 成立且 <code>'commands' not in sections</code>，表示命令区段完全缺失。此时若 <code>is_complete</code> 为真，则返回空命令、<code>True</code>、空错误；否则返回空命令、<code>False</code>、错误 <code>'Missing &lt;commands&gt; section'</code>。</li><li>在存在非空 <code>commands_content</code> 时，调用 <code>commands, parse_error = self._parse_xml_commands(commands_content, warnings)</code>；若 <code>if parse_error</code> 成立，则按 <code>is_complete</code> 分流：完成态下把 <code>parse_error</code> 追加到 <code>warnings</code> 并以空错误返回，未完成态下把 <code>parse_error</code> 直接作为 <code>error</code> 返回。</li><li>若以上分支都未提前返回，则以 <code>commands</code>、<code>is_complete</code>、空错误、格式化后的警告串以及前面提取的 <code>analysis</code>、<code>plan</code> 组装最终 <code>ParseResult</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _try_parse_response(self, response: str) -&gt; ParseResult:
+        """
+        Try to parse a terminus XML plain response.
+
+        Args:
+            response: The full LLM response string
+
+        Returns:
+            ParseResult with commands, completion status, errors and warnings
+        """
+        warnings = []
+
+        # Check for extra text before/after &lt;response&gt; tags
+        self._check_extra_text(response, warnings)
+
+        # Extract &lt;response&gt; content
+        response_content = self._extract_response_content(response)
+        if not response_content:
+            return ParseResult(
+                [],
+                False,
+                "No &lt;response&gt; tag found",
+                "- " + "\n- ".join(warnings) if warnings else "",
+                "",
+                "",
+            )
+
+        # Check if task is complete first
+        is_complete = self._check_task_complete(response_content)
+
+        # Check for required sections and extract content
+        sections = self._extract_sections(response_content, warnings)
+
+        # Extract analysis and plan for reasoning content
+        analysis = sections.get("analysis", "")
+        plan = sections.get("plan", "")
+
+        # Extract commands section
+        commands_content = sections.get("commands", "")
+        if not commands_content:
+            if "commands" in sections:
+                # Commands section exists but is empty
+                if not is_complete:
+                    warnings.append(
+                        "Commands section is empty; not taking any action. "
+                        "If you want to wait a specific amount of time please use "
+                        "`sleep`, but if you're waiting for a command to finish then "
+                        "continue to wait."
+                    )
+                return ParseResult(
+                    [],
+                    is_complete,
+                    "",
+                    "- " + "\n- ".join(warnings) if warnings else "",
+                    analysis,
+                    plan,
+                )
+            else:
+                # Commands section is missing entirely
+                if is_complete:
+                    return ParseResult(
+                        [],
+                        True,
+                        "",
+                        "- " + "\n- ".join(warnings) if warnings else "",
+                        analysis,
+                        plan,
+                    )
+                return ParseResult(
+                    [],
+                    False,
+                    "Missing &lt;commands&gt; section",
+                    "- " + "\n- ".join(warnings) if warnings else "",
+                    analysis,
+                    plan,
+                )
+
+        # Parse commands directly from XML (no code blocks in plain format)
+        commands, parse_error = self._parse_xml_commands(commands_content, warnings)
+        if parse_error:
+            # If task is complete, parse errors are just warnings
+            if is_complete:
+                warnings.append(parse_error)
+                return ParseResult(
+                    [],
+                    True,
+                    "",
+                    "- " + "\n- ".join(warnings) if warnings else "",
+                    analysis,
+                    plan,
+                )
+            return ParseResult(
+                [],
+                False,
+                parse_error,
+                "- " + "\n- ".join(warnings) if warnings else "",
+                analysis,
+                plan,
+            )
+
+        return ParseResult(
+            commands,
+            is_complete,
+            "",
+            "- " + "\n- ".join(warnings) if warnings else "",
+            analysis,
+            plan,
+        )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数把“命令相关问题”区分为三类：区段存在但为空（<code>if 'commands' in sections</code> 且 <code>if not commands_content</code>）、区段完全缺失（<code>else</code> 分支）、以及区段内容解析失败（<code>if parse_error</code>）。这种分流使不同问题得到不同严重度的返回结果，而不是统一报成同一种解析错误。</li><li><code>is_complete</code> 会影响错误降级策略：当任务已完成时，缺失命令区段不会报错，命令解析错误也会被转成警告；只有在未完成时，这些情况才会阻断为错误返回。这个取舍直接体现在 <code>if is_complete</code> 的两个分支上。</li><li>空命令区段的长提示语只在“区段存在、内容为空、且任务未完成”时追加，而不是所有空命令情况都追加。这说明该提示被用于约束未完成任务时的无动作回复，而已完成路径刻意避免附加这条提醒。</li><li>函数始终把 <code>analysis</code> 与 <code>plan</code> 的提取独立于命令成败：即便后续进入空命令、缺失命令或解析错误分支，只要 <code>sections</code> 中已有这两个字段，对应文本仍会被带入返回值。这是通过在命令判断前先执行 <code>sections.get(...)</code> 实现的。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: TerminusXMLPlainParser.parse_response</li><li><strong>核心被调用</strong>: self._check_extra_text; self._extract_response_content; self._check_task_complete; self._extract_sections; self._parse_xml_commands; ParseResult</li><li><strong>配置/状态来源</strong>: 输入参数 <code>response</code>; <code>self._extract_response_content(response)</code> 的返回值 <code>response_content</code>; <code>self._check_task_complete(response_content)</code> 的返回值 <code>is_complete</code>; <code>self._extract_sections(response_content, warnings)</code> 的返回值 <code>sections</code>; <code>self._parse_xml_commands(commands_content, warnings)</code> 的返回值 <code>commands, parse_error</code></li><li><strong>结果去向</strong>: 返回给本函数调用方的 <code>ParseResult</code>; <code>ParseResult.commands</code> 字段; <code>ParseResult.is_task_complete</code> 字段; <code>ParseResult.error</code> 字段; <code>ParseResult.warning</code> 字段; <code>ParseResult.analysis</code> 字段; <code>ParseResult.plan</code> 字段</li><li><strong>同类 sibling</strong>: TerminusXMLPlainParser.parse_response：该函数的直接上层入口，会先调用本函数获取首个解析结果; TerminusJSONPlainParser._try_parse_response：同名职责对应的 JSON 版本，但此处不描述其内部策略</li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_check_extra_text"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser._check_extra_text</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L196-L223" title="terminus_xml_plain_parser.py:196-223">terminus_xml_plain_parser.py:196–223 ↗</a></summary><div class="file-body"><p class="fn-sub">XML响应块外溢文本告警检查器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 XML 响应解析阶段，职责很窄：只检查原始 <code>response</code> 中主 <code>&lt;response&gt;</code> 块前后是否夹带额外文本，并把发现结果写入传入的 <code>warnings</code>。与同 stage 的 <code>_try_parse_response</code> 相比，它不负责提取字段、解析命令或构造 <code>ParseResult</code>，而是提供一段结构性告警补充。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收原始响应字符串 <code>response</code> 与可变列表 <code>warnings</code>，围绕首个 <code>&lt;response&gt;</code> 与首个 <code>&lt;/response&gt;</code> 的位置检查块外非空白文本。若 <code>&lt;response&gt;</code> 不存在，则直接返回且不追加任何告警；否则最多追加三条具体告警：<code>&lt;response&gt;</code> 前存在额外文本、<code>&lt;/response&gt;</code> 后存在额外文本，以及在已发现尾随文本且 <code>response.count("&lt;response&gt;") &gt; 1</code> 时追加一条强调“只应输出一个 <code>&lt;response&gt;</code> 块”的重要告警。返回值为 <code>None</code>，真正产出是对 <code>warnings</code> 的原位修改。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, response: str, warnings: List[str]) -&gt; None</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 实例引用；本函数体内未读取任何实例属性; <code>response</code>: <code>str</code> — 待检查的原始模型响应文本，作为 <code>&lt;response&gt;</code>/<code>&lt;/response&gt;</code> 与块外文本的搜索源; <code>warnings</code>: <code>List[str]</code> — 由调用方提供的可变告警列表；命中条件时向其中追加人类可读告警</li><li>返回: 返回 <code>None</code>；实际产出是按条件向 <code>warnings</code> 原位追加最多三条具体字符串告警。</li><li>副作用: 可能向 <code>warnings</code> 追加 <code>"Extra text detected before &lt;response&gt; tag"</code>; 可能向 <code>warnings</code> 追加 <code>"Extra text detected after &lt;/response&gt; tag"</code>; 可能向 <code>warnings</code> 追加 <code>"IMPORTANT: Only issue one &lt;response&gt; block at a time. You issued {total_response_count} and only the first was executed."</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先用 <code>response.find("&lt;response&gt;")</code> 与 <code>response.find("&lt;/response&gt;")</code> 定位首个起始标签和首个结束标签，分别保存为 <code>start_pos</code> 与 <code>end_pos</code>。</li><li>若 <code>start_pos == -1</code>，函数立即 <code>return</code>；这一分支不写入任何告警。</li><li>若找到了 <code>&lt;response&gt;</code>，取 <code>response[:start_pos].strip()</code> 作为 <code>before_text</code>；只要该值非空，就向 <code>warnings</code> 追加 <code>"Extra text detected before &lt;response&gt; tag"</code>。</li><li>只有在 <code>end_pos != -1</code> 时，才继续检查结束标签之后的文本：取 <code>response[end_pos + len("&lt;/response&gt;") :].strip()</code> 为 <code>after_text</code>；若其非空，就向 <code>warnings</code> 追加 <code>"Extra text detected after &lt;/response&gt; tag"</code>。</li><li>仍然只在上述“存在尾随文本”的分支里，计算 <code>response.count("&lt;response&gt;")</code> 得到 <code>total_response_count</code>；若其大于 1，再追加一条 <code>IMPORTANT</code> 告警，说明本次输出了多个 <code>&lt;response&gt;</code> 块且只会执行第一个。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _check_extra_text(self, response: str, warnings: List[str]) -&gt; None:
+        """Check for extra text before/after &lt;response&gt; tags."""
+        # Find response tag positions
+        start_pos = response.find("&lt;response&gt;")
+        end_pos = response.find("&lt;/response&gt;")
+
+        if start_pos == -1:
+            return  # Will be handled as error later
+
+        # Check text before &lt;response&gt;
+        before_text = response[:start_pos].strip()
+        if before_text:
+            warnings.append("Extra text detected before &lt;response&gt; tag")
+
+        # Check text after &lt;/response&gt; if closing tag exists
+        if end_pos != -1:
+            after_text = response[end_pos + len("&lt;/response&gt;") :].strip()
+            if after_text:
+                warnings.append("Extra text detected after &lt;/response&gt; tag")
+
+                # Count total &lt;response&gt; tags
+                total_response_count = response.count("&lt;response&gt;")
+                if total_response_count &gt; 1:
+                    warnings.append(
+                        f"IMPORTANT: Only issue one &lt;response&gt; block at a time. "
+                        f"You issued {total_response_count} and only the first "
+                        f"was executed."
+                    )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数把“缺少 <code>&lt;response&gt;</code>”排除在自身职责之外：代码在 <code>start_pos == -1</code> 时直接返回，而不是写告警或报错。这体现了一个边界划分——本函数只处理已出现起始标签时的块外文本问题，不在这里处理起始标签缺失。</li><li>对 <code>&lt;/response&gt;</code> 后文本的检查采用显式门控：只有 <code>end_pos != -1</code> 才会切片并判断 <code>after_text</code>。因此，缺少关闭标签时不会产生“结束标签后有多余文本”的告警，避免在结束边界不存在时构造不可靠结论。</li><li>重复 <code>&lt;response&gt;</code> 的强调告警不是独立全局检查，而是嵌套在“<code>&lt;/response&gt;</code> 后确有额外文本”分支中。也就是说，只有已经检测到关闭标签后仍有内容外溢时，<code>response.count("&lt;response&gt;") &gt; 1</code> 才会触发更强提示；单纯多个 <code>&lt;response&gt;</code> 字样但没有该尾随文本条件，不会在这里告警。</li><li>文本存在性判断统一经过 <code>.strip()</code>，这意味着纯空白前缀或后缀被视为可接受格式，不会污染 <code>warnings</code>。函数只把非空白可见内容认定为“extra text”。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未知；提供的源码片段未展示直接调用点; XML 解析路径中的某个上层检查步骤（从参数形态与函数命名可见）</li><li><strong>核心被调用</strong>: str.find; str.strip; list.append; str.count</li><li><strong>配置/状态来源</strong>: 参数 <code>response</code>：唯一的检查输入源; 参数 <code>warnings</code>：唯一的可变输出载体; 局部变量 <code>start_pos</code>：由 <code>response.find("&lt;response&gt;")</code> 得出; 局部变量 <code>end_pos</code>：由 <code>response.find("&lt;/response&gt;")</code> 得出</li><li><strong>结果去向</strong>: 传入的 <code>warnings</code> 列表内容; 调用方后续对 <code>warnings</code> 的消费逻辑（本片段未展示具体位置）; 本函数返回点本身不携带结果，所有有效结果均通过副作用输出; 与同 stage 的 <code>_try_parse_response</code> 相比，本函数只产生告警素材，不解析命令或字段</li><li><strong>同类 sibling</strong>: TerminusXMLPlainParser._try_parse_response：负责 XML 主体提取与命令区段解析；本函数仅补充块外文本告警; TerminusXMLPlainParser.parse_response：负责首轮解析与修复尝试；本函数自身不做修复</li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_extract_sections"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser._extract_sections</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L238-L318" title="terminus_xml_plain_parser.py:238-318">terminus_xml_plain_parser.py:238–318 ↗</a></summary><div class="file-body"><p class="fn-sub">XML响应区段提取与结构告警器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 XML 响应解析阶段，职责是把原始 <code>content</code> 中的已知区段整理成字典，并同步补充结构性告警。它由同类解析流程中的 <code>_try_parse_response</code> 调用，和兄弟函数 <code>_check_extra_text</code>、<code>_check_section_order</code> 分别覆盖块外文本、区段顺序等不同维度。相较同 stage 的 JSON 分支，这里处理的是类 XML 标签集合，而不是字段化 JSON 对象。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收响应正文 <code>content</code> 与可变告警列表 <code>warnings</code>，尝试提取 <code>analysis</code>、<code>plan</code>、<code>commands</code>、<code>task_complete</code> 四类标签对应的文本内容。返回值是仅包含“成功识别到的区段”的字典；缺失区段不会出现在返回字典中。副作用仅限于向 <code>warnings</code> 追加缺失必需区段、未知顶层标签、重复标签以及顺序检查相关的告警。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, content: str, warnings: List[str]) -&gt; dict</code></p>
+<ul><li>参数: <code>content</code>: <code>str</code> — 待扫描的 XML 风格响应文本; <code>warnings</code>: <code>List[str]</code> — 由调用方传入并原位追加诊断信息的告警列表</li><li>读状态: <code>self.required_sections</code>, <code>self._find_top_level_tags</code>, <code>self._check_section_order</code></li><li>返回: 返回 <code>dict</code>：键为已找到的区段名，值为对应内容的去首尾空白字符串；自闭合或显式空标签记为 <code>""</code>；未找到的区段不会写入返回字典。</li><li>副作用: 原位修改 <code>warnings</code>，追加缺失必需区段告警; 原位修改 <code>warnings</code>，追加未知顶层标签告警; 原位修改 <code>warnings</code>，追加重复标签告警; 调用 <code>self._check_section_order(content, warnings)</code>，使其继续向 <code>warnings</code> 追加顺序相关告警</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>初始化 <code>sections = {}</code><code> 和 </code>found_sections = set()<code>，并在局部常量 </code>section_patterns` 中为四个已知区段分别准备三类匹配模式：完整包裹标签、自闭合标签、显式空标签。</li><li>按 <code>section_patterns.items()</code> 逐个处理区段名；每个区段先用 <code>re.search(full_pattern, content, re.DOTALL)</code> 查找完整标签。若匹配成功，则提取 <code>match.group(1).strip()</code> 写入 <code>sections[section_name]</code>，并把名称加入 <code>found_sections</code>；由于使用 <code>re.search</code> 且随后 <code>continue</code>，每个区段只提取第一个完整匹配。</li><li>若完整标签未匹配，则依次检查自闭合模式与空标签模式；任一命中时，都将该区段写为 <code>""</code> 并登记到 <code>found_sections</code>，然后进入下一个区段。</li><li>用 <code>required = set(self.required_sections)</code> 与 <code>missing = required - found_sections</code> 计算缺失区段；对缺失项逐个追加 <code>Missing &lt;...&gt; section</code> 告警，但显式跳过 <code>task_complete</code>，即使它出现在 <code>required_sections</code> 中也不发缺失告警。</li><li>调用 <code>self._find_top_level_tags(content)</code> 获取直接子级标签名集合视图，并与 <code>expected_tags = set(self.required_sections + ["task_complete"])</code> 比较；凡是不在预期集合中的顶层标签，都追加 <code>Unknown tag found: &lt;...&gt;</code> 告警。</li><li>对 <code>self.required_sections + ["task_complete"]</code> 中的每个标签，用 <code>re.findall(f"&lt;{section_name}(?:\\s|&gt;|/&gt;)", content)</code> 统计出现次数；当次数大于 1 时，<code>commands</code> 生成一条带 <code>IMPORTANT</code> 的专门告警，其余标签生成通用的 <code>Multiple &lt;...&gt; sections found</code> 告警。</li><li>最后调用 <code>self._check_section_order(content, warnings)</code> 进行区段顺序检查，并返回前面累计得到的 <code>sections</code> 字典。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _extract_sections(self, content: str, warnings: List[str]) -&gt; dict:
+        """Extract analysis, plan, commands, and task_complete sections."""
+        sections = {}
+        found_sections = set()
+
+        # Define patterns for each section
+        section_patterns = {
+            "analysis": (
+                r"&lt;analysis&gt;(.*?)&lt;/analysis&gt;",
+                r"&lt;analysis\s*/&gt;",
+                r"&lt;analysis&gt;&lt;/analysis&gt;",
+            ),
+            "plan": (r"&lt;plan&gt;(.*?)&lt;/plan&gt;", r"&lt;plan\s*/&gt;", r"&lt;plan&gt;&lt;/plan&gt;"),
+            "commands": (
+                r"&lt;commands&gt;(.*?)&lt;/commands&gt;",
+                r"&lt;commands\s*/&gt;",
+                r"&lt;commands&gt;&lt;/commands&gt;",
+            ),
+            "task_complete": (
+                r"&lt;task_complete&gt;(.*?)&lt;/task_complete&gt;",
+                r"&lt;task_complete\s*/&gt;",
+                r"&lt;task_complete&gt;&lt;/task_complete&gt;",
+            ),
+        }
+
+        for section_name, patterns in section_patterns.items():
+            full_pattern, self_closing_pattern, empty_pattern = patterns
+
+            # Try full pattern first
+            match = re.search(full_pattern, content, re.DOTALL)
+            if match:
+                sections[section_name] = match.group(1).strip()
+                found_sections.add(section_name)
+                continue
+
+            # Try self-closing pattern
+            if re.search(self_closing_pattern, content):
+                sections[section_name] = ""  # Self-closing = empty content
+                found_sections.add(section_name)
+                continue
+
+            # Try empty pattern
+            if re.search(empty_pattern, content):
+                sections[section_name] = ""  # Empty = empty content
+                found_sections.add(section_name)
+                continue
+
+        # Check for missing required sections
+        required = set(self.required_sections)
+        missing = required - found_sections
+        for section in missing:
+            if section != "task_complete":  # task_complete is optional
+                warnings.append(f"Missing &lt;{section}&gt; section")
+
+        # Check for unexpected tags at the direct child level of &lt;response&gt; only
+        # Find all top-level tags (not nested inside other tags)
+        top_level_tags = self._find_top_level_tags(content)
+        expected_tags = set(self.required_sections + ["task_complete"])
+        unexpected = set(top_level_tags) - expected_tags
+        for tag in unexpected:
+            warnings.append(
+                f"Unknown tag found: &lt;{tag}&gt;, expected "
+                f"analysis/plan/commands/task_complete"
+            )
+
+        # Check for multiple instances of same tag
+        for section_name in self.required_sections + ["task_complete"]:
+            tag_count = len(re.findall(f"&lt;{section_name}(?:\\s|&gt;|/&gt;)", content))
+            if tag_count &gt; 1:
+                if section_name == "commands":
+                    warnings.append(
+                        f"IMPORTANT: Only issue one &lt;commands&gt; block at a time. "
+                        f"You issued {tag_count} and only the first was executed."
+                    )
+                else:
+                    warnings.append(f"Multiple &lt;{section_name}&gt; sections found")
+
+        # Check for correct order of sections (analysis, plan, commands)
+        self._check_section_order(content, warnings)
+
+        return sections</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>代码对每个区段采用“完整标签优先，其次自闭合，再次空标签”的判定顺序；这是由三个 <code>re.search(...)</code> 分支的先后顺序直接体现的选择。该选择使非空内容在存在时优先被提取，而 <code>&lt;tag/&gt;</code> 与 <code>&lt;tag&gt;&lt;/tag&gt;</code> 都被统一折叠为空字符串。</li><li>代码使用 <code>re.search(..., re.DOTALL)</code> 而不是 <code>re.findall(...)</code> 提取区段正文，因此只保留每类区段的第一个完整匹配，同时允许正文跨多行。这一取舍与后面的重复标签告警配套：函数会提示“有多个”，但返回结果只保留第一处匹配。</li><li>代码把缺失区段检查建立在 <code>self.required_sections</code> 之上，却对 <code>task_complete</code> 单独豁免缺失告警；这一点由 <code>if section != "task_complete"</code> 明确写死，说明它在本函数里被当作可缺省区段处理。</li><li>未知标签检查只基于 <code>self._find_top_level_tags(content)</code> 的结果，而不是对全文所有标签做差集；代码注释也明确限定为 <code>direct child level of &lt;response&gt; only</code>。这避免把嵌套标签纳入“未知区段”告警范围。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: TerminusXMLPlainParser._try_parse_response</li><li><strong>核心被调用</strong>: re.search; re.findall; self._find_top_level_tags; self._check_section_order</li><li><strong>配置/状态来源</strong>: self.required_sections; 局部常量 <code>section_patterns</code></li><li><strong>结果去向</strong>: 返回给调用方的 <code>sections</code> 字典; 调用方持有的 <code>warnings</code> 列表</li><li><strong>同类 sibling</strong>: TerminusXMLPlainParser._check_extra_text：同样向 <code>warnings</code> 追加文本结构问题，但关注 <code>&lt;response&gt;</code> 块外文本，而非内部区段集合。; TerminusXMLPlainParser._try_parse_response：在更高一层组织 <code>&lt;response&gt;</code> 提取、完成标记解析与命令区段处理，本函数只负责内部区段提取与校验。; TerminusJSONPlainParser._extract_json_content：二者都做“从原始响应中抽出结构化主体”的工作，但一个面向 XML 标签，一个面向 JSON 对象边界。</li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_check_section_order"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser._check_section_order</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L442-L480" title="terminus_xml_plain_parser.py:442-480">terminus_xml_plain_parser.py:442–480 ↗</a></summary><div class="file-body"><p class="fn-sub">XML区段顺序告警检查器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数是一个纯局部校验例程，职责仅限于检查 <code>content</code> 中若干 XML 风格区段的出现顺序是否符合约定。它不解析完整结构、不验证区段是否必然存在，也不读取任何实例状态；可见产出只有对传入 <code>warnings</code> 列表的条件性追加。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数扫描输入字符串 <code>content</code> 中 <code>analysis</code>、<code>plan</code>、<code>commands</code> 三类区段的起始标签首次出现位置，并比较这些“实际出现过的区段”之间的先后次序。若至少有两个区段被识别且顺序不符合期望，就向 <code>warnings</code> 追加一条人类可读的告警。函数自身返回 <code>None</code>，没有其他输出或状态写入。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, content: str, warnings: List[str]) -&gt; None</code></p>
+<ul><li>参数: <code>content</code>: <code>str</code> — 被扫描的文本；函数在其中查找 <code>&lt;analysis</code>、<code>&lt;plan</code>、<code>&lt;commands</code> 形式的起始标签; <code>warnings</code>: <code>List[str]</code> — 可变告警列表；当区段顺序异常时在末尾追加一条说明字符串</li><li>返回: 返回 <code>None</code>；真正产出是必要时对参数 <code>warnings</code> 的原位追加。</li><li>副作用: 可能调用 <code>warnings.append(...)</code> 追加一条“Sections appear in wrong order...”告警</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>初始化局部字典 <code>positions = {}</code>，准备记录各区段在 <code>content</code> 中的起始位置。</li><li>依次处理固定列表 <code>['analysis', 'plan', 'commands']</code>；对每个区段执行一次 <code>re.search(f"&lt;{section}(?:\\s|&gt;|/&gt;)", content)</code>，只取该区段首个匹配的起始位置 <code>match.start()</code>，若未匹配则该区段不进入 <code>positions</code>。</li><li>若 <code>positions</code> 中少于两个区段（<code>len(positions) &lt; 2</code>），函数立即返回，因为不足以比较先后顺序。</li><li>定义期望顺序 <code>expected_order = ['analysis', 'plan', 'commands']</code>，然后按该期望顺序筛出实际出现过的区段，形成 <code>present_sections</code>，其中每项为 <code>(section, position)</code>。</li><li>按记录的位置值对 <code>present_sections</code> 排序，得到实际出现顺序 <code>actual_order</code>；同时按 <code>expected_order</code> 过滤出仅包含已出现区段的期望子序列 <code>expected_present</code>。</li><li>比较 <code>actual_order</code> 与 <code>expected_present</code>；若两者不同，则把二者分别用 <code> → </code> 连接成字符串，并向 <code>warnings</code> 追加一条顺序错误告警。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _check_section_order(self, content: str, warnings: List[str]) -&gt; None:
+        """Check if sections appear in the correct order: analysis, plan, commands."""
+        # Find positions of each section
+        positions = {}
+        for section in ["analysis", "plan", "commands"]:
+            # Look for opening tags
+            match = re.search(f"&lt;{section}(?:\\s|&gt;|/&gt;)", content)
+            if match:
+                positions[section] = match.start()
+
+        # Check if we have at least 2 sections to compare order
+        if len(positions) &lt; 2:
+            return
+
+        # Expected order
+        expected_order = ["analysis", "plan", "commands"]
+
+        # Get sections that are present, in the order they appear
+        present_sections = []
+        for section in expected_order:
+            if section in positions:
+                present_sections.append((section, positions[section]))
+
+        # Sort by position to get actual order
+        actual_order = [
+            section for section, pos in sorted(present_sections, key=lambda x: x[1])
+        ]
+
+        # Get expected order for present sections only
+        expected_present = [s for s in expected_order if s in positions]
+
+        # Compare orders
+        if actual_order != expected_present:
+            actual_str = " → ".join(actual_order)
+            expected_str = " → ".join(expected_present)
+            warnings.append(
+                f"Sections appear in wrong order. Found: {actual_str}, "
+                f"expected: {expected_str}"
+            )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>该实现只用一次 <code>re.search(...)</code> 获取每类区段的首个起始标签位置，因此重复出现的同名区段不会被完整纳入顺序判断；这把检查目标限定为“首次出现的宏观顺序”，而非完整文档结构一致性。</li><li>顺序比较只针对 <code>positions</code> 中实际找到的区段子集进行：<code>expected_present = [s for s in expected_order if s in positions]</code>。这意味着缺失区段本身不会在这里触发告警；本函数专注于顺序问题，避免把“存在性”与“排序性”混在同一条规则里。</li><li>匹配模式使用 <code>&lt;{section}(?:\s|&gt;|/&gt;)</code>，显式接受标签名后接空白、普通闭合尖括号或自闭合写法，而不是要求完整 XML 解析；这是一个宽松的文本级检测策略，代价是它仅凭起始标签形态判断，不验证嵌套或配对正确性。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未知；源码片段未展示直接调用方; 任何需要对 <code>content</code> 执行区段顺序校验并收集告警的同类内部例程</li><li><strong>核心被调用</strong>: re.search; match.start; sorted; warnings.append</li><li><strong>配置/状态来源</strong>: 固定局部常量 <code>['analysis', 'plan', 'commands']</code>; 固定局部模式模板 <code>f"&lt;{section}(?:\\s|&gt;|/&gt;)"</code>; 局部期望顺序 <code>expected_order = ['analysis', 'plan', 'commands']</code></li><li><strong>结果去向</strong>: 传入的 <code>warnings</code> 列表; 调用方后续对 <code>warnings</code> 的消费逻辑</li><li><strong>同类 sibling</strong>: 与 <code>TerminusJSONPlainParser._check_field_order</code> 形态相近：二者都只检查预定义字段/区段的文本出现顺序，并在异常时追加一条告警。; 相较于 <code>TerminusXMLPlainParser._check_extra_text</code>，本函数不关心块外文本，只处理三个特定区段之间的相对位置。</li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_check_task_complete"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser._check_task_complete</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L514-L526" title="terminus_xml_plain_parser.py:514-526">terminus_xml_plain_parser.py:514–526 ↗</a></summary><div class="file-body"><p class="fn-sub">判定任务完成标签的布尔检查器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数是 XML 纯文本解析器内部的一个细粒度判定步骤，职责仅限于检查传入字符串中是否出现满足特定格式的 <code>&lt;task_complete&gt;</code> 标签。与同类兄弟函数相比，它不负责区段提取、顺序检查或告警累积，只产出一个布尔值。其实现完全自足：只读取参数 <code>response_content</code>，不读取实例状态。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数 <code>_check_task_complete</code> 接收字符串参数 <code>response_content</code>，检查其中是否存在大小写不敏感的 <code>&lt;task_complete&gt;...&lt;/task_complete&gt;</code> 标签，且标签内部文本匹配 <code>\s*true\s*</code>。若找到这样的匹配则返回 <code>True</code>，否则返回 <code>False</code>。函数不修改 <code>warnings</code>、不构造区段字典，也不写入任何 <code>self</code> 状态或外部状态。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, response_content: str) -&gt; bool</code></p>
+<ul><li>参数: <code>response_content</code>: <code>str</code> — 唯一输入文本；作为正则搜索目标，用于检查是否含有大小写不敏感且内容匹配 <code>\s*true\s*</code> 的 <code>&lt;task_complete&gt;</code> 标签</li><li>返回: 返回布尔值：仅当 <code>response_content</code> 中存在匹配模式 <code>&lt;task_complete&gt;\s*true\s*&lt;/task_complete&gt;</code>（<code>re.IGNORECASE</code>）的片段时返回 <code>True</code>；其中 <code>true</code> 两侧允许出现空白。其余情况一律返回 <code>False</code>。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>调用 <code>re.search(...)</code> 在参数 <code>response_content</code> 上执行一次正则搜索，模式固定为 <code>r"&lt;task_complete&gt;\s*true\s*&lt;/task_complete&gt;"</code>，并启用 <code>re.IGNORECASE</code>。</li><li>将搜索结果保存到局部变量 <code>true_match</code>。</li><li>若 <code>true_match</code> 为真值，则立即返回 <code>True</code>。</li><li>若未匹配到上述模式，则落入函数尾部并返回 <code>False</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _check_task_complete(self, response_content: str) -&gt; bool:
+        """Check if the response indicates the task is complete."""
+        # Check for &lt;task_complete&gt;true&lt;/task_complete&gt;
+        true_match = re.search(
+            r"&lt;task_complete&gt;\s*true\s*&lt;/task_complete&gt;",
+            response_content,
+            re.IGNORECASE,
+        )
+        if true_match:
+            return True
+
+        # All other cases (false, empty, self-closing, missing) = not complete
+        return False</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>完成判定被收敛为“是否匹配一个唯一正向模式”：代码只接受正则 <code>r"&lt;task_complete&gt;\s*true\s*&lt;/task_complete&gt;"</code>，因此判定标准明确且实现极简，但不会区分“显式 false”“空标签”“自闭合标签”“缺失标签”等不同未完成形态。</li><li>匹配使用 <code>re.IGNORECASE</code>，因此标签名与内部 <code>true</code> 的大小写变体都会被接受；这放宽了输入格式约束，但仍保持结构上的严格性，因为开始标签、结束标签及中间文本模式都必须同时满足。</li><li>内部文本使用 <code>\s*true\s*</code> 而非字面连续 <code>true</code>，可容忍 <code>true</code> 前后的空白字符；可观察效果是对常见格式化差异更宽容，而无需额外的裁剪步骤。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: TerminusXMLPlainParser 内部其他解析步骤会把待检查的响应文本作为 <code>response_content</code> 传入本函数</li><li><strong>核心被调用</strong>: re.search</li><li><strong>配置/状态来源</strong>: 无外部配置或实例字段输入；唯一数据源是显式参数 <code>response_content</code>; 匹配规则直接内嵌在正则字面量 <code>r"&lt;task_complete&gt;\s*true\s*&lt;/task_complete&gt;"</code> 中; 大小写处理策略直接来自 <code>re.IGNORECASE</code> 标志; 返回分支仅依赖局部变量 <code>true_match</code> 的真值</li><li><strong>结果去向</strong>: 返回给直接调用方一个布尔结果 <code>True</code> 或 <code>False</code>; 该结果不伴随告警列表修改; 该结果不伴随错误字符串产出; 该结果不写入任何实例寄存状态</li><li><strong>同类 sibling</strong>: 相较于 <code>TerminusXMLPlainParser._extract_sections</code>，本函数不提取多类区段，也不向 <code>warnings</code> 追加缺失/重复/顺序类告警。; 相较于 <code>TerminusXMLPlainParser._check_extra_text</code> 与 <code>_check_section_order</code>，本函数没有原位修改传入列表的副作用，输出形式更单一。; 相较于 <code>TerminusXMLPlainParser._try_parse_response</code>，本函数不构造 <code>ParseResult</code>，仅负责一个局部布尔判定。</li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_parse_xml_commands"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser._parse_xml_commands</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L320-L391" title="terminus_xml_plain_parser.py:320-391">terminus_xml_plain_parser.py:320–391 ↗</a></summary><div class="file-body"><p class="fn-sub">XML 命令区段的手工提取器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 Response Parse 阶段，职责是把已拿到的 <code>xml_content</code> 中 <code>&lt;keystrokes&gt;...&lt;/keystrokes&gt;</code> 片段转换为命令对象，同时汇集解析期告警。它不负责整段响应的区段识别，而是聚焦命令明细，和同类兄弟函数 <code>_extract_sections</code>、<code>_check_task_complete</code> 分工互补。相较于 JSON 侧的 <code>_parse_commands</code>，这里处理的是 XML/plain 形态下的命令正文与标签属性问题。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收 <code>xml_content: str</code> 与可变告警列表 <code>warnings</code>，从中提取所有 <code>&lt;keystrokes&gt;</code> 命令块，解析每条命令的 <code>duration</code> 属性，并生成 <code>ParsedCommand</code> 列表。对缺失或非法的时长、非末条命令缺少结尾换行、XML 实体字面量以及字符串中出现的 <code>"\\r\\n"</code>，它会直接向 <code>warnings</code> 追加告警。返回值始终是 <code>(commands, "")</code> 这一二元组，其中错误字符串在本函数内固定为空。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, xml_content: str, warnings: List[str]) -&gt; tuple[List[ParsedCommand], str]</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 解析器实例；仅用于调用 <code>self._check_attribute_issues(...)</code>; <code>xml_content</code>: <code>str</code> — 待扫描的 XML 风格命令文本；既作为 <code>&lt;keystrokes&gt;</code> 块提取源，也在循环后被整体扫描以检查 XML 实体字面量与 <code>"\\r\\n"</code>; <code>warnings</code>: <code>List[str]</code> — 调用方提供的可变告警容器；本函数直接 <code>append(...)</code> 多类告警，并传给 <code>_check_attribute_issues(...)</code> 供其进一步补充</li><li>返回: 返回 <code>(commands, "")</code>：前者是按出现顺序构造的 <code>ParsedCommand</code> 列表，后者为固定空字符串；真正的附加产出是对 <code>warnings</code> 的原位修改。</li><li>副作用: 直接向 <code>warnings</code> 追加时长缺失、时长非法、非末条命令缺少结尾换行、XML 实体字面量、以及 <code>"\\r\\n"</code> 相关告警; 通过调用 <code>self._check_attribute_issues(attributes_str, i + 1, warnings)</code>，可能间接向 <code>warnings</code> 追加属性问题告警</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先编译 <code>keystrokes_pattern = re.compile(r"&lt;keystrokes([^&gt;]*)&gt;(.*?)&lt;/keystrokes&gt;", re.DOTALL)</code>，并对 <code>xml_content</code> 执行 <code>findall(...)</code>，得到每个命令的属性串 <code>attributes_str</code> 与正文 <code>keystrokes_content</code>。</li><li>按匹配顺序遍历各命令；每轮首先调用 <code>self._check_attribute_issues(attributes_str, i + 1, warnings)</code> 检查当前 <code>&lt;keystrokes ...&gt;</code> 的属性问题。</li><li>对每条命令把 <code>duration</code> 先初始化为 <code>1.0</code>，再用 <code>re.search(r'duration\s*=\s*["\']([^"\']*)["\']', attributes_str)</code> 提取时长属性；若存在且可转为 <code>float</code> 则采用该值，若转换抛出 <code>ValueError</code> 或属性缺失，则保留默认值并分别追加对应告警。</li><li>仅当当前命令不是最后一条（<code>i &lt; len(matches) - 1</code>）时，检查 <code>keystrokes_content.endswith("\n")</code>；若不以换行结束，则追加“后续命令会拼接到同一行”的告警。</li><li>将当前条目构造成 <code>ParsedCommand(keystrokes=keystrokes_content, duration=duration)</code> 并加入 <code>commands</code> 列表。</li><li>在命令循环结束后，基于预定义 <code>entities</code> 映射对整个 <code>xml_content</code> 做一次全文扫描；每发现一个 <code>&amp;lt;</code>、<code>&amp;gt;</code>、<code>&amp;amp;</code>、<code>&amp;quot;</code>、<code>&amp;apos;</code> 字面量，就追加一条“本函数不会转换该实体”的告警。</li><li>最后再次针对整个 <code>xml_content</code> 检查是否包含字符串 <code>"\\r\\n"</code>；若包含，则追加建议改用 <code>"\\n"</code> 的告警，并返回 <code>(commands, "")</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _parse_xml_commands(
+        self, xml_content: str, warnings: List[str]
+    ) -&gt; tuple[List[ParsedCommand], str]:
+        """Parse XML content and extract command objects manually."""
+
+        # Find all keystrokes elements manually for better error reporting
+        commands = []
+        keystrokes_pattern = re.compile(
+            r"&lt;keystrokes([^&gt;]*)&gt;(.*?)&lt;/keystrokes&gt;", re.DOTALL
+        )
+
+        matches = keystrokes_pattern.findall(xml_content)
+        for i, (attributes_str, keystrokes_content) in enumerate(matches):
+            # Check for attribute issues
+            self._check_attribute_issues(attributes_str, i + 1, warnings)
+
+            # Parse attributes
+            duration = 1.0
+
+            # Parse duration attribute
+            duration_match = re.search(
+                r'duration\s*=\s*["\']([^"\']*)["\']', attributes_str
+            )
+            if duration_match:
+                try:
+                    duration = float(duration_match.group(1))
+                except ValueError:
+                    warnings.append(
+                        f"Command {i + 1}: Invalid duration value "
+                        f"'{duration_match.group(1)}', using default 1.0"
+                    )
+            else:
+                warnings.append(
+                    f"Command {i + 1}: Missing duration attribute, using default 1.0"
+                )
+
+            # Check for newline at end of keystrokes
+            if i &lt; len(matches) - 1 and not keystrokes_content.endswith("\n"):
+                warnings.append(
+                    f"Command {i + 1} should end with newline when followed "
+                    f"by another command. Otherwise the two commands will be "
+                    f"concatenated together on the same line."
+                )
+
+            commands.append(
+                ParsedCommand(keystrokes=keystrokes_content, duration=duration)
+            )
+
+        # Check for XML entities and warn
+        entities = {
+            "&amp;lt;": "&lt;",
+            "&amp;gt;": "&gt;",
+            "&amp;amp;": "&amp;",
+            "&amp;quot;": '"',
+            "&amp;apos;": "'",
+        }
+        for entity, char in entities.items():
+            if entity in xml_content:
+                warnings.append(
+                    f"Warning: {entity} is read verbatim and not converted to {char}. "
+                    f"NEVER USE {entity}, unless you want these exact characters to "
+                    f"appear directly in the output."
+                )
+
+        # Check for \r\n line endings and warn
+        if "\\r\\n" in xml_content:
+            warnings.append(
+                "Warning: \\r\\n line endings are not necessary - use \\n "
+                "instead for simpler output"
+            )
+
+        return commands, ""</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数采用针对 <code>&lt;keystrokes&gt;</code> 的正则扫描与局部属性解析，而不是在此处引入完整 XML 解析流程；从代码可见，其目标是围绕 <code>attributes_str</code>、<code>keystrokes_content</code> 和命令序号 <code>i + 1</code> 产出更细粒度、定位明确的告警。</li><li><code>duration</code> 的处理采取“默认接受、异常降级”策略：先设为 <code>1.0</code>，再尝试覆盖；即使属性缺失或 <code>float(...)</code> 失败，也只记录告警而不拒绝该命令。这一取舍直接体现在默认值初始化与 <code>except ValueError</code> 分支上。</li><li>换行检查被限定在“后面仍有下一条命令”的场景下才触发，而非对最后一条命令一律要求结尾换行；这是代码中 <code>i &lt; len(matches) - 1</code> 条件表达的有意识约束，用于仅拦截可能导致相邻命令文本并行拼接的情况。</li><li>对 XML 实体与 <code>"\\r\\n"</code> 的处理仅做全文扫描和告警，不做任何替换或解码；这一点由循环中的 <code>warnings.append(...)</code> 与函数末尾直接返回原始提取结果可见。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: TerminusXMLPlainParser._try_parse_response（在获得命令区段文本后调用本函数）</li><li><strong>核心被调用</strong>: self._check_attribute_issues; re.compile; keystrokes_pattern.findall; re.search; float; ParsedCommand</li><li><strong>配置/状态来源</strong>: 参数 <code>xml_content</code>：本函数全部解析与全文扫描的输入来源; 参数 <code>warnings</code>：本函数告警输出的承载容器; 局部常量 <code>entities</code>：实体字面量检查规则来源; 局部正则 <code>keystrokes_pattern</code> 与 <code>duration_match</code> 模式：命令块与时长属性的提取规则来源</li><li><strong>结果去向</strong>: 返回的 <code>commands</code> 列表进入调用方后续的 <code>ParseResult.commands</code> 组装路径; 返回的空错误字符串作为调用方判定“本函数未报告硬错误”的信号; 被原位扩充的 <code>warnings</code> 交回调用方，用于后续汇总解析告警</li><li><strong>同类 sibling</strong>: TerminusXMLPlainParser._extract_sections：负责顶层区段提取，本函数只处理已给定的命令内容; TerminusXMLPlainParser._check_extra_text：检查 <code>&lt;response&gt;</code> 块外文本，本函数不关注响应外层结构; TerminusJSONPlainParser._parse_commands：同为命令对象生成，但输入形态是 JSON 命令数组而非 XML 风格文本</li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_check_attribute_issues"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser._check_attribute_issues</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L482-L512" title="terminus_xml_plain_parser.py:482-512">terminus_xml_plain_parser.py:482–512 ↗</a></summary><div class="file-body"><p class="fn-sub">XML 命令属性问题告警检查器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数是 XML 解析器内部的一个局部校验步骤，专门检查单条命令标签的属性字符串 <code>attributes_str</code>。它不负责拒绝输入或构造命令对象，只把发现的问题追加到调用方提供的 <code>warnings</code>。与同类兄弟函数相比，它聚焦于“属性书写形式与属性名”这一窄域，而 <code>_parse_xml_commands</code> 负责整体命令提取与时长解析。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收属性子串 <code>attributes_str</code>、用于生成诊断文案的命令编号 <code>command_num</code>，以及可变列表 <code>warnings</code>。它分三轮独立扫描：未加引号的属性值、使用单引号的属性值、以及不在允许集合内的属性名；每发现一项就向 <code>warnings</code> 追加一条人类可读的告警。函数返回 <code>None</code>，真正产出是对 <code>warnings</code> 的原位累积修改；由于三轮检查互不排斥，同一个属性可累计得到多条告警。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, attributes_str: str, command_num: int, warnings: List[str]) -&gt; None</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 实例方法接收者；本函数体内未读取任何实例属性; <code>attributes_str</code>: <code>str</code> — 待检查的原始属性文本，作为三个正则扫描的输入; <code>command_num</code>: <code>int</code> — 写入告警文案中的命令序号标签; <code>warnings</code>: <code>List[str]</code> — 由调用方提供的可变告警列表；本函数向其中追加零到多条消息</li><li>返回: 返回 None；实际输出是对 <code>warnings</code> 的原位追加。告警是跨三轮独立检查累积的，同一属性可能产生多条。</li><li>副作用: 每次调用都会在函数内部编译两个正则 <code>unquoted_pattern</code> 与 <code>single_quote_pattern</code>; 按匹配结果向传入的 <code>warnings</code> 列表追加字符串告警</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先在本次调用内部编译 <code>unquoted_pattern = re.compile(r'(\w+)\s*=\s*([^"\'\s&gt;]+)')</code>，用它在 <code>attributes_str</code> 中查找未用引号包裹的 <code>name=value</code> 形式；对 <code>findall(...)</code> 返回的每个 <code>(attr_name, attr_value)</code>，追加一条建议改写为双引号形式的告警，并在文案中带上 <code>command_num</code>。</li><li>再编译 <code>single_quote_pattern = re.compile(r"(\w+)\s*=\s*'([^']*)'")</code>，扫描 <code>attributes_str</code> 中使用单引号的属性；对每个匹配追加一条“应使用双引号”的告警，同样带上命令编号与建议格式。</li><li>随后在函数内定义允许属性集合 <code>known_attributes = {"duration"}</code>，这是一个局部硬编码常量。</li><li>接着执行 <code>all_attributes = re.findall(r"(\w+)\s*=", attributes_str)</code>，从 <code>attributes_str</code> 中提取每一个出现过的 <code>name=</code>；这一轮是逐出现位置检查，不做去重，也不受前两轮是否已命中影响。</li><li>最后遍历 <code>all_attributes</code> 中的每个 <code>attr_name</code>，凡是不在 <code>known_attributes</code> 内的都追加“Unknown attribute”告警，并在文案中列出当前已知属性名。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _check_attribute_issues(
+        self, attributes_str: str, command_num: int, warnings: List[str]
+    ) -&gt; None:
+        """Check for attribute-related issues."""
+        # Check for missing quotes
+        unquoted_pattern = re.compile(r'(\w+)\s*=\s*([^"\'\s&gt;]+)')
+        unquoted_matches = unquoted_pattern.findall(attributes_str)
+        for attr_name, attr_value in unquoted_matches:
+            warnings.append(
+                f"Command {command_num}: Attribute '{attr_name}' value should be "
+                f'quoted: {attr_name}="{attr_value}"'
+            )
+
+        # Check for single quotes (should use double quotes for consistency)
+        single_quote_pattern = re.compile(r"(\w+)\s*=\s*'([^']*)'")
+        single_quote_matches = single_quote_pattern.findall(attributes_str)
+        for attr_name, attr_value in single_quote_matches:
+            warnings.append(
+                f"Command {command_num}: Use double quotes for attribute "
+                f"'{attr_name}': {attr_name}=\"{attr_value}\""
+            )
+
+        # Check for unknown attribute names
+        known_attributes = {"duration"}
+        all_attributes = re.findall(r"(\w+)\s*=", attributes_str)
+        for attr_name in all_attributes:
+            if attr_name not in known_attributes:
+                warnings.append(
+                    f"Command {command_num}: Unknown attribute '{attr_name}' - "
+                    f"known attributes are: {', '.join(sorted(known_attributes))}"
+                )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数采用“三轮独立告警”而非单轮统一判定：未加引号、单引号风格、未知属性名分别扫描并分别追加消息。这样会让同一属性同时触发多条告警，例如既因引号形式不合要求，又因名称不在允许集合中被再次报告；代码中没有做互斥或去重。</li><li>未知属性检查只基于属性名是否出现在局部常量 <code>known_attributes = {"duration"}</code> 中，不参考属性值是否可解析，也不读取任何 <code>self</code> 配置。这使规则来源非常明确，但也意味着允许属性集并非外部可配置状态。</li><li>函数选择仅追加 <code>warnings</code> 而不返回错误、也不提前中断，表明这里的定位是提示式校验而不是拒绝式验证。代码里三段循环都没有 <code>raise</code>、<code>return</code> 提前结束或错误汇总对象。</li><li>属性名收集使用 <code>re.findall(r"(\w+)\s*=", attributes_str)</code> 对所有 <code>name=</code> 出现位置逐个处理，不做去重。其结果是重复书写的同名属性会被重复告警，保留了输入文本中的逐处诊断粒度。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: TerminusXMLPlainParser._parse_xml_commands（在解析单条 XML 命令时传入属性串与 <code>warnings</code>）</li><li><strong>核心被调用</strong>: re.compile; Pattern.findall; re.findall; warnings.append</li><li><strong>配置/状态来源</strong>: 参数 <code>attributes_str</code>：提供被扫描的原始属性文本; 参数 <code>command_num</code>：提供告警文案中的命令编号; 局部常量 <code>known_attributes = {"duration"}</code>：定义允许的属性名集合; 正则字面量 <code>r'(\w+)\s*=\s*([^"\'\s&gt;]+)'</code>、<code>r"(\w+)\s*=\s*'([^']*)'"</code>、<code>r"(\w+)\s*="</code>：定义三类检查规则</li><li><strong>结果去向</strong>: 调用方持有的 <code>warnings</code> 列表; TerminusXMLPlainParser._parse_xml_commands（通过被原位修改的 <code>warnings</code> 接收结果）</li><li><strong>同类 sibling</strong>: TerminusXMLPlainParser._parse_xml_commands：负责提取 <code>&lt;keystrokes&gt;</code> 与 <code>duration</code>，本函数只补充属性层面的告警; TerminusXMLPlainParser._extract_sections：同样通过可变 <code>warnings</code> 累积解析问题，但其关注点是顶层区段而非命令属性; TerminusXMLPlainParser._check_extra_text：也是仅通过原位追加告警输出结果的辅助检查函数</li></ul></div></details><nav class="pn"><a class="pn-prev" href="stage-4.3.html"><span>← 上一阶段</span><strong>LLM 调用</strong></a><a class="pn-next" href="stage-4.5.html"><span>下一阶段 →</span><strong>待交接提示 → 用户步骤(或切分)</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

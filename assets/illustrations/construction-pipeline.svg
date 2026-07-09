@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Standalone light-theme export. Generated from the theme-aware version in script.js — keep in sync. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 262" role="img" aria-label="Handbook construction: extract facts, organize by behavior, synthesize">
+<style>text{font-family:Inter,"Source Sans 3",system-ui,sans-serif}</style>
+  <!-- input -->
+  <rect x="20" y="38" width="128" height="36" rx="9" fill="#fdfcfa" stroke="#e6e2d8"></rect>
+  <text x="84" y="61" font-size="12.5" fill="#4a463f" text-anchor="middle" font-family="'IBM Plex Mono', ui-monospace, monospace">harness repo</text>
+  <path d="M154 56 H267" stroke="#8d887e" stroke-width="1.6" fill="none"></path><polygon points="266,51.5 274,56 266,60.5" fill="#8d887e"></polygon>
+  <path d="M322 56 H521" stroke="#8d887e" stroke-width="1.6" fill="none"></path><polygon points="520,51.5 528,56 520,60.5" fill="#8d887e"></polygon>
+  <path d="M578 56 H777" stroke="#8d887e" stroke-width="1.6" fill="none"></path><polygon points="776,51.5 784,56 776,60.5" fill="#8d887e"></polygon>
+  
+      <circle cx="296" cy="56" r="15" fill="#eaf1fb" stroke="color-mix(in srgb, #2a78d6 38%, #e6e2d8)"></circle>
+      <text x="296" y="61" font-size="13" font-weight="650" fill="#1c5cab" text-anchor="middle">1</text>
+      <text x="296" y="98" font-size="15.5" font-weight="650" fill="#201d18" text-anchor="middle">Extract facts</text>
+      <text x="296" y="120" font-size="12.5" fill="#6f6a61" text-anchor="middle">static analysis of files, functions,</text>
+      <text x="296" y="137" font-size="12.5" fill="#6f6a61" text-anchor="middle">calls, state and config</text>
+      <rect x="218" y="156" width="156" height="30" rx="8" fill="#eaf1fb"></rect>
+      <text x="296" y="175.5" font-size="12.5" font-weight="600" fill="#1c5cab" text-anchor="middle">program graph</text>
+      <circle cx="552" cy="56" r="15" fill="#eaf1fb" stroke="color-mix(in srgb, #2a78d6 38%, #e6e2d8)"></circle>
+      <text x="552" y="61" font-size="13" font-weight="650" fill="#1c5cab" text-anchor="middle">2</text>
+      <text x="552" y="98" font-size="15.5" font-weight="650" fill="#201d18" text-anchor="middle">Organize by behavior</text>
+      <text x="552" y="120" font-size="12.5" fill="#6f6a61" text-anchor="middle">map code onto an execution skeleton,</text>
+      <text x="552" y="137" font-size="12.5" fill="#6f6a61" text-anchor="middle">refine until the mapping converges</text>
+      <rect x="474" y="156" width="156" height="30" rx="8" fill="#eaf1fb"></rect>
+      <text x="552" y="175.5" font-size="12.5" font-weight="600" fill="#1c5cab" text-anchor="middle">behavior map</text>
+      <circle cx="808" cy="56" r="15" fill="#eaf1fb" stroke="color-mix(in srgb, #2a78d6 38%, #e6e2d8)"></circle>
+      <text x="808" y="61" font-size="13" font-weight="650" fill="#1c5cab" text-anchor="middle">3</text>
+      <text x="808" y="98" font-size="15.5" font-weight="650" fill="#201d18" text-anchor="middle">Synthesize</text>
+      <text x="808" y="120" font-size="12.5" fill="#6f6a61" text-anchor="middle">render the three levels, keep</text>
+      <text x="808" y="137" font-size="12.5" fill="#6f6a61" text-anchor="middle">every evidence link intact</text>
+      <rect x="730" y="156" width="156" height="30" rx="8" fill="#eaf1fb"></rect>
+      <text x="808" y="175.5" font-size="12.5" font-weight="600" fill="#1c5cab" text-anchor="middle">handbook · L1–L3</text>
+  <!-- proposer-reviewer loop under station 2 -->
+  <path d="M492 214 a10 10 0 1 1 6 9" fill="none" stroke="#8d887e" stroke-width="1.5"></path>
+  <polygon points="494,226 502,224 497,217" fill="#8d887e"></polygon>
+  <text x="518" y="220" font-size="12" fill="#6f6a61">proposer ⇄ reviewer, until convergence</text>
+  <text x="480" y="252" font-size="12.5" fill="#6f6a61" text-anchor="middle" font-style="italic">Prose explains — facts anchor. Every entry stays linked to verifiable code evidence.</text>
+</svg>

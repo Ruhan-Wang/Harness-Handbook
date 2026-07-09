@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core-plugins/src/lib.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">core-plugins/src/lib.rs</code>
+<span class="code-meta">58 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=k>mod</b> app_mcp_routing;</i><i id="L2"><b class=k>mod</b> discoverable;</i><i id="L3"><b class=k>pub</b> <b class=k>mod</b> installed_marketplaces;</i><i id="L4"><b class=k>pub</b> <b class=k>mod</b> loader;</i><i id="L5"><b class=k>mod</b> manager;</i><i id="L6"><b class=k>pub</b> <b class=k>mod</b> manifest;</i><i id="L7"><b class=k>pub</b> <b class=k>mod</b> marketplace;</i><i id="L8"><b class=k>pub</b> <b class=k>mod</b> marketplace_add;</i><i id="L9"><b class=k>pub</b> <b class=k>mod</b> marketplace_remove;</i><i id="L10"><b class=k>pub</b> <b class=k>mod</b> marketplace_upgrade;</i><i id="L11"><b class=k>mod</b> plugin_bundle_archive;</i><i id="L12"><b class=k>mod</b> provider;</i><i id="L13"><b class=k>pub</b> <b class=k>mod</b> remote;</i><i id="L14"><b class=k>pub</b> <b class=k>mod</b> remote_bundle;</i><i id="L15"><b class=k>pub</b> <b class=k>mod</b> remote_legacy;</i><i id="L16"><b class=k>pub</b> <b class=k>mod</b> startup_sync;</i><i id="L17"><b class=k>pub</b> <b class=k>mod</b> store;</i><i id="L18"><b class=m>#[cfg(test)]</b></i><i id="L19"><b class=k>mod</b> test_support;</i><i id="L20"><b class=k>pub</b> <b class=k>mod</b> toggles;</i><i id="L21"></i><i id="L22"><b class=k>pub</b> <b class=k>const</b> OPENAI_CURATED_MARKETPLACE_NAME: &amp;str = <b class=s>"openai-curated"</b>;</i><i id="L23"><b class=k>pub</b> <b class=k>const</b> OPENAI_API_CURATED_MARKETPLACE_NAME: &amp;str = <b class=s>"openai-api-curated"</b>;</i><i id="L24"><b class=k>pub</b> <b class=k>const</b> OPENAI_BUNDLED_MARKETPLACE_NAME: &amp;str = <b class=s>"openai-bundled"</b>;</i><i id="L25"></i><i id="L26"><b class=k>pub</b> <b class=k>fn</b> is_openai_curated_marketplace_name(marketplace_name: &amp;str) -&gt; bool {</i><i id="L27">    marketplace_name == OPENAI_CURATED_MARKETPLACE_NAME</i><i id="L28">        || marketplace_name == OPENAI_API_CURATED_MARKETPLACE_NAME</i><i id="L29">}</i><i id="L30"></i><i id="L31"><b class=k>pub</b> <b class=k>type</b> LoadedPlugin = codex_plugin::LoadedPlugin&lt;codex_config::McpServerConfig&gt;;</i><i id="L32"><b class=k>pub</b> <b class=k>type</b> PluginLoadOutcome = codex_plugin::PluginLoadOutcome&lt;codex_config::McpServerConfig&gt;;</i><i id="L33"></i><i id="L34"><b class=k>pub</b> <b class=k>use</b> app_mcp_routing::apps_route_available;</i><i id="L35"><b class=k>pub</b> <b class=k>use</b> discoverable::ToolSuggestDiscoverablePlugin;</i><i id="L36"><b class=k>pub</b> <b class=k>use</b> discoverable::ToolSuggestPluginDiscoveryInput;</i><i id="L37"><b class=k>pub</b> <b class=k>use</b> loader::PluginHookLoadOutcome;</i><i id="L38"><b class=k>pub</b> <b class=k>use</b> manager::ConfiguredMarketplace;</i><i id="L39"><b class=k>pub</b> <b class=k>use</b> manager::ConfiguredMarketplaceListOutcome;</i><i id="L40"><b class=k>pub</b> <b class=k>use</b> manager::ConfiguredMarketplacePlugin;</i><i id="L41"><b class=k>pub</b> <b class=k>use</b> manager::PluginDetail;</i><i id="L42"><b class=k>pub</b> <b class=k>use</b> manager::PluginDetailsUnavailableReason;</i><i id="L43"><b class=k>pub</b> <b class=k>use</b> manager::PluginInstallError;</i><i id="L44"><b class=k>pub</b> <b class=k>use</b> manager::PluginInstallOutcome;</i><i id="L45"><b class=k>pub</b> <b class=k>use</b> manager::PluginInstallRequest;</i><i id="L46"><b class=k>pub</b> <b class=k>use</b> manager::PluginListBackgroundTaskOptions;</i><i id="L47"><b class=k>pub</b> <b class=k>use</b> manager::PluginReadOutcome;</i><i id="L48"><b class=k>pub</b> <b class=k>use</b> manager::PluginReadRequest;</i><i id="L49"><b class=k>pub</b> <b class=k>use</b> manager::PluginUninstallError;</i><i id="L50"><b class=k>pub</b> <b class=k>use</b> manager::PluginsConfigInput;</i><i id="L51"><b class=k>pub</b> <b class=k>use</b> manager::PluginsManager;</i><i id="L52"><b class=k>pub</b> <b class=k>use</b> marketplace_upgrade::ConfiguredMarketplaceUpgradeError <b class=k>as</b> PluginMarketplaceUpgradeError;</i><i id="L53"><b class=k>pub</b> <b class=k>use</b> marketplace_upgrade::ConfiguredMarketplaceUpgradeOutcome <b class=k>as</b> PluginMarketplaceUpgradeOutcome;</i><i id="L54"><b class=k>pub</b> <b class=k>use</b> provider::ExecutorPluginProvider;</i><i id="L55"><b class=k>pub</b> <b class=k>use</b> provider::ExecutorPluginProviderError;</i><i id="L56"><b class=k>pub</b> <b class=k>use</b> provider::ResolvedExecutorPlugin;</i><i id="L57"><b class=k>pub</b> <b class=k>use</b> remote::RecommendedPlugin;</i><i id="L58"><b class=k>pub</b> <b class=k>use</b> remote::RecommendedPluginsMode;</i></pre></div>
+</main>
+<script src="../../../assets/app.js"></script>
+</body>
+</html>

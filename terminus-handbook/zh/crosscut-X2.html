@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>crosscut-X2 · 输出长度限制</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=zh"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 手册</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=zh" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>返回主页</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>状态流寄存器</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>配置固化</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>环境搭建</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>运行起点</a></div><details class="s-node"><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>迭代主循环</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>循环入口门控</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>主动摘要探测</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM 调用</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>响应解析</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>待交接提示 → 用户步骤(或切分)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>错误分支</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>命令执行 → 观察 → 轨迹步骤</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>完成门控与循环控制</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>解析器内部辅助</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>运行收尾</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>录制后处理(外部)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>上下文摘要</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token 与成本核算</a></div><div class="s-leaf"><a class="s-link cur" href="crosscut-X2.html"><span class="s-num">X2</span>输出长度限制</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>日志</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux 内部辅助</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">索引</a></nav><div class="stage-head"><h1>输出长度限制</h1><div class="meta"><span class="chip mono">crosscut-X2</span><span class="chip">Output Length Limiting</span><span class="chip">1 个函数</span></div></div>
+<h2 class="sec">开场解释</h2>
+<p>这个环节是在解决一个很实际的问题：终端输出可能太长，长到把 LLM（大语言模型）的上下文挤爆，所以在 <strong><a href="stage-4.9.html">stage-4.9</a> Observe</strong> 里，必须先把要喂给模型的终端内容截短。它存在的目的不是“美化输出”，而是防止一次观察就吞掉太多 token（模型输入片段），让后面的推理还能继续。放在 Observe 这里也很自然：只有先看终端、整理观察材料时，系统才知道哪些文本真的要发给 LLM。</p>
+<h2 class="sec">主流程</h2>
+
+<ol><li><strong>进入条件：Observe 要组装一份给 LLM 的观察材料</strong><p>这一步会把终端里刚拿到的内容，整理成模型能读的上下文。问题是，终端输出有时会非常长，比如日志刷屏、错误堆栈很大、<code>cat</code> 了一个大文件。 如果原样塞进去，模型会被无关文本淹没。</p></li><li><strong>先对终端输出做长度限制</strong><p>这里会调用 <code>_limit_output_length()</code>（把终端文本压到上限内；超长就截断并加上 <code>[OUTPUT TRUNCATED]</code> 提示）。 它的职责很单纯：</p>
+<ul><li>没超限：原样通过 </li><li>超限：截掉尾部，并明确告诉模型“后面还有，但我没全给你”</li></ul>
+<p>这一步很重要，因为系统需要的不只是“少一点文本”，还要让模型知道这是<strong>被截断过的</strong>，避免它误以为终端本来就只输出了这些。</p></li><li><strong>把“截短后的输出”放进 observation（观察文本）里</strong><p>Observe Stage 真正负责的是“给 LLM 备料”。 所以长度限制不是终点，终点是生成一份可用的 observation：里面包含当前终端状态、命令结果、必要提示等，而终端输出部分已经被压到安全范围内。</p></li><li><strong>然后交给后面的 LLM 推理</strong><p>下一步消费的不是原始终端长文本，而是这份整理过、裁过长的 observation。 这样做的价值很直接：</p>
+<ul><li>控制上下文长度 </li><li>保住重要信息的前半段 </li><li>给模型一个明确的“这里被截断了”的信号 </li><li>避免一次观察拖垮整轮决策</li></ul></li><li><strong>分支逻辑其实很简单，但意义很大</strong><p>Observe 的主流程是“收集终端信息 → 整理 observation → 交给 LLM”。 <code>_limit_output_length()</code> 只是其中一个小分支：</p>
+<ul><li>输出短：直接用 </li><li>输出长：截断后再用 </li></ul>
+<p>但如果没有这个分支，Observe Stage 在日志很多、命令输出很大的场景下会变得不稳定，甚至让整轮 Agent 推理失真或超预算。</p></li></ol>
+<h2 class="sec"> 状态流动</h2>
+<ul><li>写: 无 — 这一段不把结果落到 skeleton 明示的持久 register；它主要是在 Observe 过程中改写将要发给 LLM 的临时文本值</li><li>读: 无 — 输入里没有给出 skeleton 中可命名的 register；这里实际消费的是 Observe 阶段拿到的“终端输出”临时值</li><li>清: 无 — 这里只做裁剪，不负责清理状态</li><li>触发下游: <code>stage-4.9 Observe</code> 的后续 LLM 调用 — 当 observation 组装完成后，把其中已截短的终端内容继续交给模型</li></ul>
+<h2 class="sec">与前后 Stage 的衔接</h2>
+<p>上游先产出原始终端输出；到 <strong><a href="stage-4.9.html">stage-4.9</a> Observe</strong> 时，本环节把这段输出压到安全长度，再拼进 observation。下游消费的是这份“已截短、可进模型”的观察材料，而不是未经处理的终端原文。</p><div class="files-bar"><h2 class="sec">函数细节<span class="pill">1</span></h2><span class="spacer"></span><button class="tool" data-x="expand">全部展开</button><button class="tool" data-x="collapse">全部折叠</button></div><details class="file" id="fn-terminus2_limit_output_length"><summary><span class="chev"></span><code class="fpath">Terminus2._limit_output_length</code><a class="fn-range" href="../code/terminus_2.py.html#L530-L566" title="terminus_2.py:530-566">terminus_2.py:530–566 ↗</a></summary><div class="file-body"><p class="fn-sub">按字节截断终端文本的辅助函数</p>
+<blockquote><p><strong>stage 上下文</strong>: 该条目属于“Output Length Limiting”主题下的基础工具函数。就所给源码而言，它只负责把 <code>output</code> 按 <code>max_bytes</code> 预算裁剪为“首段 + 中部提示 + 尾段”的字符串，不读取也不写入任何实例状态。当前提供的材料未展示其具体调用点，因此此处不扩展系统级触发条件。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收 <code>output: str</code> 与字节上限 <code>max_bytes</code>；若 <code>output.encode("utf-8")</code> 的长度未超限，则直接返回原字符串。若超限，则保留按字节切出的前半段与后半段，在两者之间插入一段带文字说明的标记，并以字面量换行符连接，返回形如 <code>first_portion + "\n[... output limited to {max_bytes} bytes; {omitted_bytes} interior bytes omitted ...]\n" + last_portion</code> 的新字符串。函数本身无副作用，也不触碰任何 <code>self._*</code> 状态。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, output: str, max_bytes: int = 10000) -&gt; str</code></p>
+<ul><li>参数: <code>output</code>: <code>str</code> — 待检查并可能截断的文本输入; <code>max_bytes</code>: <code>int</code> — 用于决定是否截断、以及前后各保留多少字节的预算上限</li><li>返回: 若 <code>output</code> 的 UTF-8 编码长度 <code>&lt;= max_bytes</code>，返回原始 <code>output</code>；否则返回由首段、字面量换行、<code>[... output limited to {max_bytes} bytes; {omitted_bytes} interior bytes omitted ...]</code> 提示、再次换行、尾段拼接而成的新字符串。该返回值的总长度并不被严格限制在 <code>max_bytes</code> 内，因为提示文本与两个换行符是额外加入的。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先执行 <code>len(output.encode("utf-8")) &lt;= max_bytes</code> 检查；若成立，立即返回原始 <code>output</code>，不再做任何拆分或格式化。</li><li>若超限，则计算 <code>portion_size = max_bytes // 2</code>，把预算平均分给前后两侧；当 <code>max_bytes</code> 为奇数时，多出的 1 个字节不会分配给任一侧。</li><li>再次执行 <code>output.encode("utf-8")</code> 得到 <code>output_bytes</code>，后续所有截取均基于字节序列而非字符数。</li><li>从 <code>output_bytes[:portion_size]</code> 解码得到 <code>first_portion</code>，并从 <code>output_bytes[-portion_size:]</code> 解码得到 <code>last_portion</code>；两次 <code>decode("utf-8", errors="ignore")</code> 都会忽略落在切片边界上的不完整多字节片段，因此得到的两段可能实际少于各自切片的字节数。</li><li>用 <code>len(output_bytes) - len(first_portion.encode("utf-8")) - len(last_portion.encode("utf-8"))</code> 重新计算 <code>omitted_bytes</code>，以反映真正未出现在返回字符串中的中部字节数。</li><li>返回格式化结果：<code>f"{first_portion}\n[... output limited to {max_bytes} bytes; {omitted_bytes} interior bytes omitted ...]\n{last_portion}"</code>。其中两侧保留内容之间固定插入两个字面量换行符和一段说明文字。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _limit_output_length(self, output: str, max_bytes: int = 10000) -&gt; str:
+        """
+        Limit output to specified byte length, keeping first and last portions.
+
+        Args:
+            output: The terminal output to potentially truncate
+            max_bytes: Maximum allowed bytes (default 10000)
+
+        Returns:
+            str: Original output if under limit, or truncated with middle omitted
+        """
+        if len(output.encode("utf-8")) &lt;= max_bytes:
+            return output
+
+        # Calculate portions (half each for first and last)
+        portion_size = max_bytes // 2
+
+        # Convert to bytes for accurate splitting
+        output_bytes = output.encode("utf-8")
+
+        # Get first portion
+        first_portion = output_bytes[:portion_size].decode("utf-8", errors="ignore")
+
+        # Get last portion
+        last_portion = output_bytes[-portion_size:].decode("utf-8", errors="ignore")
+
+        # Calculate omitted bytes
+        omitted_bytes = (
+            len(output_bytes)
+            - len(first_portion.encode("utf-8"))
+            - len(last_portion.encode("utf-8"))
+        )
+
+        return (
+            f"{first_portion}\n[... output limited to {max_bytes} bytes; "
+            f"{omitted_bytes} interior bytes omitted ...]\n{last_portion}"
+        )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>长度判定与切分都以 UTF-8 字节数而非 Python 字符数为准，体现的是“按编码后体积限额”而不是“按字符数限额”的策略；这直接对应 <code>encode("utf-8")</code> 的使用。</li><li>边界解码采用 <code>errors="ignore"</code>，容忍字节切片把一个多字节字符切断；代价是 <code>first_portion</code>、<code>last_portion</code> 可能都比各自的 <code>portion_size</code> 更短，因此代码没有直接假设两侧各保留了精确的一半字节，而是重新 <code>encode</code> 后计算 <code>omitted_bytes</code>。</li><li>函数在超限路径里先为早退检查执行一次 <code>output.encode("utf-8")</code>，随后又再次编码为 <code>output_bytes</code> 供切片使用；这是实现上的直接写法，避免复用前一次结果的额外分支组织，但代价是重复编码一次。</li><li>返回值并非“硬性不超过 <code>max_bytes</code>”；<code>max_bytes</code> 只约束前后保留切片的预算，插入的提示文本与两侧换行是额外附加的。因此该函数追求的是保留头尾上下文并显式标记删减，而不是严格的最终字符串总字节上界。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未在所给源码片段中展示</li><li><strong>核心被调用</strong>: str.encode("utf-8"); bytes.decode("utf-8", errors="ignore"); len(...); f-string 字符串格式化</li><li><strong>配置/状态来源</strong>: 参数 <code>output</code>; 参数 <code>max_bytes</code>; 函数内部常量字符串 <code>[... output limited to {max_bytes} bytes; {omitted_bytes} interior bytes omitted ...]</code>; UTF-8 编码规则与 <code>errors="ignore"</code> 解码策略</li><li><strong>结果去向</strong>: 直接作为该函数的 <code>str</code> 返回值返回给调用方</li></ul></div></details><nav class="pn"><a class="pn-prev" href="crosscut-X1.html"><span>← 上一阶段</span><strong>Token 与成本核算</strong></a><a class="pn-next" href="crosscut-X3.html"><span>下一阶段 →</span><strong>日志</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

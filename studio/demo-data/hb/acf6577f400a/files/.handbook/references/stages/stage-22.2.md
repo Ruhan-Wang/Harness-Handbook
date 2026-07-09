@@ -1,0 +1,15 @@
+# Text, parsing, truncation, and rendering helpers  `stage-22.2`
+
+This stage is shared text infrastructure that sits beneath both the main streaming/rendering path and many user-facing CLI/TUI code paths. It is used from startup through steady-state interaction whenever the system must parse incoming text, reshape it safely, and present compact terminal-friendly output.
+
+The generic string, formatting, truncation, and templating utilities provide the basic transformations: UTF-8-safe slicing, JSON/text sanitization, duration and number formatting, placeholder substitution, and token- or byte-budget truncation for plain text, structured outputs, and response history. The streaming, line framing, and hidden-markup parsers then consume incremental byte or text chunks, recover valid UTF-8 and line boundaries, strip or decode hidden tags, detect tables/code fences, and extract structured metadata such as mentions and citations while preserving visible text.
+
+On the rendering side, the TUI text layout, wrapping, and text-rendering primitives measure styled content, convert ANSI and markdown into terminal-width-aware lines, preserve hyperlinks, and support incremental wrapping and scrollable diffs. Finally, the TUI presentation-model helpers package those lines into reusable renderables, shared styles, footers, popups, and compact summaries, while the animation/progress helpers add motion effects and transient status output for live terminal feedback.
+
+## Sub-stages
+
+- [Generic string, formatting, truncation, and templating utilities](stage-22.2.1.md) `stage-22.2.1` — 12 files
+- [Streaming, line framing, and hidden-markup parsers](stage-22.2.2.md) `stage-22.2.2` — 9 files
+- [TUI text layout, wrapping, and text-rendering primitives](stage-22.2.3.md) `stage-22.2.3` — 10 files
+- [TUI presentation models, styling, and lightweight view helpers](stage-22.2.4.md) `stage-22.2.4` — 21 files
+- [TUI animation, motion, terminal media, and transient progress output](stage-22.2.5.md) `stage-22.2.5` — 5 files

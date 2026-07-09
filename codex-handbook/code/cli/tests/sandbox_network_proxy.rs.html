@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cli/tests/sandbox_network_proxy.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">cli/tests/sandbox_network_proxy.rs</code>
+<span class="code-meta">70 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=m>#![cfg(target_os = "linux")]</b></i><i id="L2"></i><i id="L3"><b class=k>use</b> std::net::TcpListener;</i><i id="L4"></i><i id="L5"><b class=k>use</b> anyhow::Result;</i><i id="L6"><b class=k>use</b> tempfile::TempDir;</i><i id="L7"></i><i id="L8"><b class=k>const</b> BWRAP_UNAVAILABLE_ERR: &amp;str = <b class=s>"bubblewrap is unavailable"</b>;</i><i id="L9"></i><i id="L10"><b class=m>#[test]</b></i><i id="L11"><b class=k>fn</b> sandbox_with_network_proxy_blocks_direct_loopback_access() -&gt; Result&lt;()&gt; {</i><i id="L12">    <b class=k>let</b> codex_home = TempDir::new()?;</i><i id="L13">    <b class=k>let</b> listener = TcpListener::bind(<b class=s>"127.0.0.2:0"</b>)?;</i><i id="L14">    <b class=k>let</b> port = listener.local_addr()?.port();</i><i id="L15">    std::fs::write(</i><i id="L16">        codex_home.path().join(<b class=s>"config.toml"</b>),</i><i id="L17">        r#<b class=s>"</b></i><i id="L18">default_permissions = <b class=s>"network-test"</b></i><i id="L19"></i><i id="L20">[features]</i><i id="L21">network_proxy = <b class=k>true</b></i><i id="L22">use_legacy_landlock = <b class=k>true</b></i><i id="L23"></i><i id="L24">[permissions.network-test]</i><i id="L25">extends = <b class=s>":workspace"</b></i><i id="L26"></i><i id="L27">[permissions.network-test.network]</i><i id="L28">enabled = <b class=k>true</b></i><i id="L29">mode = <b class=s>"full"</b></i><i id="L30"><b class=s>"#,</b></i><i id="L31">    )?;</i><i id="L32"></i><i id="L33">    <b class=k>let</b> url = <b class=m>format!</b>(<b class=s>"http://127.0.0.2:{port}/"</b>);</i><i id="L34">    <b class=k>let</b> output = std::process::Command::new(codex_utils_cargo_bin::cargo_bin(<b class=s>"codex"</b>)?)</i><i id="L35">        .env(<b class=s>"CODEX_HOME"</b>, codex_home.path())</i><i id="L36">        .args([</i><i id="L37">            <b class=s>"sandbox"</b>,</i><i id="L38">            <b class=s>"--permissions-profile"</b>,</i><i id="L39">            <b class=s>"network-test"</b>,</i><i id="L40">            <b class=s>"--"</b>,</i><i id="L41">            <b class=s>"curl"</b>,</i><i id="L42">            <b class=s>"--noproxy"</b>,</i><i id="L43">            <b class=s>"*"</b>,</i><i id="L44">            <b class=s>"--silent"</b>,</i><i id="L45">            <b class=s>"--show-error"</b>,</i><i id="L46">            <b class=s>"--connect-timeout"</b>,</i><i id="L47">            <b class=s>"1"</b>,</i><i id="L48">            <b class=s>"--max-time"</b>,</i><i id="L49">            <b class=s>"2"</b>,</i><i id="L50">            url.as_str(),</i><i id="L51">        ])</i><i id="L52">        .output()?;</i><i id="L53"></i><i id="L54">    <b class=k>let</b> stderr = String::from_utf8_lossy(&amp;output.stderr);</i><i id="L55">    <b class=k>if</b> stderr.contains(BWRAP_UNAVAILABLE_ERR) {</i><i id="L56">        <b class=m>eprintln!</b>(<b class=s>"skipping network proxy sandbox test: bubblewrap is unavailable"</b>);</i><i id="L57">        <b class=k>return</b> Ok(());</i><i id="L58">    }</i><i id="L59"></i><i id="L60">    <b class=m>assert_eq!</b>(</i><i id="L61">        output.status.code(),</i><i id="L62">        Some(<b class=n>7</b>),</i><i id="L63">        <b class=s>"expected direct loopback access to be blocked; status={:?}; stdout={}; stderr={}"</b>,</i><i id="L64">        output.status.code(),</i><i id="L65">        String::from_utf8_lossy(&amp;output.stdout),</i><i id="L66">        stderr,</i><i id="L67">    );</i><i id="L68"></i><i id="L69">    Ok(())</i><i id="L70">}</i></pre></div>
+</main>
+<script src="../../../assets/app.js"></script>
+</body>
+</html>

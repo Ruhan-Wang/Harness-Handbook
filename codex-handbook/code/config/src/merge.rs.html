@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>config/src/merge.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">config/src/merge.rs</code>
+<span class="code-meta">54 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=k>use</b> <b class=k>crate</b>::key_aliases::normalize_key_aliases;</i><i id="L2"><b class=k>use</b> <b class=k>crate</b>::key_aliases::normalized_with_key_aliases;</i><i id="L3"><b class=k>use</b> codex_network_proxy::normalize_host;</i><i id="L4"><b class=k>use</b> toml::Value <b class=k>as</b> TomlValue;</i><i id="L5"></i><i id="L6"><b class=c>/// Merge config `overlay` into `base`, giving `overlay` precedence.</b></i><i id="L7"><b class=k>pub</b> <b class=k>fn</b> merge_toml_values(base: &amp;<b class=k>mut</b> TomlValue, overlay: &amp;TomlValue) {</i><i id="L8">    merge_toml_values_at_path(base, overlay, &amp;<b class=k>mut</b> Vec::new());</i><i id="L9">}</i><i id="L10"></i><i id="L11"><b class=k>fn</b> merge_toml_values_at_path(base: &amp;<b class=k>mut</b> TomlValue, overlay: &amp;TomlValue, path: &amp;<b class=k>mut</b> Vec&lt;String&gt;) {</i><i id="L12">    <b class=k>if</b> <b class=k>let</b> TomlValue::Table(overlay_table) = overlay</i><i id="L13">        &amp;&amp; <b class=k>let</b> TomlValue::Table(base_table) = base</i><i id="L14">    {</i><i id="L15">        normalize_key_aliases(path, base_table);</i><i id="L16">        <b class=k>let</b> <b class=k>mut</b> overlay_table = overlay_table.clone();</i><i id="L17">        normalize_key_aliases(path, &amp;<b class=k>mut</b> overlay_table);</i><i id="L18">        <b class=k>if</b> is_permission_network_domains_path(path) {</i><i id="L19">            normalize_network_domain_keys(base_table);</i><i id="L20">            normalize_network_domain_keys(&amp;<b class=k>mut</b> overlay_table);</i><i id="L21">        }</i><i id="L22"></i><i id="L23">        <b class=k>for</b> (key, value) <b class=k>in</b> overlay_table {</i><i id="L24">            path.push(key.clone());</i><i id="L25">            <b class=k>if</b> <b class=k>let</b> Some(existing) = base_table.get_mut(&amp;key) {</i><i id="L26">                merge_toml_values_at_path(existing, &amp;value, path);</i><i id="L27">            } <b class=k>else</b> {</i><i id="L28">                base_table.insert(key, normalized_with_key_aliases(&amp;value, path));</i><i id="L29">            }</i><i id="L30">            path.pop();</i><i id="L31">        }</i><i id="L32">    } <b class=k>else</b> {</i><i id="L33">        *base = normalized_with_key_aliases(overlay, path);</i><i id="L34">    }</i><i id="L35">}</i><i id="L36"></i><i id="L37"><b class=k>fn</b> is_permission_network_domains_path(path: &amp;[String]) -&gt; bool {</i><i id="L38">    <b class=m>matches!</b>(</i><i id="L39">        path,</i><i id="L40">        [permissions, _, network, domains]</i><i id="L41">            <b class=k>if</b> permissions == <b class=s>"permissions"</b> &amp;&amp; network == <b class=s>"network"</b> &amp;&amp; domains == <b class=s>"domains"</b></i><i id="L42">    )</i><i id="L43">}</i><i id="L44"></i><i id="L45"><b class=k>fn</b> normalize_network_domain_keys(table: &amp;<b class=k>mut</b> toml::map::Map&lt;String, TomlValue&gt;) {</i><i id="L46">    <b class=k>let</b> entries = std::mem::take(table);</i><i id="L47">    <b class=k>for</b> (pattern, value) <b class=k>in</b> entries {</i><i id="L48">        table.insert(normalize_host(&amp;pattern), value);</i><i id="L49">    }</i><i id="L50">}</i><i id="L51"></i><i id="L52"><b class=m>#[cfg(test)]</b></i><i id="L53"><b class=m>#[path = "merge_tests.rs"]</b></i><i id="L54"><b class=k>mod</b> tests;</i></pre></div>
+</main>
+<script src="../../../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,1026 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-4.4 · Response Parse</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=en"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=en" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>Home</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>State-flow registers</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>Configuration Crystallization</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>Environment Setup</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>Run Onset</a></div><details class="s-node" open><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>Iteration Loop</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>Loop Entry Gates</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>Proactive Summarize Probe</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM Query</a></div><div class="s-leaf"><a class="s-link cur" href="stage-4.4.html"><span class="s-num">4.4</span>Response Parse</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>Pending Handoff Prompt → User Step (or Split)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>Error Branch</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>Command Execute → Observation → Trajectory Step</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>Completion Gate + Loop Control</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>Parser internal helpers</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>Run Teardown</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>Recording Post-process (External)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>Context Summarization</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token &amp; Cost Accounting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>Output Length Limiting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>Logging</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux internal helpers</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">Index</a><span class="sep">›</span><a href="stage-4.html">Iteration Loop</a></nav><div class="stage-head"><h1>Response Parse</h1><div class="meta"><span class="chip mono">stage-4.4</span><span class="chip">16 functions</span></div></div>
+<h2 class="sec">Opening Explanation</h2>
+<p>This stage exists to turn the LLM’s raw reply into something the agent can safely act on. The model does not return ready-to-run commands in a guaranteed shape. It may mix prose with structured output, cut off partway through, or mark a task as done in the wrong way. Response Parse is the boundary that says: “Did we get a valid action plan, a completion signal, or feedback we need to send back?” It sits right after the LLM call and before any user handoff or command handling. Without this stage, later parts of the pipeline would have to guess what the model meant, and the agent would be much more brittle.</p>
+<h2 class="sec">Main Flow</h2>
+
+<ol><li><code>Terminus2._handle_llm_interaction()</code> (takes one LLM reply and turns it into agent-ready data) sends the reply text into the selected parser. <p>The parser format is chosen earlier at construction time: JSON or XML. That choice matters because the agent wants a strict contract for how commands, analysis, plan, warnings, and completion are expressed.</p></li><li><code>TerminusJSONPlainParser.parse_response()</code> or <code>TerminusXMLPlainParser.parse_response()</code> (read the model reply and extract the structured pieces) tries to recover a usable result even when the reply is messy. <p>This is why the parser is more than a decoder. It also repairs common model failures:</p>
+<ul><li>JSON parser: incomplete JSON, mixed prose plus JSON</li><li>XML parser: missing closing tags, truncated output The reason is simple: the LLM is useful but not perfectly reliable, and the agent still needs a stable next step.</li></ul></li><li>The parser returns a <code>ParseResult</code>: commands, task-complete flag, error, warning, analysis, and plan. <p>This is the core responsibility of the stage. It converts one blob of model text into a small set of decisions the rest of the system can trust.</p></li><li><code>_handle_llm_interaction()</code> then compresses parse problems into a single <code>feedback</code> string, using markers like <code>ERROR: ...</code> and <code>WARNINGS: ...</code>. <p>This exists so later stages do not need to understand every parser detail. They only need one clear message to send back into the loop if the model output was malformed or questionable.</p></li><li>Any parsed command is wrapped as a <code>Command(...)</code>, with its duration capped at 60 seconds. <p>The point is not just formatting. It normalizes the LLM’s intent into the agent’s own command object, and it applies a safety limit so one bad duration value does not create an overly long terminal action.</p></li><li>At the end of this stage, the agent knows one of a few clean outcomes:<ul><li>here are valid commands</li><li>the task is complete</li><li>the reply had issues, and here is feedback to give the model That clean split is why this stage exists. It turns ambiguous model output into controlled agent behavior.</li></ul></li></ol>
+<h2 class="sec"> State Flow</h2>
+<ul><li>writes: 无 — this stage is not described as writing any explicit register from the provided skeleton</li><li>reads: 无 — no explicit register use is identified in the provided stage/register list</li><li>clears: 无 — no explicit register clearing is identified in the provided stage/register list</li><li>triggers downstream: <code>stage-4.6 Pending Handoff Prompt → User Step (or Split)</code> — after the LLM reply has been parsed into commands / completion / feedback, downstream can decide whether to hand off, ask the user, or split based on that normalized result</li></ul>
+<h2 class="sec">Pipeline Hand-Off</h2>
+<p>Upstream, this stage receives the raw text reply from stage 4.3, the LLM Query. It produces a normalized parse result: safe command objects, a task-complete signal, and a single feedback string for parse problems, which downstream stages use to decide whether to continue, ask for correction, or move toward user-facing handoff.</p><div class="files-bar"><h2 class="sec">Functions<span class="pill">16</span></h2><span class="spacer"></span><button class="tool" data-x="expand">Expand all</button><button class="tool" data-x="collapse">Collapse all</button></div><details class="file" id="fn-terminus2_handle_llm_interaction"><summary><span class="chev"></span><code class="fpath">Terminus2._handle_llm_interaction</code><a class="fn-range" href="../code/terminus_2.py.html#L1190-L1219" title="terminus_2.py:1190-1219">terminus_2.py:1190–1219 ↗</a></summary><div class="file-body"><p class="fn-sub">Parse LLM reply into commands and feedback</p>
+<blockquote><p><strong>Stage context</strong>: This region is the parse-and-normalize part of <code>Terminus2._handle_llm_interaction</code>. It runs after the method has an <code>llm_response</code> object and turns <code>llm_response.content</code> into structured outputs for the rest of the method's return tuple.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>This code asks <code>self._parser</code> to parse <code>llm_response.content</code>, then reshapes the parser result into the method's return values. It builds one <code>feedback</code> string from <code>result.error</code> and <code>result.warning</code>, logs parser warnings through <code>self.logger.debug</code>, converts each parsed command into a <code>Command</code>, and clamps each command duration to at most 60 seconds. It returns the converted commands, completion flag, feedback text, analysis, plan, and the original <code>llm_response</code> object.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, llm_response)</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — Owns <code>_parser</code> and <code>logger</code> used during parse handling; <code>llm_response</code>: <code>?</code> — Response object whose <code>content</code> is parsed and which is returned unchanged as the sixth tuple element</li><li>reads: <code>self._parser</code>, <code>self.logger</code>, <code>llm_response.content</code>, <code>result.error</code>, <code>result.warning</code>, <code>result.commands</code>, <code>result.is_task_complete</code>, <code>result.analysis</code>, <code>result.plan</code></li><li>returns: A 6-tuple: (<code>list[Command]</code> built from <code>result.commands</code>, <code>result.is_task_complete</code>, synthesized <code>feedback</code> string, <code>result.analysis</code>, <code>result.plan</code>, the same <code>llm_response</code> object passed in)</li><li>effects: Calls <code>self.logger.debug(...)</code> when <code>result.warning</code> is truthy</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Call <code>self._parser.parse_response(llm_response.content)</code> and store the structured parse output in <code>result</code>.</li><li>Build <code>feedback</code> from parser diagnostics: start empty, prepend <code>ERROR: ...</code> when <code>result.error</code> exists, append <code>\nWARNINGS: ...</code> only when both <code>result.error</code> and <code>result.warning</code> exist, otherwise use <code>WARNINGS: ...</code> alone when there is no error.</li><li>If <code>result.warning</code> is truthy, emit <code>self.logger.debug(f"Parser warnings: {result.warning}")</code>.</li><li>Iterate over <code>result.commands</code>, wrap each <code>parsed_cmd</code> as <code>Command(keystrokes=parsed_cmd.keystrokes, duration_sec=min(parsed_cmd.duration, 60))</code>, and collect them in <code>commands</code>.</li><li>Return <code>commands</code>, <code>result.is_task_complete</code>, <code>feedback</code>, <code>result.analysis</code>, <code>result.plan</code>, and the original <code>llm_response</code> object.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>        result = self._parser.parse_response(llm_response.content)
+
+        feedback = ""
+        if result.error:
+            feedback += f"ERROR: {result.error}"
+            if result.warning:
+                feedback += f"\nWARNINGS: {result.warning}"
+        elif result.warning:
+            feedback += f"WARNINGS: {result.warning}"
+
+        if result.warning:
+            self.logger.debug(f"Parser warnings: {result.warning}")
+
+        commands = []
+        for parsed_cmd in result.commands:
+            commands.append(
+                Command(
+                    keystrokes=parsed_cmd.keystrokes,
+                    duration_sec=min(parsed_cmd.duration, 60),
+                )
+            )
+
+        return (
+            commands,
+            result.is_task_complete,
+            feedback,
+            result.analysis,
+            result.plan,
+            llm_response,
+        )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The feedback builder gives <code>result.error</code> priority by placing <code>ERROR: ...</code> first and only adding warnings as a second line when both fields are present. That choice preserves both diagnostics without collapsing them into one label.</li><li>The code logs only <code>result.warning</code>, not <code>result.error</code>. The implementation treats warnings as something to surface through <code>self.logger.debug</code> while leaving errors only in the returned <code>feedback</code> string.</li><li>Command conversion applies <code>min(parsed_cmd.duration, 60)</code> at construction time. This enforces a hard upper bound on <code>duration_sec</code> even if the parser returned a larger duration.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>Terminus2._handle_llm_interaction</code></li><li><strong>Core callees</strong>: <code>self._parser.parse_response</code>; <code>self.logger.debug</code>; <code>Command</code></li><li><strong>Config / state sources</strong>: <code>self._parser</code>; <code>self.logger</code></li><li><strong>Results to</strong>: Returns parser-derived values to the enclosing <code>Terminus2._handle_llm_interaction</code> call result; Exposes the original <code>llm_response</code> unchanged as the sixth return element</li></ul></div></details><details class="file" id="fn-terminusjsonplainparser_parse_response"><summary><span class="chev"></span><code class="fpath">TerminusJSONPlainParser.parse_response</code><a class="fn-range" href="../code/terminus_json_plain_parser.py.html#L29-L62" title="terminus_json_plain_parser.py:29-62">terminus_json_plain_parser.py:29–62 ↗</a></summary><div class="file-body"><p class="fn-sub">Parse response with retry-on-autofix</p>
+<blockquote><p><strong>Stage context</strong>: This method turns one raw <code>response</code> string into a <code>ParseResult</code>. It first asks <code>_try_parse_response(...)</code> for a direct parse, then only enters its fallback path when <code>result.error</code> is non-empty. The fallback path retries parsing against corrected text candidates from <code>_get_auto_fixes()</code> and returns the first corrected parse whose <code>corrected_result.error</code> is exactly <code>""</code>.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>parse_response</code> parses the input <code>response</code> and returns a <code>ParseResult</code>. It reads <code>result.error</code> from the initial parse result to decide whether to try auto-fixes, and on a successful corrected parse it reads <code>corrected_result.error</code> and <code>corrected_result.warning</code>, then assigns <code>corrected_result.warning</code> to the value returned by <code>_combine_warnings(...)</code>. It does not write any <code>self</code> state.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, response: str) -&gt; ParseResult</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — parser instance that supplies parse and auto-fix helpers; <code>response</code>: <code>str</code> — full response text to parse</li><li>reads: <code>self._try_parse_response</code>, <code>self._get_auto_fixes</code>, <code>self._combine_warnings</code></li><li>returns: A <code>ParseResult</code>: either the initial <code>result</code>, or the first <code>corrected_result</code> whose <code>corrected_result.error</code> is <code>""</code> after an auto-fix attempt.</li><li>effects: Assigns <code>corrected_result.warning</code> on the successful auto-fix path</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Call <code>self._try_parse_response(response)</code> and store the returned <code>ParseResult</code> in <code>result</code>.</li><li>Check <code>result.error</code>; if it is non-empty, iterate through <code>(fix_name, fix_function)</code> pairs from <code>self._get_auto_fixes()</code>.</li><li>For each fix, call <code>fix_function(response, result.error)</code> to get <code>corrected_response</code> and <code>was_fixed</code>, and skip reparsing when <code>was_fixed</code> is false.</li><li>When <code>was_fixed</code> is true, call <code>self._try_parse_response(corrected_response)</code> and store that <code>ParseResult</code> in <code>corrected_result</code>.</li><li>Accept the corrected parse only when <code>corrected_result.error == ""</code>; then build <code>auto_warning</code>, combine it with <code>corrected_result.warning</code> via <code>self._combine_warnings(...)</code>, assign the combined value back to <code>corrected_result.warning</code>, and return <code>corrected_result</code>.</li><li>If no attempted fix produces a <code>corrected_result</code> with an empty error string, return the original <code>result</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def parse_response(self, response: str) -&gt; ParseResult:
+        """
+        Parse a terminus JSON plain response and extract commands.
+
+        Args:
+            response: The full LLM response string
+
+        Returns:
+            ParseResult with commands, completion status, errors and warnings
+        """
+
+        # Try normal parsing first
+        result = self._try_parse_response(response)
+
+        if result.error:
+            # Try auto-fixes in order until one works
+            for fix_name, fix_function in self._get_auto_fixes():
+                corrected_response, was_fixed = fix_function(response, result.error)
+                if was_fixed:
+                    corrected_result = self._try_parse_response(corrected_response)
+
+                    if corrected_result.error == "":
+                        # Success! Add auto-correction warning
+                        auto_warning = (
+                            f"AUTO-CORRECTED: {fix_name} - "
+                            "please fix this in future responses"
+                        )
+                        corrected_result.warning = self._combine_warnings(
+                            auto_warning, corrected_result.warning
+                        )
+                        return corrected_result
+
+        # Return original result if no fix worked
+        return result</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It gates the fallback path on <code>result.error</code> instead of always running fixes. That keeps the normal path simple and avoids changing already-parseable input.</li><li>It tests correction success with the exact condition <code>corrected_result.error == ""</code>. That makes acceptance depend on the parser's own error field rather than on whether a fix function reported <code>was_fixed</code>.</li><li>It returns on the first successful fix from <code>_get_auto_fixes()</code>. This gives the fix list an ordered priority and avoids merging or comparing multiple corrected parses.</li><li>It preserves the original <code>result</code> when no fix yields an empty <code>corrected_result.error</code>. That keeps the original parser outcome, including its original error, instead of replacing it with a later failed retry.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: External code that needs to parse a raw response string into a <code>ParseResult</code>; Owning parser users that invoke <code>parse_response(response)</code> on this parser instance</li><li><strong>Core callees</strong>: self._try_parse_response; self._get_auto_fixes; fix_function(response, result.error); self._combine_warnings</li><li><strong>Config / state sources</strong>: self._get_auto_fixes</li><li><strong>Results to</strong>: The immediate caller of <code>parse_response</code>; Code that consumes the returned <code>ParseResult</code></li><li><strong>Related siblings</strong>: Related to <code>Terminus2._handle_llm_interaction</code>, which consumes a parser result and reshapes it for its own return values</li></ul></div></details><details class="file" id="fn-terminusjsonplainparser_try_parse_response"><summary><span class="chev"></span><code class="fpath">TerminusJSONPlainParser._try_parse_response</code><a class="fn-range" href="../code/terminus_json_plain_parser.py.html#L64-L163" title="terminus_json_plain_parser.py:64-163">terminus_json_plain_parser.py:64–163 ↗</a></summary><div class="file-body"><p class="fn-sub">JSON response parser and ParseResult builder</p>
+<blockquote><p><strong>Stage context</strong>: This helper does the first strict parse attempt inside stage 4.4's response-parse path. <code>TerminusJSONPlainParser.parse_response</code> calls it before deciding whether to apply auto-correction, and <code>Terminus2._handle_llm_interaction</code> later consumes the returned <code>ParseResult</code>. Compared with its sibling <code>parse_response</code>, this method focuses on extraction, decoding, validation, and command conversion for one raw response string.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_try_parse_response</code> turns one LLM <code>response</code> string into a <code>ParseResult</code>. It extracts a JSON fragment, decodes it, checks the expected schema, normalizes <code>task_complete</code>, and converts the <code>commands</code> payload through <code>_parse_commands</code>. It returns structured errors and warnings instead of raising, and it does not mutate any instance state.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, response: str) -&gt; ParseResult</code></p>
+<ul><li>params: <code>response</code>: <code>str</code> — full LLM response text to extract JSON from and parse</li><li>returns: A <code>ParseResult(commands, is_task_complete, error, warning, analysis, plan)</code> built from the parsed JSON, or a failure result with empty commands and diagnostic text.</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>It starts a local <code>warnings</code> list, then calls <code>_extract_json_content(response)</code> to split out <code>json_content</code> and collect format warnings about extra text before or after the JSON.</li><li>If <code>_extract_json_content</code> finds no <code>json_content</code>, it returns a failure <code>ParseResult</code> with <code>error</code> set to <code>"No valid JSON found in response"</code> and the accumulated warnings joined into the bullet-list warning string.</li><li>It tries <code>json.loads(json_content)</code>. On <code>json.JSONDecodeError</code>, it returns a failure <code>ParseResult</code> whose <code>error</code> includes the exception text plus either the full <code>json_content</code> or a 100-character preview, depending on length.</li><li>It calls <code>_validate_json_structure(parsed_data, json_content, warnings)</code>. If that helper returns <code>validation_error</code>, it stops and returns a failure <code>ParseResult</code>, again preserving any warnings already accumulated.</li><li>It reads <code>parsed_data.get("task_complete", False)</code> into <code>is_complete</code> and coerces string forms like <code>"true"</code>, <code>"1"</code>, and <code>"yes"</code> to booleans. It also pulls <code>analysis</code> and <code>plan</code> from <code>parsed_data</code> with empty-string defaults.</li><li>It reads <code>commands_data = parsed_data.get("commands", [])</code> and passes it to <code>_parse_commands(commands_data, warnings)</code>. If <code>_parse_commands</code> reports <code>parse_error</code>, the method either downgrades that problem into an added warning and returns <code>is_task_complete=True</code> with no commands when <code>is_complete</code> is already true, or returns the parse error as a hard failure when completion is false.</li><li>If command parsing succeeds, it returns a success <code>ParseResult</code> with the parsed <code>commands</code>, the normalized <code>is_complete</code> flag, no <code>error</code>, the joined warning text, and the extracted <code>analysis</code> and <code>plan</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _try_parse_response(self, response: str) -&gt; ParseResult:
+        """
+        Try to parse a terminus JSON plain response.
+
+        Args:
+            response: The full LLM response string
+
+        Returns:
+            ParseResult with commands, completion status, errors and warnings
+        """
+        warnings = []
+
+        # Check for extra text before/after JSON
+        json_content, extra_text_warnings = self._extract_json_content(response)
+        warnings.extend(extra_text_warnings)
+
+        if not json_content:
+            return ParseResult(
+                [],
+                False,
+                "No valid JSON found in response",
+                "- " + "\n- ".join(warnings) if warnings else "",
+                "",
+                "",
+            )
+
+        # Parse JSON
+        try:
+            parsed_data = json.loads(json_content)
+        except json.JSONDecodeError as e:
+            # Add debug info
+            error_msg = f"Invalid JSON: {str(e)}"
+            if len(json_content) &lt; 200:
+                error_msg += f" | Content: {repr(json_content)}"
+            else:
+                error_msg += f" | Content preview: {repr(json_content[:100])}..."
+            return ParseResult(
+                [],
+                False,
+                error_msg,
+                "- " + "\n- ".join(warnings) if warnings else "",
+                "",
+                "",
+            )
+
+        # Validate structure
+        validation_error = self._validate_json_structure(
+            parsed_data, json_content, warnings
+        )
+        if validation_error:
+            return ParseResult(
+                [],
+                False,
+                validation_error,
+                "- " + "\n- ".join(warnings) if warnings else "",
+                "",
+                "",
+            )
+
+        # Check if task is complete
+        is_complete = parsed_data.get("task_complete", False)
+        if isinstance(is_complete, str):
+            is_complete = is_complete.lower() in ("true", "1", "yes")
+
+        # Extract analysis and plan for reasoning content
+        analysis = parsed_data.get("analysis", "")
+        plan = parsed_data.get("plan", "")
+
+        # Parse commands
+        commands_data = parsed_data.get("commands", [])
+        commands, parse_error = self._parse_commands(commands_data, warnings)
+        if parse_error:
+            # If task is complete, parse errors are just warnings
+            if is_complete:
+                warnings.append(parse_error)
+                return ParseResult(
+                    [],
+                    True,
+                    "",
+                    "- " + "\n- ".join(warnings) if warnings else "",
+                    analysis,
+                    plan,
+                )
+            return ParseResult(
+                [],
+                False,
+                parse_error,
+                "- " + "\n- ".join(warnings) if warnings else "",
+                analysis,
+                plan,
+            )
+
+        return ParseResult(
+            commands,
+            is_complete,
+            "",
+            "- " + "\n- ".join(warnings) if warnings else "",
+            analysis,
+            plan,
+        )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It separates hard failures from recoverable format issues by collecting <code>warnings</code> alongside normal parsing. This lets <code>_extract_json_content(...)</code> and <code>_parse_commands(...)</code> report extra text or non-fatal command issues without discarding the whole response.</li><li>It embeds <code>json_content</code> or a preview in the <code>JSONDecodeError</code> path. That choice favors diagnosis of malformed model output; the size check (<code>len(json_content) &lt; 200</code>) limits how much bad content the error string carries.</li><li>It coerces string <code>task_complete</code> values to booleans because model output may not honor the expected JSON boolean type exactly. Without this branch, values like <code>"true"</code> would pass schema extraction but drive the completion logic incorrectly.</li><li>It treats <code>parse_error</code> from <code>_parse_commands</code> as a warning when <code>is_complete</code> is already true. That trade-off prefers honoring an explicit completion signal over rejecting the whole response for unusable commands that no longer matter.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>TerminusJSONPlainParser.parse_response</code></li><li><strong>Core callees</strong>: <code>self._extract_json_content</code>; <code>json.loads</code>; <code>self._validate_json_structure</code>; <code>self._parse_commands</code>; <code>ParseResult</code> constructor</li><li><strong>Config / state sources</strong>: <code>response</code> argument; parsed JSON fields <code>task_complete</code>, <code>analysis</code>, <code>plan</code>, and <code>commands</code>; warnings accumulated from <code>_extract_json_content</code> and <code>_parse_commands</code></li><li><strong>Results to</strong>: <code>TerminusJSONPlainParser.parse_response</code>, which may retry with auto-correction and combine warnings; <code>Terminus2._handle_llm_interaction</code>, which maps <code>error</code> and <code>warning</code> into one feedback string and wraps parsed commands into <code>Command</code> objects</li><li><strong>Related siblings</strong>: <code>TerminusJSONPlainParser.parse_response</code> wraps this method with auto-fix retries and warning combination; <code>Terminus2._handle_llm_interaction</code> consumes this method's <code>ParseResult</code> shape during the same stage</li></ul></div></details><details class="file" id="fn-terminusjsonplainparser_extract_json_content"><summary><span class="chev"></span><code class="fpath">TerminusJSONPlainParser._extract_json_content</code><a class="fn-range" href="../code/terminus_json_plain_parser.py.html#L165-L212" title="terminus_json_plain_parser.py:165-212">terminus_json_plain_parser.py:165–212 ↗</a></summary><div class="file-body"><p class="fn-sub">Extract first balanced JSON object from reply text</p>
+<blockquote><p><strong>Stage context</strong>: This helper lives under the stage's response-parsing code and handles one narrow task: isolate a JSON object from a raw <code>response</code> string. The body shows no instance-state access and no downstream work beyond returning extracted text plus warning strings. It is a local utility for the parser methods in this class.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_extract_json_content</code> scans <code>response</code> and returns the first top-level <code>{...}</code> segment whose braces balance outside quoted strings. It also reports whether trimmed text exists before or after that segment. On failure, it returns an empty string and exactly <code>["No valid JSON object found"]</code>. It does not mutate <code>self</code> or any external state.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, response: str) -&gt; tuple[str, List[str]]</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — parser instance; unused in this body; <code>response</code>: <code>str</code> — raw text to scan for one complete top-level JSON object</li><li>returns: A <code>(json_text, warnings)</code> tuple. On success, <code>json_text</code> is <code>response[json_start:json_end]</code> and <code>warnings</code> may include <code>"Extra text detected before JSON object"</code> if <code>response[:json_start].strip()</code> is non-empty and/or <code>"Extra text detected after JSON object"</code> if <code>response[json_end:].strip()</code> is non-empty. On failure, it returns <code>""</code> and exactly <code>["No valid JSON object found"]</code> when either <code>json_start == -1</code> or <code>json_end == -1</code> after the scan.</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Initialize local scan state: <code>warnings</code>, <code>json_start</code>, <code>json_end</code>, <code>brace_count</code>, <code>in_string</code>, and <code>escape_next</code>.</li><li>Walk <code>response</code> with <code>enumerate(response)</code>. If <code>escape_next</code> was set by the prior character, clear it and <code>continue</code> immediately, so the current character does not reach quote or brace handling.</li><li>When the current <code>char</code> is <code>"\\"</code>, set <code>escape_next = True</code> and <code>continue</code>, so that backslash itself does not affect <code>in_string</code> or brace counting on this iteration.</li><li>When the current <code>char</code> is <code>"</code> and the code has not already continued, toggle <code>in_string</code> and <code>continue</code>, so quote characters only change string state and do not count as structure.</li><li>Only while <code>not in_string</code>, treat <code>{</code> and <code>}</code> as JSON structure: the first <code>{</code> seen at <code>brace_count == 0</code> sets <code>json_start</code>; every <code>{</code> increments <code>brace_count</code>; every <code>}</code> decrements it; when a <code>}</code> brings <code>brace_count</code> back to <code>0</code> and <code>json_start != -1</code>, set <code>json_end = i + 1</code> and stop scanning with <code>break</code>.</li><li>After the loop, fail if either boundary was never found by returning <code>""</code> and <code>["No valid JSON object found"]</code>.</li><li>On success, compute <code>before_text = response[:json_start].strip()</code> and <code>after_text = response[json_end:].strip()</code>, append the exact warning strings for any non-empty surrounding text, and return the sliced JSON text plus <code>warnings</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _extract_json_content(self, response: str) -&gt; tuple[str, List[str]]:
+        """Extract JSON content from response, handling extra text."""
+        warnings = []
+
+        # Try to find JSON object boundaries
+        json_start = -1
+        json_end = -1
+        brace_count = 0
+        in_string = False
+        escape_next = False
+
+        for i, char in enumerate(response):
+            if escape_next:
+                escape_next = False
+                continue
+
+            if char == "\\":
+                escape_next = True
+                continue
+
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+
+            if not in_string:
+                if char == "{":
+                    if brace_count == 0:
+                        json_start = i
+                    brace_count += 1
+                elif char == "}":
+                    brace_count -= 1
+                    if brace_count == 0 and json_start != -1:
+                        json_end = i + 1
+                        break
+
+        if json_start == -1 or json_end == -1:
+            return "", ["No valid JSON object found"]
+
+        # Check for extra text
+        before_text = response[:json_start].strip()
+        after_text = response[json_end:].strip()
+
+        if before_text:
+            warnings.append("Extra text detected before JSON object")
+        if after_text:
+            warnings.append("Extra text detected after JSON object")
+
+        return response[json_start:json_end], warnings</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The scan tracks <code>in_string</code> and <code>escape_next</code> separately, so braces only count when they appear outside quoted text. This choice makes <code>brace_count</code> reflect top-level structure instead of literal characters inside JSON strings.</li><li>The code uses immediate <code>continue</code> after both the prior-escape case and the backslash case. That ordering ensures an escaped quote does not toggle <code>in_string</code>, and a backslash character does not also enter the quote or brace branches in the same iteration.</li><li>It stops at the first complete object by <code>break</code>ing as soon as <code>brace_count</code> returns to zero after <code>json_start</code> was set. That favors a single extracted object over trying to parse multiple JSON regions from one <code>response</code>.</li><li>It treats surrounding prose as warnings, not failure, by checking <code>before_text</code> and <code>after_text</code> only after a valid object boundary pair exists. By contrast, missing boundaries produce the single hard failure message <code>"No valid JSON object found"</code>.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>TerminusJSONPlainParser</code> methods in this class that need a JSON substring from raw text</li><li><strong>Core callees</strong>: <code>enumerate(response)</code> for ordered character scanning; <code>response[:json_start].strip()</code> to detect leading non-JSON text; <code>response[json_end:].strip()</code> to detect trailing non-JSON text</li><li><strong>Config / state sources</strong>: none; the body reads no <code>self._*</code> attributes or external registers</li><li><strong>Results to</strong>: Returns <code>json_text</code> for later JSON decoding by its caller; Returns warning strings describing surrounding non-JSON text or total extraction failure</li><li><strong>Related siblings</strong>: <code>TerminusJSONPlainParser._try_parse_response</code> performs the later decode and schema checks after extraction; <code>TerminusJSONPlainParser.parse_response</code> wraps lower-level parse attempts and warning combination</li></ul></div></details><details class="file" id="fn-terminusjsonplainparser_validate_json_structure"><summary><span class="chev"></span><code class="fpath">TerminusJSONPlainParser._validate_json_structure</code><a class="fn-range" href="../code/terminus_json_plain_parser.py.html#L214-L249" title="terminus_json_plain_parser.py:214-249">terminus_json_plain_parser.py:214–249 ↗</a></summary><div class="file-body"><p class="fn-sub">Validate decoded JSON response schema</p>
+<blockquote><p><strong>Stage context</strong>: This helper is part of the <a href="stage-4.4.html">stage-4.4</a> response-parse path. <code>TerminusJSONPlainParser._try_parse_response</code> calls it after <code>_extract_json_content</code> has found a JSON fragment and <code>json.loads(...)</code> has decoded it. In the JSON parser sibling flow, this method handles schema-level checks before <code>_try_parse_response</code> normalizes <code>task_complete</code> and passes <code>commands</code> to <code>_parse_commands</code>.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_validate_json_structure</code> checks whether decoded <code>data</code> matches the parser's expected top-level JSON shape. It inspects <code>data</code>, <code>json_content</code>, and the parser configuration in <code>self.required_fields</code>, returns a non-empty error string for hard failures, and returns <code>""</code> when validation can continue. It also appends non-fatal issues to the caller-provided <code>warnings</code> list and delegates field-order checks to <code>_check_field_order</code>.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, data: dict, json_content: str, warnings: List[str]) -&gt; str</code></p>
+<ul><li>params: <code>data</code>: <code>dict</code> — decoded JSON payload to validate; <code>json_content</code>: <code>str</code> — raw JSON text, used for field-order checks; <code>warnings</code>: <code>List[str]</code> — mutable warning accumulator shared with the caller</li><li>reads: <code>self.required_fields</code></li><li>returns: A validation error string for hard schema failures, or <code>""</code> if the structure is acceptable enough to continue parsing.</li><li>effects: appends warning messages to <code>warnings</code>; calls <code>self._check_field_order(data, json_content, warnings)</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>It first rejects any non-dictionary <code>data</code> and returns <code>"Response must be a JSON object"</code> immediately.</li><li>It checks every name in <code>self.required_fields</code>, collects missing ones into <code>missing_fields</code>, and returns a single <code>"Missing required fields: ..."</code> error if any are absent.</li><li>It treats <code>analysis</code> and <code>plan</code> as soft checks: if <code>data.get("analysis", "")</code> or <code>data.get("plan", "")</code> is not a <code>str</code>, it appends a warning instead of failing.</li><li>It reads <code>commands = data.get("commands", [])</code> and hard-fails with <code>"Field 'commands' must be an array"</code> if that value is not a <code>list</code>.</li><li>It invokes <code>self._check_field_order(data, json_content, warnings)</code> so field-order issues become warnings tied to the original JSON text.</li><li>It validates <code>task_complete</code> only when <code>data.get("task_complete")</code> is not <code>None</code>; if present and not a <code>bool</code> or <code>str</code>, it appends a warning, then returns <code>""</code> to signal that hard validation passed.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _validate_json_structure(
+        self, data: dict, json_content: str, warnings: List[str]
+    ) -&gt; str:
+        """Validate the JSON structure has required fields."""
+        if not isinstance(data, dict):
+            return "Response must be a JSON object"
+
+        # Check for required fields
+        missing_fields = []
+        for field in self.required_fields:
+            if field not in data:
+                missing_fields.append(field)
+
+        if missing_fields:
+            return f"Missing required fields: {', '.join(missing_fields)}"
+
+        # Validate field types
+        if not isinstance(data.get("analysis", ""), str):
+            warnings.append("Field 'analysis' should be a string")
+
+        if not isinstance(data.get("plan", ""), str):
+            warnings.append("Field 'plan' should be a string")
+
+        commands = data.get("commands", [])
+        if not isinstance(commands, list):
+            return "Field 'commands' must be an array"
+
+        # Check for correct order of fields (analysis, plan, commands)
+        self._check_field_order(data, json_content, warnings)
+
+        # Validate task_complete if present
+        task_complete = data.get("task_complete")
+        if task_complete is not None and not isinstance(task_complete, (bool, str)):
+            warnings.append("Field 'task_complete' should be a boolean or string")
+
+        return ""</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It splits schema problems into hard errors and warnings. The code returns immediately for top-level shape, missing required fields, and non-list <code>commands</code>, but only appends warnings for <code>analysis</code>, <code>plan</code>, and <code>task_complete</code> type mismatches. That choice lets <code>_try_parse_response</code> keep useful command data when descriptive fields are malformed.</li><li>It accepts <code>task_complete</code> as either <code>bool</code> or <code>str</code> via <code>isinstance(task_complete, (bool, str))</code>. This is broader than strict JSON-schema typing, but it matches the parser pipeline where <code>_try_parse_response</code> later normalizes that field instead of rejecting the whole response.</li><li>It guards the <code>task_complete</code> type check with <code>task_complete is not None</code>. That preserves omission as acceptable while still flagging present-but-wrong values, avoiding a warning for missing optional data.</li><li>It validates field order through <code>_check_field_order(data, json_content, warnings)</code> using both parsed <code>data</code> and raw <code>json_content</code>. That separates semantic validation from presentation-order checks, and it keeps ordering issues non-fatal.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>TerminusJSONPlainParser._try_parse_response</code></li><li><strong>Core callees</strong>: <code>TerminusJSONPlainParser._check_field_order</code></li><li><strong>Config / state sources</strong>: <code>self.required_fields</code></li><li><strong>Results to</strong>: returned error string is consumed by <code>TerminusJSONPlainParser._try_parse_response</code>; mutated <code>warnings</code> list flows into the <code>ParseResult.warning</code> assembly in <code>TerminusJSONPlainParser._try_parse_response</code> and <code>TerminusJSONPlainParser.parse_response</code></li><li><strong>Related siblings</strong>: <code>TerminusJSONPlainParser.parse_response</code> retries parsing and combines warnings around this validation step; <code>TerminusJSONPlainParser._try_parse_response</code> performs decode, calls this validator, then normalizes <code>task_complete</code> and parses <code>commands</code>; <code>TerminusJSONPlainParser._extract_json_content</code> provides the <code>json_content</code> string that this function uses for field-order checks; <code>Terminus2._handle_llm_interaction</code> later turns parser <code>error</code> and <code>warning</code> outputs into user-facing <code>feedback</code></li></ul></div></details><details class="file" id="fn-terminusjsonplainparser_check_field_order"><summary><span class="chev"></span><code class="fpath">TerminusJSONPlainParser._check_field_order</code><a class="fn-range" href="../code/terminus_json_plain_parser.py.html#L352-L393" title="terminus_json_plain_parser.py:352-393">terminus_json_plain_parser.py:352–393 ↗</a></summary><div class="file-body"><p class="fn-sub">JSON required-field presentation order checker</p>
+<blockquote><p><strong>Stage context</strong>: This helper performs one narrow validation on the raw <code>response</code> text: it checks whether the keys <code>analysis</code>, <code>plan</code>, and <code>commands</code> appear in that textual order. The provided sibling synopsis for <code>TerminusJSONPlainParser._validate_json_structure</code> states that it delegates field-order checks to <code>_check_field_order</code>, so this function contributes a soft warning during JSON structure validation rather than producing parse data itself.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_check_field_order</code> inspects <code>response</code> for quoted key occurrences of <code>analysis</code>, <code>plan</code>, and <code>commands</code>, then compares their observed text order against the fixed <code>expected_order</code>. It uses <code>warnings</code> as its real output: it may append at most one human-readable warning, and only when at least two of those target fields are found and their observed order differs from <code>expected_present</code>. It does not return a value and does not mutate any <code>self</code> attributes.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, data: dict, response: str, warnings: List[str]) -&gt; None</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — parser instance; present but not read for any <code>self.</code> state here; <code>data</code>: <code>dict</code> — parsed JSON object; accepted by signature but unused in this body; <code>response</code>: <code>str</code> — original response text searched for key positions with <code>re.search(...)</code>; <code>warnings</code>: <code>List[str]</code> — mutable warning sink; may receive at most one appended message if order is wrong</li><li>returns: Returns <code>None</code>; its real product is a possible single appended warning in <code>warnings</code>.</li><li>effects: May call <code>warnings.append(...)</code> once, but only if at least two target fields are found and <code>actual_order != expected_present</code>.</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>It fixes the target sequence in <code>expected_order = ["analysis", "plan", "commands"]</code> and initializes <code>positions = {}</code>.</li><li>For each field in <code>expected_order</code>, it builds the regex <code>pattern = f'"({field})"\\s*:'</code>, searches <code>response</code> with <code>re.search(pattern, response)</code>, and records <code>match.start()</code> in <code>positions[field]</code> when found.</li><li>It stops early with <code>return</code> when <code>len(positions) &lt; 2</code>, because there are not enough discovered fields to compare order.</li><li>It builds <code>present_fields</code> by iterating through <code>expected_order</code> again and collecting <code>(field, positions[field])</code> only for fields that were found.</li><li>It sorts <code>present_fields</code> by the recorded position to derive <code>actual_order</code>, and separately derives <code>expected_present</code> by filtering <code>expected_order</code> down to the fields present in <code>positions</code>.</li><li>If <code>actual_order != expected_present</code>, it formats both orders with <code>" → ".join(...)</code> and appends one warning string to <code>warnings</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _check_field_order(
+        self, data: dict, response: str, warnings: List[str]
+    ) -&gt; None:
+        """Check if fields appear in the correct order: analysis, plan, commands."""
+        # Expected order for required fields
+        expected_order = ["analysis", "plan", "commands"]
+
+        # Find positions of each field in the original response
+        positions = {}
+        for field in expected_order:
+            # Look for the field name in quotes
+            pattern = f'"({field})"\\s*:'
+            match = re.search(pattern, response)
+            if match:
+                positions[field] = match.start()
+
+        # Check if we have at least 2 fields to compare order
+        if len(positions) &lt; 2:
+            return
+
+        # Get fields that are present, in the order they appear
+        present_fields = []
+        for field in expected_order:
+            if field in positions:
+                present_fields.append((field, positions[field]))
+
+        # Sort by position to get actual order
+        actual_order = [
+            field for field, pos in sorted(present_fields, key=lambda x: x[1])
+        ]
+
+        # Get expected order for present fields only
+        expected_present = [f for f in expected_order if f in positions]
+
+        # Compare orders
+        if actual_order != expected_present:
+            actual_str = " → ".join(actual_order)
+            expected_str = " → ".join(expected_present)
+            warnings.append(
+                f"Fields appear in wrong order. Found: {actual_str}, "
+                f"expected: {expected_str}"
+            )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It checks order against the raw <code>response</code> text via <code>re.search(...)</code> and <code>match.start()</code> instead of relying on <code>data</code>. That choice preserves the original presentation order, which a parsed <code>dict</code> parameter does not expose in this function.</li><li>It compares only the subset in <code>expected_present</code> rather than requiring all three keys. That lets it warn about misordering among whichever target fields were actually found, while skipping cases where fewer than two positions exist.</li><li>It records the issue through <code>warnings.append(...)</code> instead of raising or returning an error value. The code treats wrong field order as a soft formatting problem, not as a hard failure.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>TerminusJSONPlainParser._validate_json_structure</code> delegates field-order checks here according to the provided sibling synopsis</li><li><strong>Core callees</strong>: <code>re.search</code> to locate each quoted field name in <code>response</code>; <code>sorted(..., key=lambda x: x[1])</code> to order found fields by position; <code>warnings.append(...)</code> to report one mismatch message; <code>" → ".join(...)</code> to format found and expected orders</li><li><strong>Config / state sources</strong>: Local constant <code>expected_order</code> defines the only accepted sequence: <code>analysis</code>, <code>plan</code>, <code>commands</code>; Argument <code>response</code> supplies the raw text searched for field positions; Argument <code>warnings</code> supplies the mutable destination for any soft validation message; Argument <code>data</code> is part of the interface but unused in this implementation</li><li><strong>Results to</strong>: <code>warnings</code> list passed by the caller; Caller-visible <code>None</code> return after optional warning append</li><li><strong>Related siblings</strong>: <code>TerminusJSONPlainParser._validate_json_structure</code>; <code>TerminusJSONPlainParser._try_parse_response</code>; <code>TerminusJSONPlainParser.parse_response</code></li></ul></div></details><details class="file" id="fn-terminusjsonplainparser_parse_commands"><summary><span class="chev"></span><code class="fpath">TerminusJSONPlainParser._parse_commands</code><a class="fn-range" href="../code/terminus_json_plain_parser.py.html#L251-L303" title="terminus_json_plain_parser.py:251-303">terminus_json_plain_parser.py:251–303 ↗</a></summary><div class="file-body"><p class="fn-sub">Validate command objects into parsed command records</p>
+<blockquote><p><strong>Stage context</strong>: This helper sits inside the <a href="stage-4.4.html">stage-4.4</a> response-parsing path. <code>TerminusJSONPlainParser._try_parse_response</code> calls it after JSON decoding and top-level schema checks to turn the <code>commands</code> payload into <code>ParsedCommand</code> objects. It complements <code>_validate_json_structure</code> by handling per-command validation, and its warnings flow back through <code>parse_response</code> and then <code>Terminus2._handle_llm_interaction</code> into the stage feedback string.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_parse_commands</code> inspects <code>commands_data</code>, which should be a list of command dictionaries, and converts each valid entry into a <code>ParsedCommand</code>. It returns a pair <code>(commands, error_message)</code>, where any hard validation failure returns <code>[]</code> plus a non-empty error string, and successful parsing returns the built command list plus <code>""</code>. It also appends non-fatal notices into the caller-supplied <code>warnings</code> list for missing or invalid <code>duration</code>, unknown fields, and missing trailing newlines before later commands. The function does not read or write any <code>self</code> state.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, commands_data: List[dict], warnings: List[str]) -&gt; tuple[List[ParsedCommand], str]</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — parser instance; unused for state access in this method; <code>commands_data</code>: <code>List[dict]</code> — decoded JSON <code>commands</code> payload to validate and convert; <code>warnings</code>: <code>List[str]</code> — caller-owned warning accumulator that this method appends to</li><li>returns: A <code>(commands, error_message)</code> tuple. On success, <code>commands</code> is a <code>List[ParsedCommand]</code> and <code>error_message</code> is <code>""</code>; on hard validation failure, <code>commands</code> is <code>[]</code> and <code>error_message</code> explains the first fatal issue found.</li><li>effects: appends human-readable warning strings to the passed-in <code>warnings</code> list</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Initialize an empty <code>commands</code> list, then walk <code>commands_data</code> with <code>enumerate</code> so each message can name <code>Command {i + 1}</code>.</li><li>For each <code>cmd_data</code>, reject non-dict entries immediately with <code>([], f"Command {i + 1} must be an object")</code>, then require a <code>keystrokes</code> key and require <code>cmd_data["keystrokes"]</code> to be a string.</li><li>Read optional <code>duration</code>: if the key is missing, append a warning and use <code>1.0</code>; if present but not an <code>int</code> or <code>float</code>, append a warning and also fall back to <code>1.0</code>.</li><li>Compute <code>unknown_fields</code> as <code>set(cmd_data.keys()) - {"keystrokes", "duration"}</code> and append a warning when extra keys are present.</li><li>If this is not the last command and <code>keystrokes</code> does not end with <code>"\n"</code>, append a warning about line concatenation risk across adjacent commands.</li><li>Create <code>ParsedCommand(keystrokes=keystrokes, duration=float(duration))</code>, append it to <code>commands</code>, and after the loop return <code>(commands, "")</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _parse_commands(
+        self, commands_data: List[dict], warnings: List[str]
+    ) -&gt; tuple[List[ParsedCommand], str]:
+        """Parse commands array into ParsedCommand objects."""
+        commands = []
+
+        for i, cmd_data in enumerate(commands_data):
+            if not isinstance(cmd_data, dict):
+                return [], f"Command {i + 1} must be an object"
+
+            # Check for required keystrokes field
+            if "keystrokes" not in cmd_data:
+                return [], f"Command {i + 1} missing required 'keystrokes' field"
+
+            keystrokes = cmd_data["keystrokes"]
+            if not isinstance(keystrokes, str):
+                return [], f"Command {i + 1} 'keystrokes' must be a string"
+
+            # Parse optional fields with defaults
+            if "duration" in cmd_data:
+                duration = cmd_data["duration"]
+                if not isinstance(duration, (int, float)):
+                    warnings.append(
+                        f"Command {i + 1}: Invalid duration value, using default 1.0"
+                    )
+                    duration = 1.0
+            else:
+                warnings.append(
+                    f"Command {i + 1}: Missing duration field, using default 1.0"
+                )
+                duration = 1.0
+
+            # Check for unknown fields
+            known_fields = {"keystrokes", "duration"}
+            unknown_fields = set(cmd_data.keys()) - known_fields
+            if unknown_fields:
+                warnings.append(
+                    f"Command {i + 1}: Unknown fields: {', '.join(unknown_fields)}"
+                )
+
+            # Check for newline at end of keystrokes if followed by another command
+            if i &lt; len(commands_data) - 1 and not keystrokes.endswith("\n"):
+                warnings.append(
+                    f"Command {i + 1} should end with newline when followed "
+                    "by another command. Otherwise the two commands will be "
+                    "concatenated together on the same line."
+                )
+
+            commands.append(
+                ParsedCommand(keystrokes=keystrokes, duration=float(duration))
+            )
+
+        return commands, ""</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It treats <code>keystrokes</code> as a hard requirement but treats <code>duration</code> as recoverable. The branches around <code>"keystrokes"</code> and <code>isinstance(keystrokes, str)</code> abort immediately, while bad or missing <code>duration</code> only adds to <code>warnings</code> and falls back to <code>1.0</code>. That choice preserves executable command text when timing metadata is weak.</li><li>It stops at the first fatal command error instead of collecting every structural problem. The early <code>return [], ...</code> branches keep downstream code from receiving a partially parsed command list, at the cost of less comprehensive error reporting in one pass.</li><li>It warns about unknown keys instead of rejecting them. The <code>unknown_fields</code> check makes the parser strict enough to surface schema drift but permissive enough to keep useful commands.</li><li>It checks for a trailing newline only when another command follows. The <code>i &lt; len(commands_data) - 1</code> guard reflects the real hazard: separate command payloads can concatenate on one shell line, so the parser reports this as advisory formatting risk rather than invalid syntax.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>TerminusJSONPlainParser._try_parse_response</code></li><li><strong>Core callees</strong>: <code>enumerate</code> over <code>commands_data</code>; <code>isinstance</code> for dict/string/number validation; <code>set(cmd_data.keys())</code> to detect unknown fields; <code>ParsedCommand(...)</code> constructor; <code>float(duration)</code> coercion</li><li><strong>Config / state sources</strong>: <code>commands_data</code> argument supplies the decoded command objects; <code>warnings</code> argument supplies the mutable warning sink shared with parser siblings</li><li><strong>Results to</strong>: returned <code>commands</code> populate <code>ParseResult.commands</code> in <code>TerminusJSONPlainParser._try_parse_response</code>; returned error string becomes the parse error path in <code>TerminusJSONPlainParser._try_parse_response</code>; appended warnings are carried through <code>TerminusJSONPlainParser.parse_response</code>; those warnings are later folded into <code>feedback</code> by <code>Terminus2._handle_llm_interaction</code></li><li><strong>Related siblings</strong>: <code>TerminusJSONPlainParser._try_parse_response</code> calls this after <code>_validate_json_structure</code> passes; <code>TerminusJSONPlainParser.parse_response</code> may combine this method's warnings with auto-correction warnings; <code>Terminus2._handle_llm_interaction</code> converts successful <code>ParsedCommand</code> results into <code>Command</code> objects with duration clamping</li></ul></div></details><details class="file" id="fn-terminusjsonplainparser_fix_mixed_content"><summary><span class="chev"></span><code class="fpath">TerminusJSONPlainParser._fix_mixed_content</code><a class="fn-range" href="../code/terminus_json_plain_parser.py.html#L330-L343" title="terminus_json_plain_parser.py:330-343">terminus_json_plain_parser.py:330–343 ↗</a></summary><div class="file-body"><p class="fn-sub">Mixed-content JSON candidate extractor</p>
+<blockquote><p><strong>Stage context</strong>: This helper belongs to the stage's parser-side recovery toolkit. Within this entry's own code, it only searches a <code>response</code> string for brace-delimited candidates and tests them as JSON; it does not inspect parser configuration or mutate parser state.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_fix_mixed_content</code> scans <code>response</code> for substrings that look like JSON objects and returns the first candidate that <code>json.loads</code> accepts. It takes <code>error</code> as a parameter but this body never reads it. On success it returns <code>(match, True)</code>; if no candidate parses, it returns the original <code>response</code> unchanged with <code>False</code>. It reads no <code>self</code> attributes and writes no state.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, response: str, error: str) -&gt; tuple[str, bool]</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — parser instance; unused by this method body; <code>response</code>: <code>str</code> — source text to search for brace-delimited JSON-like substrings; <code>error</code>: <code>str</code> — unused input parameter</li><li>returns: A tuple <code>(text, ok)</code> where <code>text</code> is either the first candidate substring accepted by <code>json.loads</code> or the original <code>response</code>, and <code>ok</code> is <code>True</code> on successful extraction and <code>False</code> otherwise.</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Build <code>json_pattern = r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}"</code> and call <code>re.findall(json_pattern, response, re.DOTALL)</code> to collect brace-delimited, object-like substrings from <code>response</code>.</li><li>Iterate through each <code>match</code> from <code>matches</code> and call <code>json.loads(match)</code> to validate whether that candidate is real JSON.</li><li>If <code>json.loads(match)</code> succeeds for a candidate, return that exact <code>match</code> with <code>True</code> immediately.</li><li>If <code>json.loads(match)</code> raises <code>json.JSONDecodeError</code>, ignore that candidate and continue to the next one; the function does not handle other exception types here.</li><li>If no candidate survives validation, return the original <code>response</code> with <code>False</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _fix_mixed_content(self, response: str, error: str) -&gt; tuple[str, bool]:
+        """Extract JSON from response with mixed content."""
+        # Look for JSON-like patterns
+        json_pattern = r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}"
+        matches = re.findall(json_pattern, response, re.DOTALL)
+
+        for match in matches:
+            try:
+                json.loads(match)
+                return match, True
+            except json.JSONDecodeError:
+                continue
+
+        return response, False</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It separates candidate extraction from acceptance: the regex only finds object-like text, and <code>json.loads</code> makes the final decision. That avoids trusting the pattern to recognize valid JSON on its own.</li><li>The pattern targets brace-delimited substrings, not arbitrary JSON values. This keeps the search focused on object-shaped fragments, but it also means the method is only an approximation for nested structures.</li><li>The <code>except</code> block catches only <code>json.JSONDecodeError</code> and then continues scanning. This choice deliberately treats malformed candidates as normal misses instead of failing the whole recovery attempt.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Unknown from provided code; this entry does not show its caller</li><li><strong>Core callees</strong>: <code>re.findall</code>; <code>json.loads</code></li><li><strong>Config / state sources</strong>: <code>response</code> argument; <code>error</code> argument (present but unused)</li><li><strong>Results to</strong>: Its direct caller, via the returned <code>(text, ok)</code> tuple</li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_parse_response"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser.parse_response</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L28-L60" title="terminus_xml_plain_parser.py:28-60">terminus_xml_plain_parser.py:28–60 ↗</a></summary><div class="file-body"><p class="fn-sub"> </p>
+<blockquote><p><strong>Stage context</strong>:</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><strong>Source</strong></p>
+<pre><code>    def parse_response(self, response: str) -&gt; ParseResult:
+        """
+        Parse a terminus XML plain response and extract commands.
+
+        Args:
+            response: The full LLM response string
+
+        Returns:
+            ParseResult with commands, completion status, errors and warnings
+        """
+        # Try normal parsing first
+        result = self._try_parse_response(response)
+
+        if result.error:
+            # Try auto-fixes in order until one works
+            for fix_name, fix_function in self._get_auto_fixes():
+                corrected_response, was_fixed = fix_function(response, result.error)
+                if was_fixed:
+                    corrected_result = self._try_parse_response(corrected_response)
+
+                    if corrected_result.error == "":
+                        # Success! Add auto-correction warning
+                        auto_warning = (
+                            f"AUTO-CORRECTED: {fix_name} - "
+                            "please fix this in future responses"
+                        )
+                        corrected_result.warning = self._combine_warnings(
+                            auto_warning, corrected_result.warning
+                        )
+                        return corrected_result
+
+        # Return original result if no fix worked
+        return result</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<p><strong>Relations</strong></p></div></details><details class="file" id="fn-terminusxmlplainparser_try_parse_response"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser._try_parse_response</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L62-L169" title="terminus_xml_plain_parser.py:62-169">terminus_xml_plain_parser.py:62–169 ↗</a></summary><div class="file-body"><p class="fn-sub">Parse one XML reply into ParseResult</p>
+<blockquote><p><strong>Stage context</strong>: This function is the XML parser's core <a href="stage-4.4.html">stage-4.4</a> worker for turning one LLM reply string into the normalized <code>ParseResult</code> that later response-handling code consumes. <code>TerminusXMLPlainParser.parse_response</code> calls it before any higher-level feedback mapping happens. In the XML path, it plays the same role that <code>TerminusJSONPlainParser._try_parse_response</code> plays for JSON, but it works through XML-specific helpers for wrapper extraction, section discovery, completion detection, and command parsing.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_try_parse_response</code> consumes a full XML-formatted <code>response</code> string and returns a <code>ParseResult(commands, is_task_complete, error, warning, analysis, plan)</code>. It validates the outer <code>&lt;response&gt;</code> wrapper, extracts section content, detects completion through <code>is_complete</code>, and parses <code>&lt;commands&gt;</code> content into command objects through <code>_parse_xml_commands</code>. It accumulates human-readable warnings in <code>warnings</code> and returns parse failures as <code>error</code> strings instead of raising. It does not mutate any instance state.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, response: str) -&gt; ParseResult</code></p>
+<ul><li>params: <code>response</code>: <code>str</code> — full LLM reply to parse as Terminus plain XML</li><li>returns: a <code>ParseResult</code> containing parsed commands, completion flag, parse error text, warning text, and extracted <code>analysis</code> / <code>plan</code> section text</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>It starts a local <code>warnings</code> list, then calls <code>_check_extra_text(response, warnings)</code> so any text outside the expected <code>&lt;response&gt;</code> wrapper becomes non-fatal warning output.</li><li>It extracts the wrapper body with <code>_extract_response_content(response)</code>; if that returns a falsey value, it stops immediately and returns a <code>ParseResult</code> with <code>error</code> set to <code>"No &lt;response&gt; tag found"</code>, no commands, <code>False</code> completion, and any accumulated warnings joined into the bullet-list string format.</li><li>It computes <code>is_complete</code> from <code>_check_task_complete(response_content)</code>, then calls <code>_extract_sections(response_content, warnings)</code> to gather named section payloads and section-related warnings.</li><li>It pulls <code>analysis</code> and <code>plan</code> from <code>sections</code> with default <code>""</code>, then inspects <code>commands_content = sections.get("commands", "")</code> to decide whether commands are present, empty, or missing.</li><li>If <code>commands_content</code> is empty but the key <code>"commands"</code> exists in <code>sections</code>, it treats that as an empty commands section: when <code>is_complete</code> is false it appends a specific waiting-related warning, and then returns success-with-no-commands using the current <code>is_complete</code>, <code>analysis</code>, and <code>plan</code> values.</li><li>If the <code>"commands"</code> section is missing entirely, it accepts that only when <code>is_complete</code> is true; otherwise it returns a hard parse error <code>"Missing &lt;commands&gt; section"</code> with no commands.</li><li>When command content exists, it delegates to <code>_parse_xml_commands(commands_content, warnings)</code>; if that returns <code>parse_error</code>, the function downgrades that error into an added warning when <code>is_complete</code> is true, but returns it as the <code>error</code> field when <code>is_complete</code> is false.</li><li>If command parsing succeeds, it returns a <code>ParseResult</code> with the parsed <code>commands</code>, the previously computed <code>is_complete</code>, an empty <code>error</code>, the joined warning string, and the extracted <code>analysis</code> and <code>plan</code> text.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _try_parse_response(self, response: str) -&gt; ParseResult:
+        """
+        Try to parse a terminus XML plain response.
+
+        Args:
+            response: The full LLM response string
+
+        Returns:
+            ParseResult with commands, completion status, errors and warnings
+        """
+        warnings = []
+
+        # Check for extra text before/after &lt;response&gt; tags
+        self._check_extra_text(response, warnings)
+
+        # Extract &lt;response&gt; content
+        response_content = self._extract_response_content(response)
+        if not response_content:
+            return ParseResult(
+                [],
+                False,
+                "No &lt;response&gt; tag found",
+                "- " + "\n- ".join(warnings) if warnings else "",
+                "",
+                "",
+            )
+
+        # Check if task is complete first
+        is_complete = self._check_task_complete(response_content)
+
+        # Check for required sections and extract content
+        sections = self._extract_sections(response_content, warnings)
+
+        # Extract analysis and plan for reasoning content
+        analysis = sections.get("analysis", "")
+        plan = sections.get("plan", "")
+
+        # Extract commands section
+        commands_content = sections.get("commands", "")
+        if not commands_content:
+            if "commands" in sections:
+                # Commands section exists but is empty
+                if not is_complete:
+                    warnings.append(
+                        "Commands section is empty; not taking any action. "
+                        "If you want to wait a specific amount of time please use "
+                        "`sleep`, but if you're waiting for a command to finish then "
+                        "continue to wait."
+                    )
+                return ParseResult(
+                    [],
+                    is_complete,
+                    "",
+                    "- " + "\n- ".join(warnings) if warnings else "",
+                    analysis,
+                    plan,
+                )
+            else:
+                # Commands section is missing entirely
+                if is_complete:
+                    return ParseResult(
+                        [],
+                        True,
+                        "",
+                        "- " + "\n- ".join(warnings) if warnings else "",
+                        analysis,
+                        plan,
+                    )
+                return ParseResult(
+                    [],
+                    False,
+                    "Missing &lt;commands&gt; section",
+                    "- " + "\n- ".join(warnings) if warnings else "",
+                    analysis,
+                    plan,
+                )
+
+        # Parse commands directly from XML (no code blocks in plain format)
+        commands, parse_error = self._parse_xml_commands(commands_content, warnings)
+        if parse_error:
+            # If task is complete, parse errors are just warnings
+            if is_complete:
+                warnings.append(parse_error)
+                return ParseResult(
+                    [],
+                    True,
+                    "",
+                    "- " + "\n- ".join(warnings) if warnings else "",
+                    analysis,
+                    plan,
+                )
+            return ParseResult(
+                [],
+                False,
+                parse_error,
+                "- " + "\n- ".join(warnings) if warnings else "",
+                analysis,
+                plan,
+            )
+
+        return ParseResult(
+            commands,
+            is_complete,
+            "",
+            "- " + "\n- ".join(warnings) if warnings else "",
+            analysis,
+            plan,
+        )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It separates hard failures from recoverable format issues by collecting <code>warnings</code> locally and returning them in <code>ParseResult.warning</code>. That keeps <a href="stage-4.4.html">stage-4.4</a> parsing tolerant of wrapper noise and section quirks, while still preserving machine-readable failure state in <code>error</code> for callers that need to gate execution.</li><li>It checks <code>is_complete</code> before enforcing command validity so a completion-marked reply can omit usable commands. That choice appears in both the missing-<code>&lt;commands&gt;</code> branch and the <code>parse_error</code> branch, and it avoids rejecting final-answer messages just because they no longer carry executable actions.</li><li>It distinguishes an empty <code>&lt;commands&gt;</code> section from a missing <code>&lt;commands&gt;</code> section by testing both <code>commands_content</code> and <code>"commands" in sections</code>. This lets the parser give a softer, instructional warning for an explicitly empty section while still treating a truly absent section as malformed unless the task is already complete.</li><li>It returns bullet-formatted warning text (<code>"- " + "\n- ".join(warnings)</code>) at every exit point instead of exposing the raw list. That keeps this function aligned with the stage contract described for later feedback mapping, where downstream code expects warning text rather than parser-internal list structure.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>TerminusXMLPlainParser.parse_response</code></li><li><strong>Core callees</strong>: <code>TerminusXMLPlainParser._check_extra_text</code>; <code>TerminusXMLPlainParser._extract_response_content</code>; <code>TerminusXMLPlainParser._check_task_complete</code>; <code>TerminusXMLPlainParser._extract_sections</code>; <code>TerminusXMLPlainParser._parse_xml_commands</code></li><li><strong>Config / state sources</strong>: input parameter <code>response</code>; local <code>warnings</code> accumulator populated by helper calls; section mapping returned by <code>_extract_sections</code>; command parse result returned by <code>_parse_xml_commands</code></li><li><strong>Results to</strong>: <code>TerminusXMLPlainParser.parse_response</code>; <a href="stage-4.4.html">stage-4.4</a> response-parse output contract; <code>_handle_llm_interaction</code> warning/error to feedback mapping described in the owning stage; later command-wrapping logic that consumes <code>ParseResult.commands</code></li><li><strong>Related siblings</strong>: <code>TerminusJSONPlainParser._try_parse_response</code> is the JSON-path counterpart with the same <code>ParseResult</code> target but different extraction and validation strategy.; <code>TerminusXMLPlainParser.parse_response</code> is the public XML entry point that wraps this lower-level attempt function.</li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_check_extra_text"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser._check_extra_text</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L196-L223" title="terminus_xml_plain_parser.py:196-223">terminus_xml_plain_parser.py:196–223 ↗</a></summary><div class="file-body"><p class="fn-sub">Warn on XML text outside response block</p>
+<blockquote><p><strong>Stage context</strong>: This helper belongs to the XML response parser path in <code>TerminusXMLPlainParser</code>. It runs as a structural check on the raw <code>response</code> string and contributes only warning text, complementing <code>_try_parse_response</code>, which handles the main XML extraction and error reporting.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_check_extra_text</code> inspects a raw XML-like <code>response</code> string for non-whitespace text outside the first <code>&lt;response&gt;</code> / <code>&lt;/response&gt;</code> block. It takes <code>response</code> and a mutable <code>warnings</code> list, returns <code>None</code>, and communicates solely by appending warning strings to <code>warnings</code>. It adds <code>"Extra text detected before &lt;response&gt; tag"</code> when stripped text exists before the first opening tag, <code>"Extra text detected after &lt;/response&gt; tag"</code> when stripped text exists after a found closing tag, and an additional <code>IMPORTANT:</code> warning only when that trailing extra text exists and <code>response.count("&lt;response&gt;") &gt; 1</code>.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, response: str, warnings: List[str]) -&gt; None</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — parser instance; this body does not read instance attributes; <code>response</code>: <code>str</code> — raw model output to scan for text before or after <code>&lt;response&gt;</code> tags; <code>warnings</code>: <code>List[str]</code> — mutable accumulator that receives any detected warning messages</li><li>returns: None; the real output is mutation of <code>warnings</code></li><li>effects: Appends <code>"Extra text detected before &lt;response&gt; tag"</code> if <code>response[:start_pos].strip()</code> is non-empty; Appends <code>"Extra text detected after &lt;/response&gt; tag"</code> if <code>end_pos != -1</code> and <code>response[end_pos + len("&lt;/response&gt;"):].strip()</code> is non-empty; Appends <code>"IMPORTANT: Only issue one &lt;response&gt; block at a time. You issued {total_response_count} and only the first was executed."</code> only when trailing extra text was detected and <code>response.count("&lt;response&gt;") &gt; 1</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>It computes both tag positions up front with <code>response.find("&lt;response&gt;")</code> and <code>response.find("&lt;/response&gt;")</code> into <code>start_pos</code> and <code>end_pos</code>.</li><li>If <code>start_pos == -1</code>, it returns immediately and emits no warnings from this helper.</li><li>It slices <code>response[:start_pos]</code>, strips whitespace into <code>before_text</code>, and appends <code>"Extra text detected before &lt;response&gt; tag"</code> when that text is non-empty.</li><li>It checks trailing text only when <code>end_pos != -1</code>: it slices from just after <code>&lt;/response&gt;</code>, strips into <code>after_text</code>, and appends <code>"Extra text detected after &lt;/response&gt; tag"</code> when that text is non-empty.</li><li>Inside that same trailing-text branch, it counts opening tags with <code>response.count("&lt;response&gt;")</code> and appends the <code>IMPORTANT:</code> warning only if the count is greater than 1.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _check_extra_text(self, response: str, warnings: List[str]) -&gt; None:
+        """Check for extra text before/after &lt;response&gt; tags."""
+        # Find response tag positions
+        start_pos = response.find("&lt;response&gt;")
+        end_pos = response.find("&lt;/response&gt;")
+
+        if start_pos == -1:
+            return  # Will be handled as error later
+
+        # Check text before &lt;response&gt;
+        before_text = response[:start_pos].strip()
+        if before_text:
+            warnings.append("Extra text detected before &lt;response&gt; tag")
+
+        # Check text after &lt;/response&gt; if closing tag exists
+        if end_pos != -1:
+            after_text = response[end_pos + len("&lt;/response&gt;") :].strip()
+            if after_text:
+                warnings.append("Extra text detected after &lt;/response&gt; tag")
+
+                # Count total &lt;response&gt; tags
+                total_response_count = response.count("&lt;response&gt;")
+                if total_response_count &gt; 1:
+                    warnings.append(
+                        f"IMPORTANT: Only issue one &lt;response&gt; block at a time. "
+                        f"You issued {total_response_count} and only the first "
+                        f"was executed."
+                    )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The function treats a missing opening tag as out of scope for warnings: the <code>if start_pos == -1: return</code> branch suppresses all extra-text checks in that case.</li><li>It warns about leading text independently of the closing tag, because the <code>before_text</code> check runs as soon as an opening tag exists, while the <code>after_text</code> check is separately gated by <code>if end_pos != -1</code>.</li><li>It ties duplicate-<code>&lt;response&gt;</code> reporting to actual trailing spillover, not merely to multiple openings anywhere in the string, because <code>response.count("&lt;response&gt;")</code> runs only inside the <code>if after_text:</code> branch.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>TerminusXMLPlainParser._try_parse_response</code></li><li><strong>Core callees</strong>: <code>str.find</code> on <code>response</code> for <code>&lt;response&gt;</code> and <code>&lt;/response&gt;</code>; <code>str.strip</code> on the before/after slices; <code>warnings.append</code>; <code>str.count</code> on <code>response</code> for <code>&lt;response&gt;</code></li><li><strong>Config / state sources</strong>: <code>response</code> argument; <code>warnings</code> argument</li><li><strong>Results to</strong>: the caller-provided <code>warnings</code> list; <code>TerminusXMLPlainParser._try_parse_response</code> warning accumulation; the XML parser path alongside <code>TerminusXMLPlainParser.parse_response</code>; sibling XML parse logic that also validates response structure</li><li><strong>Related siblings</strong>: <code>TerminusXMLPlainParser.parse_response</code>; <code>TerminusXMLPlainParser._try_parse_response</code></li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_extract_sections"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser._extract_sections</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L238-L318" title="terminus_xml_plain_parser.py:238-318">terminus_xml_plain_parser.py:238–318 ↗</a></summary><div class="file-body"><p class="fn-sub">Extract and validate XML response sections</p>
+<blockquote><p><strong>Stage context</strong>: This helper sits inside stage 4.4's XML response parsing path. <code>TerminusXMLPlainParser._try_parse_response</code> calls it after it has identified the XML-like response body and before later logic interprets section contents such as command XML and completion flags. It complements sibling helpers that check extra wrapper text and parse commands by turning raw section markup into a normalized <code>dict</code> plus warning messages.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_extract_sections</code> scans <code>content</code> for <code>&lt;analysis&gt;</code>, <code>&lt;plan&gt;</code>, <code>&lt;commands&gt;</code>, and <code>&lt;task_complete&gt;</code> blocks and returns a dictionary of the sections it found, with each value stripped to plain inner text. It accepts three encodings for each section: a normal open/close pair, a self-closing tag, or an explicitly empty pair, and the normal pair search uses <code>re.DOTALL</code> so section bodies may span multiple lines. It appends diagnostics to <code>warnings</code> for missing required sections except <code>task_complete</code>, unknown direct-child tags reported by <code>_find_top_level_tags</code>, duplicate expected tags counted over <code>self.required_sections + ["task_complete"]</code>, and any ordering issues delegated to <code>_check_section_order</code>.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, content: str, warnings: List[str]) -&gt; dict</code></p>
+<ul><li>params: <code>content</code>: <code>str</code> — Raw XML-like response text to scan for section tags; <code>warnings</code>: <code>List[str]</code> — Caller-owned list that collects non-fatal validation messages</li><li>reads: <code>self.required_sections</code>, <code>self._find_top_level_tags</code>, <code>self._check_section_order</code></li><li>returns: A <code>dict</code> mapping found section names to stripped inner text, with empty strings for self-closing or explicitly empty tags</li><li>effects: Appends missing-section warnings to <code>warnings</code> for required sections other than <code>task_complete</code>; Appends unknown top-level tag warnings to <code>warnings</code> based on <code>self._find_top_level_tags(content)</code>; Appends duplicate-section warnings to <code>warnings</code> when counts over <code>self.required_sections + ["task_complete"]</code> exceed one; Passes <code>content</code> and <code>warnings</code> to <code>self._check_section_order</code>, which may append ordering warnings</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Initialize <code>sections</code> and <code>found_sections</code>, then define <code>section_patterns</code> for the four supported section names: each name gets a full open/close regex, a self-closing regex, and an explicit empty-pair regex.</li><li>For each entry in <code>section_patterns</code>, try the full open/close pattern first with <code>re.search(full_pattern, content, re.DOTALL)</code>; on a match, store <code>match.group(1).strip()</code> under that section name and mark it in <code>found_sections</code>.</li><li>If the full pattern did not match, look for the self-closing form and then the explicit empty form; either case records that section with <code>""</code> as its value and adds the name to <code>found_sections</code>.</li><li>Compute <code>missing</code> as <code>set(self.required_sections) - found_sections</code> and append <code>Missing &lt;...&gt; section</code> for each missing required section except <code>task_complete</code>, which this branch treats as optional.</li><li>Call <code>self._find_top_level_tags(content)</code> to get direct-child tag names, compare them against <code>set(self.required_sections + ["task_complete"])</code>, and append an <code>Unknown tag found</code> warning for each unexpected top-level tag.</li><li>Count duplicates by iterating over <code>self.required_sections + ["task_complete"]</code> and running <code>re.findall(f"&lt;{section_name}(?:\\s|&gt;|/&gt;)", content)</code>; append a special <code>IMPORTANT:</code> warning for duplicate <code>commands</code> tags and a generic multiple-section warning for other names.</li><li>Delegate final ordering checks to <code>self._check_section_order(content, warnings)</code>, then return the assembled <code>sections</code> dictionary.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _extract_sections(self, content: str, warnings: List[str]) -&gt; dict:
+        """Extract analysis, plan, commands, and task_complete sections."""
+        sections = {}
+        found_sections = set()
+
+        # Define patterns for each section
+        section_patterns = {
+            "analysis": (
+                r"&lt;analysis&gt;(.*?)&lt;/analysis&gt;",
+                r"&lt;analysis\s*/&gt;",
+                r"&lt;analysis&gt;&lt;/analysis&gt;",
+            ),
+            "plan": (r"&lt;plan&gt;(.*?)&lt;/plan&gt;", r"&lt;plan\s*/&gt;", r"&lt;plan&gt;&lt;/plan&gt;"),
+            "commands": (
+                r"&lt;commands&gt;(.*?)&lt;/commands&gt;",
+                r"&lt;commands\s*/&gt;",
+                r"&lt;commands&gt;&lt;/commands&gt;",
+            ),
+            "task_complete": (
+                r"&lt;task_complete&gt;(.*?)&lt;/task_complete&gt;",
+                r"&lt;task_complete\s*/&gt;",
+                r"&lt;task_complete&gt;&lt;/task_complete&gt;",
+            ),
+        }
+
+        for section_name, patterns in section_patterns.items():
+            full_pattern, self_closing_pattern, empty_pattern = patterns
+
+            # Try full pattern first
+            match = re.search(full_pattern, content, re.DOTALL)
+            if match:
+                sections[section_name] = match.group(1).strip()
+                found_sections.add(section_name)
+                continue
+
+            # Try self-closing pattern
+            if re.search(self_closing_pattern, content):
+                sections[section_name] = ""  # Self-closing = empty content
+                found_sections.add(section_name)
+                continue
+
+            # Try empty pattern
+            if re.search(empty_pattern, content):
+                sections[section_name] = ""  # Empty = empty content
+                found_sections.add(section_name)
+                continue
+
+        # Check for missing required sections
+        required = set(self.required_sections)
+        missing = required - found_sections
+        for section in missing:
+            if section != "task_complete":  # task_complete is optional
+                warnings.append(f"Missing &lt;{section}&gt; section")
+
+        # Check for unexpected tags at the direct child level of &lt;response&gt; only
+        # Find all top-level tags (not nested inside other tags)
+        top_level_tags = self._find_top_level_tags(content)
+        expected_tags = set(self.required_sections + ["task_complete"])
+        unexpected = set(top_level_tags) - expected_tags
+        for tag in unexpected:
+            warnings.append(
+                f"Unknown tag found: &lt;{tag}&gt;, expected "
+                f"analysis/plan/commands/task_complete"
+            )
+
+        # Check for multiple instances of same tag
+        for section_name in self.required_sections + ["task_complete"]:
+            tag_count = len(re.findall(f"&lt;{section_name}(?:\\s|&gt;|/&gt;)", content))
+            if tag_count &gt; 1:
+                if section_name == "commands":
+                    warnings.append(
+                        f"IMPORTANT: Only issue one &lt;commands&gt; block at a time. "
+                        f"You issued {tag_count} and only the first was executed."
+                    )
+                else:
+                    warnings.append(f"Multiple &lt;{section_name}&gt; sections found")
+
+        # Check for correct order of sections (analysis, plan, commands)
+        self._check_section_order(content, warnings)
+
+        return sections</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It recognizes three tag forms per section—full, self-closing, and explicit empty—so callers receive a section key with <code>""</code> instead of treating empty content as missing. Without the extra self-closing and empty-pattern branches, the function would collapse 'present but empty' into 'not found'.</li><li>It searches the full open/close form before empty forms and only stores one value per section name. That choice makes the first full match the extracted payload while leaving duplicate detection to a later counting pass, instead of trying to merge or reconcile repeated sections.</li><li>It exempts <code>task_complete</code> in the missing-section loop even though <code>task_complete</code> still appears in extraction and duplicate checks. The code separates 'may appear and should be parsed if present' from 'must exist to avoid a warning'.</li><li>It limits unknown-tag warnings to names returned by <code>_find_top_level_tags(content)</code> rather than scanning every nested tag. That keeps the warning scope tied to direct children of <code>&lt;response&gt;</code> and avoids flagging nested command markup as an unknown response section.</li><li>It iterates duplicate checks over <code>self.required_sections + ["task_complete"]</code>, not over the hard-coded <code>section_patterns</code> keys alone. That keeps the duplicate-warning scope aligned with configured expected sections while still always checking <code>task_complete</code>.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>TerminusXMLPlainParser._try_parse_response</code></li><li><strong>Core callees</strong>: <code>re.search</code>; <code>re.findall</code>; <code>self._find_top_level_tags</code>; <code>self._check_section_order</code></li><li><strong>Config / state sources</strong>: <code>self.required_sections</code></li><li><strong>Results to</strong>: Returned <code>sections</code> dict feeds later section interpretation in <code>TerminusXMLPlainParser._try_parse_response</code>; Mutated <code>warnings</code> list contributes non-fatal parser diagnostics returned from <code>TerminusXMLPlainParser._try_parse_response</code>; Extracted <code>commands</code> section text is later consumed by XML command parsing in the caller; Extracted <code>task_complete</code> text is later consumed by completion detection in the caller</li><li><strong>Related siblings</strong>: <code>TerminusXMLPlainParser.parse_response</code>; <code>TerminusXMLPlainParser._try_parse_response</code>; <code>TerminusXMLPlainParser._check_extra_text</code></li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_check_section_order"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser._check_section_order</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L442-L480" title="terminus_xml_plain_parser.py:442-480">terminus_xml_plain_parser.py:442–480 ↗</a></summary><div class="file-body"><p class="fn-sub">XML section order warning checker</p>
+<blockquote><p><strong>Stage context</strong>: This helper is a local validator for XML-like section ordering. It inspects a raw <code>content</code> string for the opening tags of <code>analysis</code>, <code>plan</code>, and <code>commands</code>, and reports only a warning through the caller-provided <code>warnings</code> list when the found order disagrees with the fixed expected sequence.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_check_section_order</code> scans <code>content</code> for the first opening-tag occurrence of <code>analysis</code>, <code>plan</code>, and <code>commands</code>. For each section, it records <code>match.start()</code> from <code>re.search(f"&lt;{section}(?:\\s|&gt;|/&gt;)", content)</code>, so it recognizes <code>&lt;section&gt;</code>, <code>&lt;section ...&gt;</code>, and <code>&lt;section/&gt;</code> forms. It returns <code>None</code> and communicates only by possibly appending one warning to <code>warnings</code>, and it does that only when at least two target sections are present and their observed text order differs from the expected <code>analysis → plan → commands</code> order after filtering to the sections actually found.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, content: str, warnings: List[str]) -&gt; None</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — instance parameter; this body does not read instance state; <code>content</code>: <code>str</code> — input string scanned for the first opening-tag match of <code>analysis</code>, <code>plan</code>, and <code>commands</code>; <code>warnings</code>: <code>List[str]</code> — mutable output list that receives one human-readable order warning when two or more matched sections are out of order</li><li>returns: None; the real product is a possible <code>warnings.append(...)</code> side effect</li><li>effects: May append <code>"Sections appear in wrong order. Found: ... expected: ..."</code> to <code>warnings</code> only when at least two target sections were matched and <code>actual_order != expected_present</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Build <code>positions</code> by looping over <code>"analysis"</code>, <code>"plan"</code>, and <code>"commands"</code>, running <code>re.search(f"&lt;{section}(?:\\s|&gt;|/&gt;)", content)</code> for each, and storing <code>positions[section] = match.start()</code> only for sections whose first opening-tag match exists.</li><li>Stop early with <code>return</code> when <code>len(positions) &lt; 2</code>, because there are not enough matched sections to compare order.</li><li>Define the fixed <code>expected_order = ["analysis", "plan", "commands"]</code>, then build <code>present_sections</code> by iterating that expected order and collecting <code>(section, positions[section])</code> pairs only for sections present in <code>positions</code>.</li><li>Sort <code>present_sections</code> by the recorded start offset to produce <code>actual_order</code>, and separately build <code>expected_present</code> by filtering <code>expected_order</code> down to the sections found in <code>positions</code>.</li><li>Compare <code>actual_order</code> against <code>expected_present</code>; if they differ, format both sequences with <code>" → ".join(...)</code> and append one warning string to <code>warnings</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _check_section_order(self, content: str, warnings: List[str]) -&gt; None:
+        """Check if sections appear in the correct order: analysis, plan, commands."""
+        # Find positions of each section
+        positions = {}
+        for section in ["analysis", "plan", "commands"]:
+            # Look for opening tags
+            match = re.search(f"&lt;{section}(?:\\s|&gt;|/&gt;)", content)
+            if match:
+                positions[section] = match.start()
+
+        # Check if we have at least 2 sections to compare order
+        if len(positions) &lt; 2:
+            return
+
+        # Expected order
+        expected_order = ["analysis", "plan", "commands"]
+
+        # Get sections that are present, in the order they appear
+        present_sections = []
+        for section in expected_order:
+            if section in positions:
+                present_sections.append((section, positions[section]))
+
+        # Sort by position to get actual order
+        actual_order = [
+            section for section, pos in sorted(present_sections, key=lambda x: x[1])
+        ]
+
+        # Get expected order for present sections only
+        expected_present = [s for s in expected_order if s in positions]
+
+        # Compare orders
+        if actual_order != expected_present:
+            actual_str = " → ".join(actual_order)
+            expected_str = " → ".join(expected_present)
+            warnings.append(
+                f"Sections appear in wrong order. Found: {actual_str}, "
+                f"expected: {expected_str}"
+            )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It uses a regex on opening tags instead of parsing XML structure. The pattern <code>(?:\s|&gt;|/&gt;)</code> deliberately accepts three syntactic forms—plain open tags, open tags with attributes or whitespace, and self-closing tags—while keeping the check lightweight.</li><li>It records only <code>match.start()</code> from <code>re.search</code>, so each section's position comes from the first matching opening tag in <code>content</code>. That choice makes the check a first-occurrence ordering test and ignores later duplicate tags.</li><li>It returns immediately when fewer than two sections matched. This avoids emitting a misleading order warning when the code cannot form a meaningful comparison.</li><li>It filters the expected order down to <code>expected_present</code> before comparing. That means missing sections do not count as an ordering error; only the relative order of sections that were actually found matters.</li><li>It builds <code>present_sections</code> by iterating <code>expected_order</code> before sorting by position, rather than iterating <code>positions.items()</code>. That keeps the comparison anchored to the fixed canonical section list and avoids depending on dictionary insertion order.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: external caller not proven from this function's source</li><li><strong>Core callees</strong>: <code>re.search</code>; <code>sorted</code>; <code>warnings.append</code>; <code>str.join</code></li><li><strong>Config / state sources</strong>: hard-coded <code>expected_order = ["analysis", "plan", "commands"]</code> inside this function; hard-coded regex template <code>f"&lt;{section}(?:\\s|&gt;|/&gt;)"</code> inside this function</li><li><strong>Results to</strong>: the caller-provided <code>warnings</code> list; local <code>positions</code> mapping; local <code>present_sections</code> list; local <code>actual_order</code> and <code>expected_present</code> comparisons</li><li><strong>Related siblings</strong>: <code>TerminusXMLPlainParser._extract_sections</code> is a related helper mentioned in sibling context, but that call relationship is not proven by this function's source</li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_check_task_complete"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser._check_task_complete</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L514-L526" title="terminus_xml_plain_parser.py:514-526">terminus_xml_plain_parser.py:514–526 ↗</a></summary><div class="file-body"><p class="fn-sub">XML task completion flag detector</p>
+<blockquote><p><strong>Stage context</strong>: This helper contributes one small part of stage 4.4 response parsing: it turns the XML <code>&lt;task_complete&gt;</code> section into the boolean completion flag that ends up in the stage parse result. <code>TerminusXMLPlainParser._try_parse_response</code> invokes it while assembling <code>ParseResult(...)</code> from an LLM reply. It complements sibling helpers that extract sections and warnings, but unlike <code>_extract_sections</code> or <code>_check_section_order</code>, it produces only a boolean and no diagnostics.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_check_task_complete</code> inspects the <code>response_content</code> string for a <code>&lt;task_complete&gt;true&lt;/task_complete&gt;</code> tag pair. It returns <code>True</code> only when that tag contains <code>true</code>, ignoring case and surrounding whitespace. For every other form of the section, including missing tags or non-<code>true</code> content, it returns <code>False</code>. It does not read or write any <code>self</code> state.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, response_content: str) -&gt; bool</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — parser instance; unused in this body; <code>response_content</code>: <code>str</code> — raw XML-like response text to inspect for task completion</li><li>returns: A boolean completion flag: <code>True</code> only for a matching <code>&lt;task_complete&gt;true&lt;/task_complete&gt;</code> marker, otherwise <code>False</code>.</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Search <code>response_content</code> with <code>re.search(...)</code> for the exact tag pattern <code>r"&lt;task_complete&gt;\s*true\s*&lt;/task_complete&gt;"</code>, using <code>re.IGNORECASE</code> so <code>true</code> may vary in case and may be surrounded by whitespace.</li><li>If that search returns <code>true_match</code>, return <code>True</code> immediately.</li><li>If no such match exists, fall through to the default <code>False</code> return for all other cases.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _check_task_complete(self, response_content: str) -&gt; bool:
+        """Check if the response indicates the task is complete."""
+        # Check for &lt;task_complete&gt;true&lt;/task_complete&gt;
+        true_match = re.search(
+            r"&lt;task_complete&gt;\s*true\s*&lt;/task_complete&gt;",
+            response_content,
+            re.IGNORECASE,
+        )
+        if true_match:
+            return True
+
+        # All other cases (false, empty, self-closing, missing) = not complete
+        return False</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The function accepts only the explicit positive form <code>&lt;task_complete&gt;true&lt;/task_complete&gt;</code>. That keeps completion detection conservative: malformed, empty, self-closing, <code>false</code>, or absent tags all map to the same non-complete result instead of trying to classify several negative or invalid variants.</li><li>It uses a direct regex on <code>response_content</code> instead of reusing section extraction state. That keeps this check independent and cheap inside <code>_try_parse_response</code>, at the cost of not distinguishing parse errors from an ordinary <code>False</code> completion flag.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>TerminusXMLPlainParser._try_parse_response</code> while building <code>ParseResult.is_task_complete</code>; <code>TerminusXMLPlainParser.parse_response</code> indirectly through <code>_try_parse_response</code></li><li><strong>Core callees</strong>: <code>re.search</code></li><li><strong>Config / state sources</strong>: <code>response_content</code> argument; hard-coded regex <code>r"&lt;task_complete&gt;\s*true\s*&lt;/task_complete&gt;"</code>; hard-coded flag <code>re.IGNORECASE</code></li><li><strong>Results to</strong>: <code>ParseResult.is_task_complete</code> produced by <code>TerminusXMLPlainParser._try_parse_response</code>; <a href="stage-4.4.html">stage-4.4</a> parse output consumed by later completion-handling stages</li><li><strong>Related siblings</strong>: <code>TerminusXMLPlainParser._try_parse_response</code>; <code>TerminusXMLPlainParser._extract_sections</code>; <code>TerminusXMLPlainParser._check_extra_text</code>; <code>TerminusXMLPlainParser._check_section_order</code></li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_parse_xml_commands"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser._parse_xml_commands</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L320-L391" title="terminus_xml_plain_parser.py:320-391">terminus_xml_plain_parser.py:320–391 ↗</a></summary><div class="file-body"><p class="fn-sub">Parse XML keystroke command blocks</p>
+<blockquote><p><strong>Stage context</strong>: This helper handles the <code>&lt;commands&gt;</code> payload inside the XML parser's response path. <code>TerminusXMLPlainParser._try_parse_response</code> calls it after <code>_extract_sections</code> has isolated the <code>commands</code> section, and its output becomes the <code>commands</code> field of the stage's <code>ParseResult</code>. Unlike <code>_extract_sections</code>, which finds high-level sections, this function focuses only on repeated <code>&lt;keystrokes ...&gt;...&lt;/keystrokes&gt;</code> command entries and adds command-specific warnings.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_parse_xml_commands</code> scans <code>xml_content</code> for <code>&lt;keystrokes&gt;</code> elements, converts each match into a <code>ParsedCommand</code>, and returns <code>(commands, "")</code>. It reads each tag's <code>duration</code> attribute, falls back to <code>1.0</code> when the attribute is missing or not numeric, and appends human-readable warnings into the caller-supplied <code>warnings</code> list. It also warns about missing trailing newlines between adjacent commands, literal XML entities found in <code>xml_content</code>, and literal <code>"\\r\\n"</code> sequences.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, xml_content: str, warnings: List[str]) -&gt; tuple[List[ParsedCommand], str]</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — XML parser instance used only to call <code>_check_attribute_issues</code>; <code>xml_content</code>: <code>str</code> — raw XML-like command section content to scan for <code>&lt;keystrokes&gt;</code> blocks; <code>warnings</code>: <code>List[str]</code> — mutable warning sink that collects non-fatal parse diagnostics</li><li>returns: A tuple <code>(commands, "")</code>, where <code>commands</code> is a list of <code>ParsedCommand(keystrokes, duration)</code> built from matched <code>&lt;keystrokes&gt;</code> elements and the error string is always empty.</li><li>effects: Appends warning strings to the provided <code>warnings</code> list; Calls <code>self._check_attribute_issues(attributes_str, i + 1, warnings)</code> for each matched command tag</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Compile <code>keystrokes_pattern = re.compile(r"&lt;keystrokes([^&gt;]*)&gt;(.*?)&lt;/keystrokes&gt;", re.DOTALL)</code> and use <code>findall(xml_content)</code> to collect every matched command body plus its raw attribute text.</li><li>For each <code>(attributes_str, keystrokes_content)</code> match, call <code>self._check_attribute_issues(attributes_str, i + 1, warnings)</code> before parsing any known attributes.</li><li>Initialize <code>duration = 1.0</code>, then search <code>attributes_str</code> for <code>duration\s*=\s*["\']([^"\']*)["\']</code>; if present, convert the captured value with <code>float(...)</code>, and if that conversion raises <code>ValueError</code>, keep <code>1.0</code> and append an invalid-duration warning.</li><li>If the <code>duration</code> attribute is absent, append a missing-duration warning and keep the default <code>1.0</code>.</li><li>For every command except the last one, check <code>keystrokes_content.endswith("\n")</code>; when it does not, append a warning that the next command will concatenate onto the same line.</li><li>Append <code>ParsedCommand(keystrokes=keystrokes_content, duration=duration)</code> to <code>commands</code> for each match.</li><li>After command extraction, scan the full <code>xml_content</code> for each literal entity key in <code>entities = {"&amp;lt;": "&lt;", "&amp;gt;": "&gt;", "&amp;amp;": "&amp;", "&amp;quot;": '"', "&amp;apos;": "'"}</code> and append a warning for every entity found.</li><li>Check whether the literal substring <code>"\\r\\n"</code> appears in <code>xml_content</code>; if it does, append a line-ending warning, then return <code>commands, ""</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _parse_xml_commands(
+        self, xml_content: str, warnings: List[str]
+    ) -&gt; tuple[List[ParsedCommand], str]:
+        """Parse XML content and extract command objects manually."""
+
+        # Find all keystrokes elements manually for better error reporting
+        commands = []
+        keystrokes_pattern = re.compile(
+            r"&lt;keystrokes([^&gt;]*)&gt;(.*?)&lt;/keystrokes&gt;", re.DOTALL
+        )
+
+        matches = keystrokes_pattern.findall(xml_content)
+        for i, (attributes_str, keystrokes_content) in enumerate(matches):
+            # Check for attribute issues
+            self._check_attribute_issues(attributes_str, i + 1, warnings)
+
+            # Parse attributes
+            duration = 1.0
+
+            # Parse duration attribute
+            duration_match = re.search(
+                r'duration\s*=\s*["\']([^"\']*)["\']', attributes_str
+            )
+            if duration_match:
+                try:
+                    duration = float(duration_match.group(1))
+                except ValueError:
+                    warnings.append(
+                        f"Command {i + 1}: Invalid duration value "
+                        f"'{duration_match.group(1)}', using default 1.0"
+                    )
+            else:
+                warnings.append(
+                    f"Command {i + 1}: Missing duration attribute, using default 1.0"
+                )
+
+            # Check for newline at end of keystrokes
+            if i &lt; len(matches) - 1 and not keystrokes_content.endswith("\n"):
+                warnings.append(
+                    f"Command {i + 1} should end with newline when followed "
+                    f"by another command. Otherwise the two commands will be "
+                    f"concatenated together on the same line."
+                )
+
+            commands.append(
+                ParsedCommand(keystrokes=keystrokes_content, duration=duration)
+            )
+
+        # Check for XML entities and warn
+        entities = {
+            "&amp;lt;": "&lt;",
+            "&amp;gt;": "&gt;",
+            "&amp;amp;": "&amp;",
+            "&amp;quot;": '"',
+            "&amp;apos;": "'",
+        }
+        for entity, char in entities.items():
+            if entity in xml_content:
+                warnings.append(
+                    f"Warning: {entity} is read verbatim and not converted to {char}. "
+                    f"NEVER USE {entity}, unless you want these exact characters to "
+                    f"appear directly in the output."
+                )
+
+        # Check for \r\n line endings and warn
+        if "\\r\\n" in xml_content:
+            warnings.append(
+                "Warning: \\r\\n line endings are not necessary - use \\n "
+                "instead for simpler output"
+            )
+
+        return commands, ""</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It uses a targeted regex over <code>&lt;keystrokes&gt;</code> tags instead of a full XML parser so it can keep parsing simple command blocks while issuing command-numbered diagnostics tied to <code>attributes_str</code>, <code>keystrokes_content</code>, and adjacency checks. A stricter XML parser would validate structure differently, but it would make these focused warnings harder to phrase in terms of the original command text.</li><li>It treats missing or bad <code>duration</code> as a warning, not a hard error, by initializing <code>duration = 1.0</code> and preserving that value through the <code>except ValueError</code> branch. That choice keeps usable commands flowing downstream even when metadata is malformed.</li><li>It checks newline termination only when <code>i &lt; len(matches) - 1</code>, so the warning targets the specific case that changes terminal behavior: one command's text running directly into the next command. It does not require a trailing newline on the last command because there is no following command to concatenate with.</li><li>It warns that entity strings like <code>&amp;lt;</code> and <code>&amp;amp;</code> are read literally instead of decoding them. This matches the function's plain-text extraction model: <code>keystrokes_content</code> goes straight into <code>ParsedCommand</code> without any entity unescaping, so warning early is safer than silently changing user-visible output.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>TerminusXMLPlainParser._try_parse_response</code></li><li><strong>Core callees</strong>: <code>self._check_attribute_issues</code>; <code>re.compile</code>; <code>re.search</code>; <code>ParsedCommand</code></li><li><strong>Config / state sources</strong>: No <code>self._...</code> configuration or register-backed state is read; Behavior is driven entirely by <code>xml_content</code>, <code>warnings</code>, and hard-coded patterns such as <code>keystrokes_pattern</code> and <code>entities</code></li><li><strong>Results to</strong>: Returns <code>commands</code> to <code>TerminusXMLPlainParser._try_parse_response</code> for inclusion in <code>ParseResult.commands</code>; Appended <code>warnings</code> continue upward through <code>TerminusXMLPlainParser._try_parse_response</code> into <code>ParseResult.warning</code>; Successful <code>ParsedCommand.duration</code> values later feed <a href="stage-4.4.html">stage-4.4</a> command wrapping into <code>Command(..., duration_sec=min(duration, 60))</code></li><li><strong>Related siblings</strong>: <code>TerminusXMLPlainParser._try_parse_response</code> delegates command-section parsing here after <code>_extract_sections</code>; <code>TerminusXMLPlainParser._extract_sections</code> finds the <code>&lt;commands&gt;</code> block that becomes this function's <code>xml_content</code> input; <code>TerminusJSONPlainParser._parse_commands</code> is the JSON-side analogue: both build parsed command lists and report non-fatal issues through warnings</li></ul></div></details><details class="file" id="fn-terminusxmlplainparser_check_attribute_issues"><summary><span class="chev"></span><code class="fpath">TerminusXMLPlainParser._check_attribute_issues</code><a class="fn-range" href="../code/terminus_xml_plain_parser.py.html#L482-L512" title="terminus_xml_plain_parser.py:482-512">terminus_xml_plain_parser.py:482–512 ↗</a></summary><div class="file-body"><p class="fn-sub">XML attribute warning checker</p>
+<blockquote><p><strong>Stage context</strong>: This helper validates an XML attribute substring by adding human-readable warnings to a caller-supplied list. In the Response Parse stage, it serves as a narrow diagnostic step alongside other XML parser helpers such as <code>_check_extra_text</code> and <code>_extract_sections</code>, but this function itself only inspects <code>attributes_str</code> and does not parse whole responses.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_check_attribute_issues</code> inspects <code>attributes_str</code> for three advisory problems: unquoted attribute values, single-quoted values, and attribute names outside a hard-coded allowed set. It uses <code>command_num</code> only to label each warning message and appends all findings into the mutable <code>warnings</code> list. It returns <code>None</code> and does not read or write any instance state. The three checks run independently, so one attribute text can produce multiple warnings and the function does not deduplicate them.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, attributes_str: str, command_num: int, warnings: List[str]) -&gt; None</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — instance reference; unused by this body; <code>attributes_str</code>: <code>str</code> — raw attribute text to inspect; <code>command_num</code>: <code>int</code> — command identifier interpolated into warning text; <code>warnings</code>: <code>List[str]</code> — mutable sink for diagnostic messages</li><li>returns: None; the real output is any warning strings appended to <code>warnings</code></li><li>effects: appends warning strings to the caller-provided <code>warnings</code> list</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Compile <code>unquoted_pattern = re.compile(r'(\w+)\s*=\s*([^"\'\s&gt;]+)')</code>, find all matches in <code>attributes_str</code>, and append one warning per <code>(attr_name, attr_value)</code> saying the value should be written as <code>name="value"</code>.</li><li>Compile <code>single_quote_pattern = re.compile(r"(\w+)\s*=\s*'([^']*)'")</code>, find all matches in <code>attributes_str</code>, and append one warning per match telling the caller to use double quotes for that attribute.</li><li>Set <code>known_attributes = {"duration"}</code>, collect every attribute name matched by <code>re.findall(r"(\w+)\s*=", attributes_str)</code>, and append an unknown-attribute warning for each name not in that set.</li><li>Return <code>None</code> without short-circuiting or deduplicating, so warnings from earlier passes remain and later passes can add more messages for the same source text.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _check_attribute_issues(
+        self, attributes_str: str, command_num: int, warnings: List[str]
+    ) -&gt; None:
+        """Check for attribute-related issues."""
+        # Check for missing quotes
+        unquoted_pattern = re.compile(r'(\w+)\s*=\s*([^"\'\s&gt;]+)')
+        unquoted_matches = unquoted_pattern.findall(attributes_str)
+        for attr_name, attr_value in unquoted_matches:
+            warnings.append(
+                f"Command {command_num}: Attribute '{attr_name}' value should be "
+                f'quoted: {attr_name}="{attr_value}"'
+            )
+
+        # Check for single quotes (should use double quotes for consistency)
+        single_quote_pattern = re.compile(r"(\w+)\s*=\s*'([^']*)'")
+        single_quote_matches = single_quote_pattern.findall(attributes_str)
+        for attr_name, attr_value in single_quote_matches:
+            warnings.append(
+                f"Command {command_num}: Use double quotes for attribute "
+                f"'{attr_name}': {attr_name}=\"{attr_value}\""
+            )
+
+        # Check for unknown attribute names
+        known_attributes = {"duration"}
+        all_attributes = re.findall(r"(\w+)\s*=", attributes_str)
+        for attr_name in all_attributes:
+            if attr_name not in known_attributes:
+                warnings.append(
+                    f"Command {command_num}: Unknown attribute '{attr_name}' - "
+                    f"known attributes are: {', '.join(sorted(known_attributes))}"
+                )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The function reports problems through <code>warnings.append(...)</code> instead of raising or returning a status object. That keeps attribute issues advisory in this helper and lets the caller accumulate multiple diagnostics from one input string.</li><li>It hard-codes <code>known_attributes = {"duration"}</code> inside the function. That makes the accepted attribute set explicit at the point of validation, but any new supported XML attributes would require changing this function.</li><li>It uses regex heuristics (<code>unquoted_pattern</code>, <code>single_quote_pattern</code>, and <code>re.findall(r"(\w+)\s*=", ...)</code>) rather than a stricter XML attribute parser. The result is lightweight validation focused on specific formatting and naming issues, not full XML conformance.</li><li>The three passes are intentionally independent. Because the unknown-name scan runs over all <code>name=</code> occurrences and there is no deduplication, a single attribute can trigger both a quoting/style warning and an unknown-attribute warning.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: caller that extracts an XML attribute substring and wants advisory diagnostics; XML command parsing path in <code>TerminusXMLPlainParser</code></li><li><strong>Core callees</strong>: <code>re.compile</code>; <code>Pattern.findall</code>; <code>re.findall</code>; <code>warnings.append</code>; <code>sorted</code>; <code>str.join</code></li><li><strong>Config / state sources</strong>: <code>attributes_str</code> input text; <code>command_num</code> warning label input; <code>warnings</code> mutable output list; local <code>known_attributes</code> constant</li><li><strong>Results to</strong>: caller-owned <code>warnings</code> list; human-readable warning strings labeled with <code>command_num</code>; downstream parser diagnostics that consume the accumulated <code>warnings</code> list</li><li><strong>Related siblings</strong>: <code>TerminusXMLPlainParser._parse_xml_commands</code>; <code>TerminusXMLPlainParser._check_extra_text</code>; <code>TerminusXMLPlainParser._extract_sections</code></li></ul></div></details><nav class="pn"><a class="pn-prev" href="stage-4.3.html"><span>← Previous</span><strong>LLM Query</strong></a><a class="pn-next" href="stage-4.5.html"><span>Next →</span><strong>Pending Handoff Prompt → User Step (or Split)</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+This startup stage assembles the catalogs, toggles, and bundled assets the rest of the system assumes already exist before any session, plugin surface, or UI is created. It begins by resolving feature state: `features` defines typed flag schemas, maps legacy keys, merges layered config with overrides, and emits warnings and telemetry, while `managed_features` applies policy pins and dependency normalization. The TUI’s experimental-features view is the interactive editor for those flags.
+
+It also installs and loads built-in capabilities. Skills configuration schemas and extension config determine whether bundled skills participate; `skills` installs embedded system skills, `core-skills` can clean them up, compute enable/disable rules, discover `SKILL.md` trees from all roots, and build the filtered runtime skill index. Memory extensions seed default instruction files similarly.
+
+For external capability catalogs, marketplace config and CLI manage plugin sources; plugin provider and load-outcome types turn discovered plugins into merged capability roots. MCP declarations are parsed, conflict-resolved in the catalog, and combined into the final server set.
+
+Finally, this stage prepares static runtime catalogs: model-provider definitions, model metadata and collaboration presets, approval presets, and built-in pet assets and manifests, including downloading and validating cached spritesheets.

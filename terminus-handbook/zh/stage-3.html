@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-3 · 运行起点</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=zh"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 手册</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=zh" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>返回主页</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>状态流寄存器</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>配置固化</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>环境搭建</a></div><div class="s-leaf"><a class="s-link cur" href="stage-3.html"><span class="s-num">3</span>运行起点</a></div><details class="s-node"><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>迭代主循环</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>循环入口门控</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>主动摘要探测</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM 调用</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>响应解析</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>待交接提示 → 用户步骤(或切分)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>错误分支</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>命令执行 → 观察 → 轨迹步骤</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>完成门控与循环控制</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>解析器内部辅助</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>运行收尾</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>录制后处理(外部)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>上下文摘要</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token 与成本核算</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>输出长度限制</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>日志</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux 内部辅助</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">索引</a></nav><div class="stage-head"><h1>运行起点</h1><div class="meta"><span class="chip mono">stage-3</span><span class="chip">Run Onset</span><span class="chip">3 个函数</span></div></div><p>Run Onset 这个 Stage 的存在，是为了把“已经准备好的环境”真正变成“一次新的、可追踪的运行”。前一阶段只把外部条件搭好；这里要解决的是：别让上一次运行的残留污染这一次，并且把当前终端、工具说明、技能说明整理成 LLM（大语言模型）第一轮就能用的起点。它处在进入主循环前的最后一道门。</p>
+<ol><li>先把“这次运行”从“上次运行”里切出来。 <p><code>Terminus2._reset_per_run_state()</code>（清掉本次 run 专属缓存）做的不是杂务，而是隔离。Agent 实例会被重复用，所以轨迹、计数、待完成引用、subagent（被主 Agent 调用的小 Agent）统计这些东西都要先清。否则这一轮会带着上一轮的脚印出发，后面的判断、记录、收尾都会乱。</p></li><li>再准备一个新的 Chat。 <p>这里的 Chat（LLM 调用包装器）代表“这次 run 的对话入口”。为什么要新建？因为这一轮要有独立的推理上下文和消息流，而不是继续接着上一轮说。这样主循环里的每次模型调用，都会明确属于当前 session。</p></li><li>读一眼终端当前长什么样。 <p><code>session.get_incremental_output()</code> 会抓当前终端屏幕。终端对 Agent 来说就是现场；如果第一轮看不到现场，模型只能盲答。这个 Stage 先把现场快照拿到，等于开工前先抬头看屏幕。</p></li><li>把“任务说明”补成“可行动的说明”。 <p>这里会把原始 instruction 再拼上两类材料：</p>
+<ul><li>MCP servers（外部工具/服务接入点）的说明：告诉模型现在有哪些可用能力。 </li><li><code>_build_skills_section()</code>（动态生成技能说明）：把系统支持的操作方式整理给模型看。 这一步的意义是防止 LLM 只知道目标，不知道手里有什么工具、该怎么用。</li></ul></li><li>生成第一条真正的提示词，并记进轨迹。 <p>模板会把 instruction 和 terminal state 拼成初始 prompt。然后这条 prompt 会被写成 trajectory（运行轨迹）的第一步，来源记为 <code>user</code>。为什么要这么做？因为后面所有分析、调试、落盘都需要一个统一的“本次 run 是怎么开始的”记录，不能只存在内存里。</p></li><li>然后才进入主循环。 <p>也就是说，主循环不是从“空白”开始，而是从一个已经清干净、看过现场、带着工具说明、并且第一步已入账的状态开始。外层再用 <code>try</code>/<code>finally</code> 包住，是为了保证后面即使中途出错，收尾逻辑也还能跑。</p></li></ol>
+<ul><li>清: <a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — run 一开始由 <code>_reset_per_run_state()</code> 清空，防止上一轮的轨迹混进这一轮</li><li>写: <a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — 初始 prompt 生成后立刻写入，作为这次 trial（试跑）的第 1 条正式记录</li><li>读: <a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — 本 Stage 不依赖旧值做决策，而是把它当作本轮的“空白账本”重新开张</li><li>触发下游: <code>stage-4 Iteration Loop ★ Core ★</code> — 初始 prompt 入轨迹后，进入真正的按轮迭代</li></ul>
+<p>上一阶段给的是“已经可用的环境”和 session（终端会话）。这个 Stage 产出的是“本轮干净状态 + 初始现场 + 首条 prompt + 首条轨迹记录”。下一阶段据此开始循环：读轨迹、调 LLM、发动作、再把结果继续追加进去。</p><div class="files-bar"><h2 class="sec">函数细节<span class="pill">3</span></h2><span class="spacer"></span><button class="tool" data-x="expand">全部展开</button><button class="tool" data-x="collapse">全部折叠</button></div><details class="file" id="fn-terminus2_reset_per_run_state"><summary><span class="chev"></span><code class="fpath">Terminus2._reset_per_run_state</code><a class="fn-range" href="../code/terminus_2.py.html#L1563-L1578" title="terminus_2.py:1563-1578">terminus_2.py:1563–1578 ↗</a></summary><div class="file-body"><p class="fn-sub">每次 run 开始前的运行态清零器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 <a href="stage-3.html">stage-3</a>「Run Onset」，负责在 <code>Terminus2.run()</code> 进入主循环前，把仅应属于本次执行的累积状态全部恢复到初始值。触发条件是一次新的 <code>run()</code> 开始。作为本 stage 的起点，它先完成状态隔离，随后兄弟流程才会新建 <code>Chat</code>、抓取终端初始画面并写入首条用户轨迹。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数不接收除 <code>self</code> 外的参数，核心作用是重置所有按单次 <code>run()</code> 计的内部字段，包括轨迹、请求耗时、轮次计数、摘要计数、子代理统计、待处理 completion / handoff 状态以及 marker 容器。它唯一读取的既有状态是 <code>self._user_provided_session_id</code>，用来决定本次运行沿用外部给定 session id，还是生成新的 UUID。函数返回 <code>None</code>，真正产出是对多个 <code>self._...</code> 字段的覆盖写入，这些字段随后被 <a href="stage-4.html">stage-4</a> 到 <a href="stage-6.html">stage-6</a> 持续消费。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self) -&gt; None</code></p>
+<ul><li>参数: <code>self</code>: <code>Terminus2</code> — 当前代理实例；其跨次运行复用的内部状态在此被重置</li><li>读状态: <code>self._user_provided_session_id</code></li><li>返回: 返回 None；实际结果是将本次 <code>run()</code> 的各项累积寄存状态重置到干净起点，并确定 <code>self._session_id</code>。</li><li>副作用: 写入 self._trajectory_steps; 写入 self._api_request_times; 写入 self._n_episodes; 写入 self._summarization_count; 写入 self._subagent_metrics; 写入 self._subagent_rollout_details; 写入 self._pending_completion; 写入 self._pending_subagent_refs; 写入 self._pending_handoff_prompt; 写入 self._timestamped_markers; 写入 self._session_id</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先将面向本次运行的线性累积容器清空：<code>self._trajectory_steps = []</code>、<code>self._api_request_times = []</code>、<code>self._subagent_rollout_details = []</code>、<code>self._timestamped_markers = []</code>，为后续轨迹记录、API 耗时统计、子代理 rollout 明细和 asciinema marker 采集提供空起点。</li><li>再把计数类状态归零：<code>self._n_episodes = 0</code> 与 <code>self._summarization_count = 0</code>，使后续迭代计数和摘要调用计数从本轮重新累计。</li><li>随后重建子代理统计对象 <code>self._subagent_metrics = SubagentMetrics()</code>，而不是保留旧对象内容，确保子代理 token/cost 统计按本次 <code>run()</code> 独立核算。</li><li>接着清除跨迭代挂起状态：<code>self._pending_completion = False</code>、<code>self._pending_subagent_refs = None</code>、<code>self._pending_handoff_prompt = None</code>，消除上一次运行遗留的二阶段 completion 确认、摘要引用和 handoff prompt。</li><li>最后确定本次运行的会话标识：若 <code>self._user_provided_session_id</code> 为真值则直接沿用，否则通过 <code>str(uuid.uuid4())</code> 生成新的 <code>self._session_id</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _reset_per_run_state(self) -&gt; None:
+        """Reset all per-run state. The same Terminus2 instance is reused
+        across multiple `run()` invocations in multi-step trials, so any
+        accumulator that should be scoped to a single step must be reset here.
+        """
+        self._trajectory_steps = []
+        self._api_request_times = []
+        self._n_episodes = 0
+        self._summarization_count = 0
+        self._subagent_metrics = SubagentMetrics()
+        self._subagent_rollout_details = []
+        self._pending_completion = False
+        self._pending_subagent_refs = None
+        self._pending_handoff_prompt = None
+        self._timestamped_markers = []
+        self._session_id = self._user_provided_session_id or str(uuid.uuid4())</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>该函数集中重置“per-run state”，而不是在各使用点零散清理；这是源码注释明确说明的取舍：同一个 <code>Terminus2</code> 实例会跨多个 <code>run()</code> 复用，因此若不在入口统一清扫，上一轮 trial step 的累积值会泄漏到下一轮。</li><li>对子代理统计采用 <code>SubagentMetrics()</code> 新建实例，而不是仅把若干字段手动置零；这避免旧对象内部残留不可见状态，也把“本轮统计起点”表达得更明确。</li><li>挂起态使用显式布尔/<code>None</code> 复位：<code>_pending_completion</code> 设为 <code>False</code>，而 <code>_pending_subagent_refs</code>、<code>_pending_handoff_prompt</code> 设为 <code>None</code>。这种区分保留了不同状态机的语义边界：前者是确认门闩，后两者是“当前无待消费载荷”。</li><li><code>_session_id</code> 的选择采用“优先外部提供，否则生成 UUID”的策略，说明代码既支持调用方强制绑定会话标识，也支持默认获得每次运行唯一的 session。若始终生成新值，将破坏外部显式指定；若始终复用旧值，则不同 run 无法可靠分隔。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2.run</li><li><strong>核心被调用</strong>: SubagentMetrics; uuid.uuid4; str</li><li><strong>配置/状态来源</strong>: self._user_provided_session_id</li><li><strong>结果去向</strong>: <a href="stage-3.html">stage-3</a> 后续的新建 Chat 流程读取本次干净起点; <a href="stage-4.1.html">stage-4.1</a> 递增并消费 <code>self._n_episodes</code>; <a href="stage-4.3.html">stage-4.3</a> / <code>_track_api_request_time</code> 继续向 <code>self._api_request_times</code> 追加; <a href="stage-4.5.html">stage-4.5</a> / 4.6 / 4.8 / 4.9 继续向 <code>self._trajectory_steps</code> 写入; <a href="side-S1.html">side-S1</a> / <code>_summarize</code> 继续更新 <code>self._summarization_count</code>、<code>self._pending_subagent_refs</code>、<code>self._pending_handoff_prompt</code>; <a href="stage-4.9.html">stage-4.9</a> 与 <a href="stage-5.html">stage-5</a> 使用这些重置后的累计字段做落盘与 metadata 汇总; <a href="stage-6.html">stage-6</a> 通过 <code>self._timestamped_markers</code> 输出 asciinema markers</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — 新 run 前清空轨迹记录</li><li><a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — 清空本轮 LLM 请求耗时</li><li><a class="reg" href="registers.html#reg-n-episodes"><code>reg-n-episodes</code></a> — 轮次计数归零后续再累加</li><li><a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — 摘要调用计数重新开始</li><li><a class="reg" href="registers.html#reg-subagent-metrics"><code>reg-subagent-metrics</code></a> — 子代理 token 成本统计重建</li><li><a class="reg" href="registers.html#reg-pending-completion"><code>reg-pending-completion</code></a> — 清除完成确认门闩</li><li><a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a> — 清除待写入子代理引用</li><li><a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — 清除待消费 handoff 提示</li><li><a class="reg" href="registers.html#reg-asciinema-markers"><code>reg-asciinema-markers</code></a> — 清空时间戳 marker 缓冲</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_run"><summary><span class="chev"></span><code class="fpath">Terminus2.run</code><a class="fn-range" href="../code/terminus_2.py.html#L1586-L1625" title="terminus_2.py:1586-1625">terminus_2.py:1586–1625 ↗</a></summary><div class="file-body"><p class="fn-sub">run 入口的初始提示装配段</p>
+<blockquote><p><strong>stage 上下文</strong>: 这段代码位于 <code>Terminus2.run</code> 的 pre-loop 开头，在进入主迭代前完成本次运行的局部初始化与首条提示构造。它紧接兄弟函数 <code>_reset_per_run_state</code> 之后执行：前者负责清空/轮换按次运行状态，这里则建立新的 <code>Chat</code>、抓取终端快照，并把格式化后的初始提示落为轨迹首步。触发前提是 <code>run()</code> 已拿到 <code>instruction</code>、<code>environment</code> 与 <code>context</code>，且 <code>self._session</code> 必须已设置。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>该片段先调用 <code>_reset_per_run_state()</code> 重置按次运行状态，再新建 <code>Chat(self._llm, interleaved_thinking=self._interleaved_thinking)</code> 并保存传入的 <code>context</code>。随后它要求 <code>self._session</code> 非空，读取当前终端增量输出并经 <code>_limit_output_length(...)</code> 截断；以原始 <code>instruction</code> 为起点，按需拼接 MCP server 描述和 <code>_build_skills_section(environment)</code> 生成的技能段，最后通过 <code>self._prompt_template.format(...)</code> 形成 <code>initial_prompt</code>。该提示被追加为一条新的 <code>Step</code>，其中显式写入 <code>step_id=1</code>、UTC ISO 时间戳、<code>source="user"</code> 和消息正文。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, instruction: str, environment: ToolEnvironment, context: RunContext) -&gt; ?</code></p>
+<ul><li>参数: <code>instruction</code>: <code>str</code> — 本次运行的原始用户指令，作为 <code>augmented_instruction</code> 的起始内容; <code>environment</code>: <code>ToolEnvironment</code> — 传给 <code>_build_skills_section(environment)</code>，用于构造可用技能说明; <code>context</code>: <code>RunContext</code> — 保存到 <code>self._context</code> 的运行上下文</li><li>读状态: <code>self._llm</code>, <code>self._interleaved_thinking</code>, <code>self._session</code>, <code>self.mcp_servers</code>, <code>self._prompt_template</code></li><li>返回: 此源码片段内未出现 <code>return</code> 语句；可见产出是对运行期状态的初始化、提示字符串的构造，以及轨迹列表的追加写入。</li><li>副作用: 调用 <code>self._reset_per_run_state()</code> 重置按次运行状态; 以新实例覆盖 <code>self._chat</code>; 将传入的 <code>context</code> 写入 <code>self._context</code>; 若 <code>self._session is None</code> 则抛出 <code>RuntimeError("Session is not set")</code>; 异步读取 <code>self._session.get_incremental_output()</code> 获取终端输出; 向 <code>self._trajectory_steps</code> 追加一条新的 <code>Step</code> 记录</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先执行 <code>self._reset_per_run_state()</code>，随后创建新的 <code>Chat(self._llm, interleaved_thinking=self._interleaved_thinking)</code> 覆盖到 <code>self._chat</code>，并把入参 <code>context</code> 保存到 <code>self._context</code>。</li><li>检查 <code>self._session</code>：若为 <code>None</code>，立即抛出 <code>RuntimeError("Session is not set")</code>，本段后续逻辑不再继续。</li><li>通过 <code>await self._session.get_incremental_output()</code> 读取当前终端增量输出，再交给 <code>self._limit_output_length(...)</code> 生成用于首条提示的 <code>terminal_state</code>。</li><li>令 <code>augmented_instruction = instruction</code> 作为起点；若 <code>self.mcp_servers</code> 为真，则构造 <code>mcp_info</code> 文本，并按 <code>s.transport</code> 分支：<code>stdio</code> 时写入 <code>s.name</code>、<code>s.command</code> 与 <code>' '.join(s.args)</code>，否则写入 <code>s.name</code>、<code>s.transport</code> 与 <code>s.url</code>；之后把该段拼接到原始指令后。</li><li>调用 <code>await self._build_skills_section(environment)</code> 获取 <code>skills_section</code>；仅当该结果为真值时，才继续拼接到 <code>augmented_instruction</code>。</li><li>以 <code>self._prompt_template.format(instruction=augmented_instruction, terminal_state=terminal_state)</code> 生成 <code>initial_prompt</code>。</li><li>向 <code>self._trajectory_steps</code> 追加一条 <code>Step</code>：其中 <code>step_id=1</code>，<code>timestamp</code> 为 <code>datetime.now(timezone.utc).isoformat()</code>，<code>source="user"</code>，<code>message=initial_prompt</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>        self._reset_per_run_state()
+        self._chat = Chat(self._llm, interleaved_thinking=self._interleaved_thinking)
+        self._context = context
+
+        if self._session is None:
+            raise RuntimeError("Session is not set")
+
+        # Get the terminal state for the initial prompt
+        terminal_state = self._limit_output_length(
+            await self._session.get_incremental_output()
+        )
+
+        augmented_instruction = instruction
+        if self.mcp_servers:
+            mcp_info = "\n\nMCP Servers:\nThe following MCP servers are available for this task.\n"
+            for s in self.mcp_servers:
+                if s.transport == "stdio":
+                    args_str = " ".join(s.args)
+                    mcp_info += f"- {s.name}: stdio transport, command: {s.command} {args_str}\n"
+                else:
+                    mcp_info += f"- {s.name}: {s.transport} transport, url: {s.url}\n"
+            augmented_instruction = instruction + mcp_info
+
+        skills_section = await self._build_skills_section(environment)
+        if skills_section:
+            augmented_instruction += skills_section
+
+        initial_prompt = self._prompt_template.format(
+            instruction=augmented_instruction,
+            terminal_state=terminal_state,
+        )
+
+        self._trajectory_steps.append(
+            Step(
+                step_id=1,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                source="user",
+                message=initial_prompt,
+            )
+        )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>代码对 <code>self._session</code> 做了显式 <code>None</code> 检查，并在缺失时直接抛出异常；这是源码中可见的前置条件收紧，而不是依赖后续异步调用在更深层位置失败。</li><li>MCP server 描述采用 <code>transport</code> 分支格式化：<code>stdio</code> 分支输出命令与参数，其它分支输出传输类型与 URL；该取舍直接体现在 <code>if s.transport == "stdio"</code> 的字符串拼接路径中。</li><li><code>augmented_instruction</code> 明确先等于原始 <code>instruction</code>，再按条件追加 MCP 信息与技能段；这使可选扩展不会替代原始指令内容。</li><li>技能段采用 truthy gate（<code>if skills_section:</code>）控制，说明 <code>_build_skills_section(environment)</code> 的结果允许为空/假值，而空结果不会被强行写入提示文本。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2.run</li><li><strong>核心被调用</strong>: Terminus2._reset_per_run_state; Chat; TmuxSession.get_incremental_output; Terminus2._limit_output_length; Terminus2._build_skills_section</li><li><strong>配置/状态来源</strong>: <code>self._llm</code>：用于构造 <code>Chat</code>; <code>self._interleaved_thinking</code>：作为 <code>Chat</code> 初始化参数; <code>self.mcp_servers</code>：决定是否追加 MCP 描述及其具体内容; <code>self._prompt_template</code>：用于格式化 <code>initial_prompt</code></li><li><strong>结果去向</strong>: <code>self._chat</code>：被新的 <code>Chat(...)</code> 实例覆盖; <code>self._context</code>：保存传入的 <code>context</code>; <code>self._trajectory_steps</code>：追加首条 <code>Step</code> 记录; <code>initial_prompt</code> 局部变量：作为新建 <code>Step.message</code> 的值</li><li><strong>同类 sibling</strong>: 与同 stage 的 <code>_reset_per_run_state</code> 相比，前者负责清空按次运行寄存状态；本段在其后基于干净状态创建 <code>Chat</code>、读取终端快照并写入首条轨迹。</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — 追加 step_id=1 的首条用户轨迹</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_build_skills_section"><summary><span class="chev"></span><code class="fpath">Terminus2._build_skills_section</code><a class="fn-range" href="../code/terminus_2.py.html#L419-L470" title="terminus_2.py:419-470">terminus_2.py:419–470 ↗</a></summary><div class="file-body"><p class="fn-sub">构造初始提示的技能清单段</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 <a href="stage-3.html">stage-3</a> 的提示构造阶段，在 <code>Terminus2.run()</code> 完成单次运行状态重置、采集初始终端输出之后被调用。它负责把远端环境中可用的 Agent Skills 转换成可插入提示词的结构化片段，与兄弟逻辑中的 MCP server 描述一起扩充原始 <code>instruction</code>。相较于 <code>_reset_per_run_state</code> 这类状态初始化函数，它不触碰运行期寄存器，只提供一段可选的提示文本。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收一个 <code>BaseEnvironment</code>，基于 <code>self.skills_dir</code> 在远端环境中发现技能文件 <code>SKILL.md</code>，并从文件 frontmatter 中抽取 <code>name</code> 与 <code>description</code>。若技能目录未配置、目录不存在、扫描无结果、文件不可读或 frontmatter 非法，则直接返回 <code>None</code>；只有存在至少一个有效技能时，才返回一个 <code>&lt;available_skills&gt;</code> XML 字符串。函数本身不修改任何 <code>self._...</code> 状态，唯一外部作用是通过 <code>environment.exec(...)</code> 和 <code>environment.is_dir(...)</code> 访问远端文件系统。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, environment: BaseEnvironment) -&gt; str | None</code></p>
+<ul><li>参数: <code>self</code>: <code>Terminus2</code> — 提供技能目录配置 <code>self.skills_dir</code> 与 frontmatter 解析器 <code>self._parse_skill_frontmatter</code>; <code>environment</code>: <code>BaseEnvironment</code> — 远端环境抽象，用于检查目录存在性并执行 <code>find</code> / <code>cat</code> 命令读取技能文件</li><li>读状态: <code>self.skills_dir</code>, <code>self._parse_skill_frontmatter</code></li><li>返回: 当未配置技能目录、目录不存在、扫描不到候选文件或没有任何 frontmatter 合法的技能时返回 <code>None</code>；否则返回带有 <code>available_skills/skill/name/description/location</code> 结构的 XML 文本，供 <code>run()</code> 拼接进初始提示。</li><li>副作用: 调用 <code>environment.is_dir(self.skills_dir)</code> 读取远端目录状态; 调用 <code>environment.exec(...)</code> 在远端执行 <code>find</code> 与 <code>cat</code> 命令; 无实例字段写入</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先检查 <code>self.skills_dir</code> 是否已配置；若为空值，则立即返回 <code>None</code>，跳过整段技能发现流程。</li><li>随后通过 <code>await environment.is_dir(self.skills_dir)</code> 确认远端目录存在；若不是目录，则返回 <code>None</code>。</li><li>在远端执行 <code>find {skills_dir} -mindepth 2 -maxdepth 2 -name SKILL.md -type f | sort</code>，把候选范围限定为 <code>skills_dir</code> 下第二层子目录中的 <code>SKILL.md</code>；若命令失败、标准输出为空或只含空白，则返回 <code>None</code>。</li><li>把 <code>find</code> 输出按行拆成 <code>skill_md_paths</code>，逐个对每个路径执行 <code>cat</code>；若某个文件读取失败或无输出，则仅跳过该文件，不中断整个函数。</li><li>对成功读出的文件内容调用 <code>self._parse_skill_frontmatter(...)</code>；只有返回非 <code>None</code> 的 frontmatter 才会被接受，并以 <code>(fm['name'], fm['description'], skill_md_path)</code> 形式加入 <code>entries</code>。</li><li>若全部候选都被过滤掉、<code>entries</code> 为空，则返回 <code>None</code>；否则构建根节点 <code>available_skills</code>，为每项技能写入 <code>name</code>、<code>description</code> 和 <code>location</code> 三个子元素。</li><li>最后对 XML 树执行 <code>indent(root, space=' ')</code> 美化缩进，并以 <code>tostring(..., encoding='unicode')</code> 序列化，在结果前额外拼接一个换行符后返回。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    async def _build_skills_section(self, environment: BaseEnvironment) -&gt; str | None:
+        """Discover Agent Skills in skills_dir and return an &lt;available_skills&gt; XML block.
+
+        Follows the Agent Skills spec: scans for subdirectories containing SKILL.md
+        inside the remote environment, parses YAML frontmatter for name/description,
+        and provides the absolute path so the model can ``cat`` the file to activate
+        a skill.
+        """
+        if not self.skills_dir:
+            return None
+
+        if not await environment.is_dir(self.skills_dir):
+            return None
+
+        # List subdirectories containing SKILL.md in the remote environment
+        result = await environment.exec(
+            f"find {shlex.quote(self.skills_dir)} -mindepth 2 -maxdepth 2"
+            " -name SKILL.md -type f | sort",
+            timeout_sec=10,
+        )
+
+        if result.return_code != 0 or not result.stdout or not result.stdout.strip():
+            return None
+
+        skill_md_paths = result.stdout.strip().splitlines()
+        entries: list[tuple[str, str, str]] = []  # (name, description, location)
+
+        for skill_md_path in skill_md_paths:
+            cat_result = await environment.exec(
+                f"cat {shlex.quote(skill_md_path)}", timeout_sec=10
+            )
+            if cat_result.return_code != 0 or not cat_result.stdout:
+                continue
+            fm = self._parse_skill_frontmatter(cat_result.stdout)
+            if fm is None:
+                continue
+            entries.append((fm["name"], fm["description"], skill_md_path))
+
+        if not entries:
+            return None
+
+        from xml.etree.ElementTree import Element, SubElement, indent, tostring
+
+        root = Element("available_skills")
+        for name, description, location in entries:
+            skill = SubElement(root, "skill")
+            SubElement(skill, "name").text = name
+            SubElement(skill, "description").text = description
+            SubElement(skill, "location").text = location
+
+        indent(root, space="  ")
+        return "\n" + tostring(root, encoding="unicode")</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数采用“缺失即静默不暴露”的策略：<code>self.skills_dir</code> 未配置、目录不存在、扫描失败、没有有效 frontmatter 时都统一返回 <code>None</code>，而不是抛错。这表明技能段是提示增强项而非运行前置条件，避免因技能目录问题阻塞 <code>run()</code> 的主流程。</li><li>技能发现完全委托给 <code>environment</code> 执行远端 <code>find</code>/<code>cat</code>，而不是在本地进程直接访问文件系统。这一取舍使发现结果与实际运行环境一致，特别适用于容器、远端 shell 或沙箱场景；代价是每个技能文件都要额外发起一次远端命令。</li><li>代码对单个坏文件采取局部容错：<code>cat</code> 失败或 <code>_parse_skill_frontmatter(...)</code> 返回 <code>None</code> 时只 <code>continue</code>，不让一个损坏的 <code>SKILL.md</code> 污染整个技能列表。这样做提高了目录内容不整洁时的鲁棒性，但也意味着调用方拿不到被跳过文件的错误细节。</li><li>输出格式选择 XML 且显式包含 <code>location</code>，并在 docstring 中说明模型可据此 <code>cat</code> 文件来激活技能。这说明该返回值不是给程序二次解析，而是给后续提示词直接消费，强调“向模型声明可用技能及其绝对位置”的用途。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2.run（<a href="stage-3.html">stage-3</a> 中构造初始提示时调用）</li><li><strong>核心被调用</strong>: environment.is_dir; environment.exec; self._parse_skill_frontmatter; xml.etree.ElementTree.Element; xml.etree.ElementTree.SubElement; xml.etree.ElementTree.indent; xml.etree.ElementTree.tostring; shlex.quote</li><li><strong>配置/状态来源</strong>: self.skills_dir 提供远端技能根目录; self._parse_skill_frontmatter 定义可接受的技能元数据格式; environment 代表当前试验实际运行的远端文件系统/命令执行上下文; <a href="stage-3.html">stage-3</a> 的提示拼装约定决定其返回值会被附加到 <code>instruction</code></li><li><strong>结果去向</strong>: 返回给 Terminus2.run; 被 <code>run()</code> 追加到原始 <code>instruction</code> 中; 随后进入 <code>self._prompt_template.format(instruction=..., terminal_state=...)</code>; 最终以初始 user step 写入轨迹，供后续 LLM 对话消费</li><li><strong>同类 sibling</strong>: 与 <code>Terminus2._reset_per_run_state</code> 形成对照：后者重置单次运行寄存器，本函数不修改任何运行态，只生成可选提示片段。; 与 <code>Terminus2.run</code> 的 <a href="stage-3.html">stage-3</a> 片段直接衔接：<code>run</code> 负责收集初始终端状态、拼接 MCP 描述与本函数返回的技能段，再形成首条 prompt。</li></ul></div></details><nav class="pn"><a class="pn-prev" href="stage-2.html"><span>← 上一阶段</span><strong>环境搭建</strong></a><a class="pn-next" href="stage-4.html"><span>下一阶段 →</span><strong>迭代主循环</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

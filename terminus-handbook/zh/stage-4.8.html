@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-4.8 · 完成门控与循环控制</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=zh"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 手册</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=zh" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>返回主页</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>状态流寄存器</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>配置固化</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>环境搭建</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>运行起点</a></div><details class="s-node" open><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>迭代主循环</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>循环入口门控</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>主动摘要探测</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM 调用</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>响应解析</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>待交接提示 → 用户步骤(或切分)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>错误分支</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>命令执行 → 观察 → 轨迹步骤</a></div><div class="s-leaf"><a class="s-link cur" href="stage-4.8.html"><span class="s-num">4.8</span>完成门控与循环控制</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>解析器内部辅助</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>运行收尾</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>录制后处理(外部)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>上下文摘要</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token 与成本核算</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>输出长度限制</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>日志</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux 内部辅助</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">索引</a><span class="sep">›</span><a href="stage-4.html">迭代主循环</a></nav><div class="stage-head"><h1>完成门控与循环控制</h1><div class="meta"><span class="chip mono">stage-4.8</span><span class="chip">Completion Gate + Loop Control</span><span class="chip">2 个函数</span></div></div>
+<h2 class="sec">开场解释</h2>
+<p>这个 Stage 在解决<strong>“Agent 会不会太早宣布任务完成”</strong>的问题。它站在一轮循环的尾部，专门做最后一道门：如果模型（LLM，大语言模型）说任务完成了，不立刻信，而是要求它<strong>连续两轮都确认完成</strong>才真的结束。这样做的意义很直接：前一 Stage 刚拿到终端观察结果，这里最适合决定“是继续干，还是收尾返回”。它的职责不是产生命令，而是<strong>判定本轮结果是否足以结束任务，并决定下一轮输入是什么</strong>。</p>
+<h2 class="sec">主流程</h2>
+
+<ol><li>先看这一轮的结论是不是“任务已完成”。 <p>这里接的是上一个 Stage 产出的 <code>is_task_complete</code> 和 <code>observation</code>。<code>observation</code> 可能是普通终端输出，也可能是上一轮专门发出的“你确认真的完成了吗？”这类确认问题的回复。</p></li><li>如果这轮判定完成，但<strong>还只是第一次</strong>说完成，就<strong>不结束</strong>。 <p>这一步的意思是：先把“完成声明”变成一次显式复核。系统会把下一轮 <code>prompt</code> 设成当前的 <code>observation</code>，让模型再看一眼刚才的结果，并继续循环。 <code>Terminus2._get_completion_confirmation_message()</code>（生成“请再次确认是否真的完成”的提示）就是为这个双重确认服务的。</p></li><li>如果这轮判定完成，而且上一轮已经处在“待确认完成”状态，也就是<strong>连续第二次确认完成</strong>，就直接 <code>return</code>。 <p>这时这个 Stage 的合同很明确：<strong>终止循环，并把任务完成作为最终结果交出去</strong>。 关键点不是“完成过一次”，而是“连续两次都说完成”。</p></li><li>如果这轮没有满足完成条件，就走普通路径。 <p>系统把下一轮 <code>prompt</code> 设成当前 <code>observation</code>（通常就是终端输出），然后继续进入下一轮循环。 换句话说，这个 Stage 负责把“刚观察到的东西”变成“下一轮模型要读的输入”。</p></li><li>这道门为什么要放在这里，而不是更早或更晚？ <p>因为只有在<strong>命令已跑完、观察结果已拿到、这一轮轨迹已记下</strong>之后，系统才有足够信息判断“是否真的结束”。放早了，看到的是半成品；放晚了，又会把错误的完成声明带出循环，失去防线。</p></li></ol>
+<h2 class="sec"> 状态流动</h2>
+<ul><li>读: 无 — 输入给出的 register 列表中未显式提供任何本 Stage 使用的寄存器名；因此无法按寄存器名校验 <code>is_task_complete</code>、<code>was_pending_completion</code>、<code>observation</code>、<code>prompt</code> 等状态读写，只能描述逻辑分支。</li><li>写: 无 — 同上。代码语义上，本 Stage 会更新“是否处于待二次确认”以及“下一轮 prompt”，但这些 register-id 未出现在提供列表中，不能编造名称。</li><li>清: 无 — 提供的 register 列表中没有可被真实引用的清理项，无法验证是否有显式清空动作。</li><li>触发下游: <code>stage-4.9 Command Execute → Observation → Trajectory Step</code> — 当未终止时，本 Stage 把下一轮输入设为当前 <code>observation</code>，然后回到循环下一次迭代；下一次迭代会再次经过前面的计划/执行链路，并在执行后回到 <a href="stage-4.9.html">stage-4.9</a> 产出新的观察。</li><li>触发下游: <code>return</code>（终止循环，不再进入下一轮 Stage）— 条件是 <code>is_task_complete == true</code> 且 <code>was_pending_completion == true</code>，即连续第二次确认完成；此时本 Stage 直接交付“任务完成”的终止结果。</li><li>触发下游: <code>continue</code>（发出下一轮 prompt）— 条件一：<code>is_task_complete == true</code> 且 <code>was_pending_completion == false</code>，表示第一次声明完成；产物是“把当前 observation 作为下一轮 prompt，并标记进入待确认状态”。 </li><li>触发下游: <code>continue</code>（发出下一轮 prompt）— 条件二：<code>is_task_complete == false</code>，表示未完成或确认失败；产物是“把当前 observation 作为下一轮 prompt，按普通路径继续”。如果前一轮已经进入过首次确认，但这轮没有再次确认完成，那么它不会终止，而是回退到正常循环。</li></ul>
+<h2 class="sec">与前后 Stage 的衔接</h2>
+<p>上游 <a href="stage-4.9.html">[stage-4.9</a>](<a href="stage-4.9.html">stage-4.9</a>.html) 刚产出两样关键东西：<strong>观察结果</strong>和<strong>这一轮是否可视为完成</strong>。本 Stage 不再碰执行细节，只负责把这两个信号变成二选一的结果：要么<strong>终止并返回完成</strong>，要么<strong>把 observation 改写成下一轮 prompt</strong>后继续进入下一次循环入口。</p><div class="files-bar"><h2 class="sec">函数细节<span class="pill">2</span></h2><span class="spacer"></span><button class="tool" data-x="expand">全部展开</button><button class="tool" data-x="collapse">全部折叠</button></div><details class="file" id="fn-terminus2_run_agent_loop"><summary><span class="chev"></span><code class="fpath">Terminus2._run_agent_loop</code><a class="fn-range" href="../code/terminus_2.py.html#L1550-L1561" title="terminus_2.py:1550-1561">terminus_2.py:1550–1561 ↗</a></summary><div class="file-body"><p class="fn-sub">迭代尾部的完成门控与续转控制</p>
+<blockquote><p><strong>stage 上下文</strong>: 该片段位于 <code>Terminus2._run_agent_loop</code> 的一次 episode 收尾处，承接前面阶段已得到的 <code>is_task_complete</code>、<code>was_pending_completion</code> 与 <code>observation</code>。它先调用 <code>self._dump_trajectory()</code> 持久化当前轨迹，再依据完成状态决定是立即退出整个函数，还是把本轮 <code>observation</code> 送入下一轮作为新的 <code>prompt</code>。作为本 stage 的首个已译单元，这里承担了 stage 标题所说的 completion gate 与 loop control 的最终落点。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>此代码段在每轮结束时先执行 <code>self._dump_trajectory()</code>，把当前运行轨迹落盘。随后检查 <code>is_task_complete</code>：若其为真且 <code>was_pending_completion</code> 也为真，则直接 <code>return</code> 结束 <code>_run_agent_loop</code>；若仅 <code>is_task_complete</code> 为真，则把 <code>observation</code> 赋给 <code>prompt</code> 并 <code>continue</code> 进入下一轮。其余情况下同样执行 <code>prompt = observation</code>，但不显式跳转，由外围循环按常规流转进入下一次迭代。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self) -&gt; None</code></p>
+<ul><li>返回: 无显式返回值；实际控制效果分支化：当 <code>is_task_complete and was_pending_completion</code> 时经裸 <code>return</code> 提前结束整个 <code>_run_agent_loop</code>，否则不返回，由外围循环继续执行。</li><li>副作用: 调用 <code>self._dump_trajectory()</code> 触发轨迹持久化这一外部副作用; 读取局部/外层作用域输入 <code>is_task_complete</code>、<code>was_pending_completion</code>、<code>observation</code> 以决定控制流; 在两个非返回分支中执行 <code>prompt = observation</code>，为后续迭代准备下一轮输入; 仅在“首次完成”分支执行 <code>continue</code>，立即进入下一轮循环</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先无条件调用 <code>self._dump_trajectory()</code>，在完成本轮 episode 后立即持久化当前轨迹。</li><li>检查 <code>is_task_complete</code>；若为假，则跳过完成门控，直接执行末尾的 <code>prompt = observation</code>。</li><li>若 <code>is_task_complete</code> 为真，再检查 <code>was_pending_completion</code>；当两者同时为真时，执行裸 <code>return</code>，当前函数立即结束。</li><li>若 <code>is_task_complete</code> 为真但 <code>was_pending_completion</code> 为假，则将 <code>observation</code> 赋给 <code>prompt</code>，随后执行 <code>continue</code>，显式开始下一轮循环。</li><li>在未命中上述 <code>return</code> / <code>continue</code> 的常规路径中，执行最终的 <code>prompt = observation</code>，但此路径本身不强制跳转，只把控制权留给外围循环的正常迭代机制。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>            self._dump_trajectory()
+
+            if is_task_complete:
+                if was_pending_completion:
+                    # Task is confirmed complete (this is the second time task_complete was True), return
+                    return
+                else:
+                    # First completion attempt - ask for confirmation and continue
+                    prompt = observation
+                    continue
+
+            prompt = observation</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>轨迹持久化被放在完成判定之前：代码先执行 <code>self._dump_trajectory()</code>，再检查 <code>is_task_complete</code> / <code>was_pending_completion</code>，因此即便随后走到提前 <code>return</code>，本轮轨迹也已先落盘。</li><li>完成退出采用双条件门控而非单条件门控：只有 <code>is_task_complete</code> 与 <code>was_pending_completion</code> 同时成立才 <code>return</code>；单独一次 <code>is_task_complete</code> 不结束函数，而是改为设置 <code>prompt</code> 并 <code>continue</code>。</li><li>同一个 <code>observation</code> 在两个非返回分支都被复用为下一轮 <code>prompt</code>，但控制语义不同：首次完成分支带有显式 <code>continue</code>，普通分支只有赋值、没有额外跳转；这一差异在源码中是显式区分的。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2._run_agent_loop</li><li><strong>核心被调用</strong>: Terminus2._dump_trajectory</li><li><strong>配置/状态来源</strong>: 局部布尔量 <code>is_task_complete</code>; 局部布尔量 <code>was_pending_completion</code>; 局部值 <code>observation</code></li><li><strong>结果去向</strong>: 提前 <code>return</code> 到 <code>Terminus2._run_agent_loop</code> 的调用方; 局部变量 <code>prompt</code>，作为下一轮 agent 输入; 外围 <code>while</code>/迭代控制流中的 <code>continue</code> 分支; <code>self._dump_trajectory()</code> 所对应的轨迹持久化目标</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-pending-completion"><code>reg-pending-completion</code></a> — 经 <code>was_pending_completion</code> 决定是否退出</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_get_completion_confirmation_message"><summary><span class="chev"></span><code class="fpath">Terminus2._get_completion_confirmation_message</code><a class="fn-range" href="../code/terminus_2.py.html#L486-L507" title="terminus_2.py:486-507">terminus_2.py:486–507 ↗</a></summary><div class="file-body"><p class="fn-sub">生成完工二次确认提示文案</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数在本 stage 中承担文案生成角色：根据 <code>self._parser_name</code> 为当前响应格式产出一条完工确认消息。它本身不推进循环、不修改状态，只把终端快照 <code>terminal_output</code> 包装成要求再次确认的提示语。与同 stage 中负责门控与循环控制的兄弟逻辑相比，这里仅负责形成提示文本本身。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收 <code>terminal_output: str</code>，读取 <code>self._parser_name</code>，返回一条要求再次确认任务完成的字符串。成功路径下，返回值都以 <code>Current terminal state:\n{terminal_output}\n\n</code> 为共同前缀，随后接相同的确认警告语，只在最后要求重复给出的完成标记上区分 <code>json</code> 与 <code>xml</code>。函数无副作用；若 <code>self._parser_name</code> 既不是 <code>json</code> 也不是 <code>xml</code>，则直接抛出 <code>ValueError</code>。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, terminal_output: str) -&gt; str</code></p>
+<ul><li>参数: <code>terminal_output</code>: <code>str</code> — 插入提示文案中的当前终端状态原文</li><li>读状态: <code>self._parser_name</code></li><li>返回: 返回一条确认消息字符串；成功时固定以 <code>Current terminal state:\n{terminal_output}\n\n</code> 开头，并要求再次给出完成标记：<code>json</code> 分支要求包含 <code>"task_complete": true</code>，<code>xml</code> 分支要求包含 <code>&lt;task_complete&gt;true&lt;/task_complete&gt;</code>；若解析器名不受支持则不返回而是抛出 <code>ValueError</code>。</li><li>副作用: 无</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>读取 <code>self._parser_name</code>，先判断是否为字面值 <code>json</code>。</li><li>若为 <code>json</code>，返回一条字符串：以前缀 <code>Current terminal state:\n{terminal_output}\n\n</code> 嵌入传入的终端输出，再附加确认警告，并明确要求在 JSON 响应中再次包含 <code>"task_complete": true</code>。</li><li>若不是 <code>json</code>，继续判断是否为字面值 <code>xml</code>。</li><li>若为 <code>xml</code>，返回同样以前缀 <code>Current terminal state:\n{terminal_output}\n\n</code> 开头、主体警告语相同的字符串，只把最后的完成标记改为 <code>&lt;task_complete&gt;true&lt;/task_complete&gt;</code>。</li><li>若两种格式都不匹配，则抛出 <code>ValueError</code>，错误消息中回显当前的 <code>self._parser_name</code>，并提示可用值是 <code>json</code> 或 <code>xml</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _get_completion_confirmation_message(self, terminal_output: str) -&gt; str:
+        """Return the format-specific task completion confirmation message."""
+        if self._parser_name == "json":
+            return (
+                f"Current terminal state:\n{terminal_output}\n\n"
+                "Are you sure you want to mark the task as complete? "
+                "This will trigger your solution to be graded and you won't be able to "
+                'make any further corrections. If so, include "task_complete": true '
+                "in your JSON response again."
+            )
+        elif self._parser_name == "xml":
+            return (
+                f"Current terminal state:\n{terminal_output}\n\n"
+                "Are you sure you want to mark the task as complete? "
+                "This will trigger your solution to be graded and you won't be able to "
+                "make any further corrections. If so, include "
+                "&lt;task_complete&gt;true&lt;/task_complete&gt; again."
+            )
+        else:
+            raise ValueError(
+                f"Unknown parser_name: {self._parser_name}. Use 'json' or 'xml'."
+            )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>代码没有为未知 <code>self._parser_name</code> 提供兜底格式，而是显式 <code>raise ValueError(...)</code>。这是一种失败即暴露的取舍：配置错误会立即显现，避免静默生成与实际响应 schema 不一致的确认文案。</li><li>两个成功分支复用了几乎完全相同的消息骨架，包括共同前缀 <code>Current terminal state:\n{terminal_output}\n\n</code> 和相同的确认警告语，只在最后的完成标记文本上分化。这表明该函数把“格式差异”收敛到最小范围，仅对 schema 必需的字面标记做分支处理。</li><li>函数直接把原始 <code>terminal_output</code> 内插进返回文案，没有做裁剪、转义或摘要处理。由此保留了调用方传入的终端状态全貌，但也意味着输出内容完全依赖输入字符串原样呈现。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 外部调用方：任何需要基于当前终端输出生成完工确认消息的实例方法</li><li><strong>核心被调用</strong>: 内建 <code>ValueError</code> 构造与抛出</li><li><strong>配置/状态来源</strong>: <code>self._parser_name</code>：决定选择 <code>json</code> 分支、<code>xml</code> 分支，还是进入异常路径; <code>terminal_output</code> 参数：提供返回字符串中的终端状态正文</li><li><strong>结果去向</strong>: 返回给调用方的一条确认消息字符串; 异常路径将 <code>ValueError</code> 传播给调用方处理</li><li><strong>同类 sibling</strong>: Terminus2._run_agent_loop：兄弟逻辑负责依据完成状态决定继续、确认或返回；本函数仅生成其所需的确认文案，不承担循环控制。</li></ul></div></details><nav class="pn"><a class="pn-prev" href="stage-4.7.html"><span>← 上一阶段</span><strong>命令执行 → 观察 → 轨迹步骤</strong></a><a class="pn-next" href="stage-4.9.html"><span>下一阶段 →</span><strong>解析器内部辅助</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

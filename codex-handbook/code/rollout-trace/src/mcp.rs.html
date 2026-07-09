@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rollout-trace/src/mcp.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">rollout-trace/src/mcp.rs</code>
+<span class="code-meta">99 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=c>//! Hot-path helpers for correlating concrete MCP executions with rollout traces.</b></i><i id="L2"><b class=c>//!</b></i><i id="L3"><b class=c>//! Core decides when an MCP request is actually going to execute. The trace</b></i><i id="L4"><b class=c>//! crate owns the globally unique ID, the trace event that preserves it in the</b></i><i id="L5"><b class=c>//! reduced artifact, and the bridge-private MCP request metadata key.</b></i><i id="L6"></i><i id="L7"><b class=k>use</b> <b class=k>crate</b>::McpCallId;</i><i id="L8"><b class=k>use</b> serde_json::Value <b class=k>as</b> JsonValue;</i><i id="L9"></i><i id="L10"><b class=k>const</b> MCP_CALL_ID_META_KEY: &amp;str = <b class=s>"codex_bridge_mcp_call_id"</b>;</i><i id="L11"></i><i id="L12"><b class=c>/// No-op capable handle for one concrete MCP backend call.</b></i><i id="L13"><b class=m>#[derive(Clone, Debug)]</b></i><i id="L14"><b class=k>pub</b> <b class=k>struct</b> McpCallTraceContext {</i><i id="L15">    mcp_call_id: Option&lt;McpCallId&gt;,</i><i id="L16">}</i><i id="L17"></i><i id="L18"><b class=k>impl</b> McpCallTraceContext {</i><i id="L19">    <b class=c>/// Builds a context that records nothing and leaves request metadata unchanged.</b></i><i id="L20">    <b class=k>pub</b> <b class=k>fn</b> disabled() -&gt; <b class=k>Self</b> {</i><i id="L21">        <b class=k>Self</b> { mcp_call_id: None }</i><i id="L22">    }</i><i id="L23"></i><i id="L24">    <b class=c>/// Builds the trace handle for one concrete MCP execution.</b></i><i id="L25">    <b class=k>pub</b>(<b class=k>crate</b>) <b class=k>fn</b> enabled(mcp_call_id: McpCallId) -&gt; <b class=k>Self</b> {</i><i id="L26">        <b class=k>Self</b> {</i><i id="L27">            mcp_call_id: Some(mcp_call_id),</i><i id="L28">        }</i><i id="L29">    }</i><i id="L30"></i><i id="L31">    <b class=c>/// Returns the trace-owned MCP call ID when rollout tracing is enabled.</b></i><i id="L32">    <b class=k>pub</b>(<b class=k>crate</b>) <b class=k>fn</b> mcp_call_id(&amp;<b class=k>self</b>) -&gt; Option&lt;&amp;str&gt; {</i><i id="L33">        <b class=k>self</b>.mcp_call_id.as_deref()</i><i id="L34">    }</i><i id="L35"></i><i id="L36">    <b class=c>/// Adds bridge-private MCP correlation metadata to one outgoing request.</b></i><i id="L37">    <b class=k>pub</b> <b class=k>fn</b> add_request_meta(&amp;<b class=k>self</b>, meta: Option&lt;JsonValue&gt;) -&gt; Option&lt;JsonValue&gt; {</i><i id="L38">        <b class=k>let</b> Some(mcp_call_id) = <b class=k>self</b>.mcp_call_id() <b class=k>else</b> {</i><i id="L39">            <b class=k>return</b> meta;</i><i id="L40">        };</i><i id="L41"></i><i id="L42">        <b class=k>match</b> meta {</i><i id="L43">            Some(JsonValue::Object(<b class=k>mut</b> map)) =&gt; {</i><i id="L44">                map.insert(</i><i id="L45">                    MCP_CALL_ID_META_KEY.to_string(),</i><i id="L46">                    JsonValue::String(mcp_call_id.to_string()),</i><i id="L47">                );</i><i id="L48">                Some(JsonValue::Object(map))</i><i id="L49">            }</i><i id="L50">            None =&gt; {</i><i id="L51">                <b class=k>let</b> <b class=k>mut</b> map = serde_json::Map::new();</i><i id="L52">                map.insert(</i><i id="L53">                    MCP_CALL_ID_META_KEY.to_string(),</i><i id="L54">                    JsonValue::String(mcp_call_id.to_string()),</i><i id="L55">                );</i><i id="L56">                Some(JsonValue::Object(map))</i><i id="L57">            }</i><i id="L58">            <b class=c>// This should never happen but if it does then we'll fallback to</b></i><i id="L59">            <b class=c>// a noop rather than any breaking behavior. The tracing is best</b></i><i id="L60">            <b class=c>// effort after all.</b></i><i id="L61">            Some(_) =&gt; meta,</i><i id="L62">        }</i><i id="L63">    }</i><i id="L64">}</i><i id="L65"></i><i id="L66"><b class=m>#[cfg(test)]</b></i><i id="L67"><b class=k>mod</b> tests {</i><i id="L68">    <b class=k>use</b> serde_json::json;</i><i id="L69"></i><i id="L70">    <b class=k>use</b> <b class=k>super</b>::MCP_CALL_ID_META_KEY;</i><i id="L71">    <b class=k>use</b> <b class=k>super</b>::McpCallTraceContext;</i><i id="L72"></i><i id="L73">    <b class=m>#[test]</b></i><i id="L74">    <b class=k>fn</b> disabled_mcp_trace_leaves_request_meta_unchanged() {</i><i id="L75">        <b class=k>let</b> meta = Some(<b class=m>json!</b>({<b class=s>"source"</b>: <b class=s>"test"</b>}));</i><i id="L76"></i><i id="L77">        <b class=m>assert_eq!</b>(</i><i id="L78">            McpCallTraceContext::disabled().add_request_meta(meta.clone()),</i><i id="L79">            meta</i><i id="L80">        );</i><i id="L81">    }</i><i id="L82"></i><i id="L83">    <b class=m>#[test]</b></i><i id="L84">    <b class=k>fn</b> enabled_mcp_trace_adds_bridge_correlation_meta() {</i><i id="L85">        <b class=k>let</b> trace = McpCallTraceContext::enabled(<b class=s>"mcp-call-id"</b>.to_string());</i><i id="L86">        <b class=k>let</b> meta = trace</i><i id="L87">            .add_request_meta(Some(<b class=m>json!</b>({<b class=s>"source"</b>: <b class=s>"test"</b>})))</i><i id="L88">            .expect(<b class=s>"enabled trace keeps request metadata"</b>);</i><i id="L89">        <b class=k>let</b> object = meta</i><i id="L90">            .as_object()</i><i id="L91">            .expect(<b class=s>"MCP request metadata remains an object"</b>);</i><i id="L92"></i><i id="L93">        <b class=m>assert_eq!</b>(object[<b class=s>"source"</b>], <b class=m>json!</b>(<b class=s>"test"</b>));</i><i id="L94">        <b class=m>assert_eq!</b>(</i><i id="L95">            object[MCP_CALL_ID_META_KEY],</i><i id="L96">            <b class=m>json!</b>(trace.mcp_call_id().expect(<b class=s>"enabled trace has an ID"</b>))</i><i id="L97">        );</i><i id="L98">    }</i><i id="L99">}</i></pre></div>
+</main>
+<script src="../../../assets/app.js"></script>
+</body>
+</html>

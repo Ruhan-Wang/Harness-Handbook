@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>thread-store/src/local/test_support.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">thread-store/src/local/test_support.rs</code>
+<span class="code-meta">107 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=k>use</b> std::fs;</i><i id="L2"><b class=k>use</b> std::io::Write;</i><i id="L3"><b class=k>use</b> std::path::Path;</i><i id="L4"><b class=k>use</b> std::path::PathBuf;</i><i id="L5"></i><i id="L6"><b class=k>use</b> codex_rollout::ARCHIVED_SESSIONS_SUBDIR;</i><i id="L7"><b class=k>use</b> uuid::Uuid;</i><i id="L8"></i><i id="L9"><b class=k>use</b> <b class=k>super</b>::LocalThreadStoreConfig;</i><i id="L10"></i><i id="L11"><b class=k>pub</b>(<b class=k>super</b>) <b class=k>fn</b> test_config(codex_home: &amp;Path) -&gt; LocalThreadStoreConfig {</i><i id="L12">    LocalThreadStoreConfig {</i><i id="L13">        codex_home: codex_home.to_path_buf(),</i><i id="L14">        sqlite_home: codex_home.to_path_buf(),</i><i id="L15">        default_model_provider_id: <b class=s>"test-provider"</b>.to_string(),</i><i id="L16">    }</i><i id="L17">}</i><i id="L18"></i><i id="L19"><b class=k>pub</b>(<b class=k>super</b>) <b class=k>fn</b> write_session_file(root: &amp;Path, ts: &amp;str, uuid: Uuid) -&gt; std::io::Result&lt;PathBuf&gt; {</i><i id="L20">    write_session_file_with(</i><i id="L21">        root,</i><i id="L22">        root.join(<b class=s>"sessions/2025/01/03"</b>),</i><i id="L23">        ts,</i><i id="L24">        uuid,</i><i id="L25">        <b class=s>"Hello from user"</b>,</i><i id="L26">        Some(<b class=s>"test-provider"</b>),</i><i id="L27">    )</i><i id="L28">}</i><i id="L29"></i><i id="L30"><b class=k>pub</b>(<b class=k>super</b>) <b class=k>fn</b> write_archived_session_file(</i><i id="L31">    root: &amp;Path,</i><i id="L32">    ts: &amp;str,</i><i id="L33">    uuid: Uuid,</i><i id="L34">) -&gt; std::io::Result&lt;PathBuf&gt; {</i><i id="L35">    write_session_file_with(</i><i id="L36">        root,</i><i id="L37">        root.join(ARCHIVED_SESSIONS_SUBDIR),</i><i id="L38">        ts,</i><i id="L39">        uuid,</i><i id="L40">        <b class=s>"Archived user message"</b>,</i><i id="L41">        Some(<b class=s>"test-provider"</b>),</i><i id="L42">    )</i><i id="L43">}</i><i id="L44"></i><i id="L45"><b class=k>pub</b>(<b class=k>super</b>) <b class=k>fn</b> write_session_file_with(</i><i id="L46">    root: &amp;Path,</i><i id="L47">    day_dir: PathBuf,</i><i id="L48">    ts: &amp;str,</i><i id="L49">    uuid: Uuid,</i><i id="L50">    first_user_message: &amp;str,</i><i id="L51">    model_provider: Option&lt;&amp;str&gt;,</i><i id="L52">) -&gt; std::io::Result&lt;PathBuf&gt; {</i><i id="L53">    write_session_file_with_fork(</i><i id="L54">        root,</i><i id="L55">        day_dir,</i><i id="L56">        ts,</i><i id="L57">        uuid,</i><i id="L58">        first_user_message,</i><i id="L59">        model_provider,</i><i id="L60">        <b class=c>/*forked_from_id*/</b> None,</i><i id="L61">    )</i><i id="L62">}</i><i id="L63"></i><i id="L64"><b class=k>pub</b>(<b class=k>super</b>) <b class=k>fn</b> write_session_file_with_fork(</i><i id="L65">    root: &amp;Path,</i><i id="L66">    day_dir: PathBuf,</i><i id="L67">    ts: &amp;str,</i><i id="L68">    uuid: Uuid,</i><i id="L69">    first_user_message: &amp;str,</i><i id="L70">    model_provider: Option&lt;&amp;str&gt;,</i><i id="L71">    forked_from_id: Option&lt;Uuid&gt;,</i><i id="L72">) -&gt; std::io::Result&lt;PathBuf&gt; {</i><i id="L73">    fs::create_dir_all(&amp;day_dir)?;</i><i id="L74">    <b class=k>let</b> path = day_dir.join(<b class=m>format!</b>(<b class=s>"rollout-{ts}-{uuid}.jsonl"</b>));</i><i id="L75">    <b class=k>let</b> <b class=k>mut</b> file = fs::File::create(&amp;path)?;</i><i id="L76">    <b class=k>let</b> meta = serde_json::<b class=m>json!</b>({</i><i id="L77">        <b class=s>"timestamp"</b>: ts,</i><i id="L78">        <b class=s>"type"</b>: <b class=s>"session_meta"</b>,</i><i id="L79">        <b class=s>"payload"</b>: {</i><i id="L80">            <b class=s>"id"</b>: uuid,</i><i id="L81">            <b class=s>"forked_from_id"</b>: forked_from_id,</i><i id="L82">            <b class=s>"timestamp"</b>: ts,</i><i id="L83">            <b class=s>"cwd"</b>: root,</i><i id="L84">            <b class=s>"originator"</b>: <b class=s>"test_originator"</b>,</i><i id="L85">            <b class=s>"cli_version"</b>: <b class=s>"test_version"</b>,</i><i id="L86">            <b class=s>"source"</b>: <b class=s>"cli"</b>,</i><i id="L87">            <b class=s>"model_provider"</b>: model_provider,</i><i id="L88">            <b class=s>"git"</b>: {</i><i id="L89">                <b class=s>"commit_hash"</b>: <b class=s>"abcdef"</b>,</i><i id="L90">                <b class=s>"branch"</b>: <b class=s>"main"</b>,</i><i id="L91">                <b class=s>"repository_url"</b>: <b class=s>"https://example.com/repo.git"</b></i><i id="L92">            }</i><i id="L93">        },</i><i id="L94">    });</i><i id="L95">    <b class=m>writeln!</b>(file, <b class=s>"{meta}"</b>)?;</i><i id="L96">    <b class=k>let</b> user_event = serde_json::<b class=m>json!</b>({</i><i id="L97">        <b class=s>"timestamp"</b>: ts,</i><i id="L98">        <b class=s>"type"</b>: <b class=s>"event_msg"</b>,</i><i id="L99">        <b class=s>"payload"</b>: {</i><i id="L100">            <b class=s>"type"</b>: <b class=s>"user_message"</b>,</i><i id="L101">            <b class=s>"message"</b>: first_user_message,</i><i id="L102">            <b class=s>"kind"</b>: <b class=s>"plain"</b>,</i><i id="L103">        },</i><i id="L104">    });</i><i id="L105">    <b class=m>writeln!</b>(file, <b class=s>"{user_event}"</b>)?;</i><i id="L106">    Ok(path)</i><i id="L107">}</i></pre></div>
+</main>
+<script src="../../../../assets/app.js"></script>
+</body>
+</html>

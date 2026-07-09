@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ext/memories/src/local/list.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">ext/memories/src/local/list.rs</code>
+<span class="code-meta">83 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=k>use</b> <b class=k>crate</b>::MAX_LIST_RESULTS;</i><i id="L2"><b class=k>use</b> <b class=k>crate</b>::backend::ListMemoriesRequest;</i><i id="L3"><b class=k>use</b> <b class=k>crate</b>::backend::ListMemoriesResponse;</i><i id="L4"><b class=k>use</b> <b class=k>crate</b>::backend::MemoriesBackendError;</i><i id="L5"><b class=k>use</b> <b class=k>crate</b>::backend::MemoryEntry;</i><i id="L6"><b class=k>use</b> <b class=k>crate</b>::backend::MemoryEntryType;</i><i id="L7"></i><i id="L8"><b class=k>use</b> <b class=k>super</b>::LocalMemoriesBackend;</i><i id="L9"><b class=k>use</b> <b class=k>super</b>::path::display_relative_path;</i><i id="L10"><b class=k>use</b> <b class=k>super</b>::path::is_hidden_path;</i><i id="L11"><b class=k>use</b> <b class=k>super</b>::path::read_sorted_dir_paths;</i><i id="L12"><b class=k>use</b> <b class=k>super</b>::path::reject_symlink;</i><i id="L13"></i><i id="L14"><b class=k>pub</b>(<b class=k>super</b>) <b class=k>async</b> <b class=k>fn</b> list(</i><i id="L15">    backend: &amp;LocalMemoriesBackend,</i><i id="L16">    request: ListMemoriesRequest,</i><i id="L17">) -&gt; Result&lt;ListMemoriesResponse, MemoriesBackendError&gt; {</i><i id="L18">    <b class=k>let</b> max_results = request.max_results.min(MAX_LIST_RESULTS);</i><i id="L19">    <b class=k>let</b> start = backend.resolve_scoped_path(request.path.as_deref()).<b class=k>await</b>?;</i><i id="L20">    <b class=k>let</b> start_index = <b class=k>match</b> request.cursor.as_deref() {</i><i id="L21">        Some(cursor) =&gt; cursor.parse::&lt;usize&gt;().map_err(|_| {</i><i id="L22">            MemoriesBackendError::invalid_cursor(cursor, <b class=s>"must be a non-negative integer"</b>)</i><i id="L23">        })?,</i><i id="L24">        None =&gt; <b class=n>0</b>,</i><i id="L25">    };</i><i id="L26">    <b class=k>let</b> Some(metadata) = LocalMemoriesBackend::metadata_or_none(&amp;start).<b class=k>await</b>? <b class=k>else</b> {</i><i id="L27">        <b class=k>return</b> Err(MemoriesBackendError::NotFound {</i><i id="L28">            path: request.path.unwrap_or_default(),</i><i id="L29">        });</i><i id="L30">    };</i><i id="L31">    reject_symlink(&amp;display_relative_path(&amp;backend.root, &amp;start), &amp;metadata)?;</i><i id="L32"></i><i id="L33">    <b class=k>let</b> <b class=k>mut</b> entries = <b class=k>if</b> metadata.is_file() {</i><i id="L34">        <b class=m>vec!</b>[MemoryEntry {</i><i id="L35">            path: display_relative_path(&amp;backend.root, &amp;start),</i><i id="L36">            entry_type: MemoryEntryType::File,</i><i id="L37">        }]</i><i id="L38">    } <b class=k>else</b> <b class=k>if</b> metadata.is_dir() {</i><i id="L39">        <b class=k>let</b> <b class=k>mut</b> entries = Vec::new();</i><i id="L40">        <b class=k>for</b> path <b class=k>in</b> read_sorted_dir_paths(&amp;start).<b class=k>await</b>? {</i><i id="L41">            <b class=k>if</b> is_hidden_path(&amp;path) {</i><i id="L42">                <b class=k>continue</b>;</i><i id="L43">            }</i><i id="L44">            <b class=k>let</b> Some(metadata) = LocalMemoriesBackend::metadata_or_none(&amp;path).<b class=k>await</b>? <b class=k>else</b> {</i><i id="L45">                <b class=k>continue</b>;</i><i id="L46">            };</i><i id="L47">            <b class=k>if</b> metadata.file_type().is_symlink() {</i><i id="L48">                <b class=k>continue</b>;</i><i id="L49">            }</i><i id="L50"></i><i id="L51">            <b class=k>let</b> entry_type = <b class=k>if</b> metadata.is_dir() {</i><i id="L52">                MemoryEntryType::Directory</i><i id="L53">            } <b class=k>else</b> <b class=k>if</b> metadata.is_file() {</i><i id="L54">                MemoryEntryType::File</i><i id="L55">            } <b class=k>else</b> {</i><i id="L56">                <b class=k>continue</b>;</i><i id="L57">            };</i><i id="L58">            entries.push(MemoryEntry {</i><i id="L59">                path: display_relative_path(&amp;backend.root, &amp;path),</i><i id="L60">                entry_type,</i><i id="L61">            });</i><i id="L62">        }</i><i id="L63">        entries</i><i id="L64">    } <b class=k>else</b> {</i><i id="L65">        Vec::new()</i><i id="L66">    };</i><i id="L67">    <b class=k>if</b> start_index &gt; entries.len() {</i><i id="L68">        <b class=k>return</b> Err(MemoriesBackendError::invalid_cursor(</i><i id="L69">            start_index.to_string(),</i><i id="L70">            <b class=s>"exceeds result count"</b>,</i><i id="L71">        ));</i><i id="L72">    }</i><i id="L73"></i><i id="L74">    <b class=k>let</b> end_index = start_index.saturating_add(max_results).min(entries.len());</i><i id="L75">    <b class=k>let</b> next_cursor = (end_index &lt; entries.len()).then(|| end_index.to_string());</i><i id="L76">    <b class=k>let</b> truncated = next_cursor.is_some();</i><i id="L77">    Ok(ListMemoriesResponse {</i><i id="L78">        path: request.path,</i><i id="L79">        entries: entries.drain(start_index..end_index).collect(),</i><i id="L80">        next_cursor,</i><i id="L81">        truncated,</i><i id="L82">    })</i><i id="L83">}</i></pre></div>
+</main>
+<script src="../../../../../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+This stage runs at the end of a connection, session, or process and provides the system’s bounded graceful-shutdown path. Its job is to stop admitting new work, let in-flight work finish where possible, and then tear down remaining runtime state without losing important persisted metadata.
+
+In the server, connection_rpc_gate.rs is the first line of shutdown coordination for each connection: it flips a per-connection acceptance flag so no new initialized RPC handlers can start, while tracking already-running handlers with task tokens until they drain. connection_cleanup.rs complements that gate by managing the cleanup tasks spawned for a connection; it can collect completions incrementally, wait for all cleanup work, or abort stragglers if shutdown deadlines require it.
+
+At the domain layer, core/src/agent/control/legacy.rs closes existing agent threads and recursively shuts down live descendants, while also persisting closed spawn-edge information so the stored thread tree remains consistent with in-memory teardown.
+
+At the process level, app-server-daemon/src/update_loop.rs governs the daemon’s Unix updater lifecycle, periodically refreshing the managed installer and performing restart or re-exec when binaries change, ensuring teardown and replacement happen in a controlled way.

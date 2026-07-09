@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>protocol/src/thread_id.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">protocol/src/thread_id.rs</code>
+<span class="code-meta">103 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=k>use</b> std::fmt::Display;</i><i id="L2"></i><i id="L3"><b class=k>use</b> schemars::JsonSchema;</i><i id="L4"><b class=k>use</b> schemars::r#gen::SchemaGenerator;</i><i id="L5"><b class=k>use</b> schemars::schema::Schema;</i><i id="L6"><b class=k>use</b> serde::Deserialize;</i><i id="L7"><b class=k>use</b> serde::Serialize;</i><i id="L8"><b class=k>use</b> ts_rs::TS;</i><i id="L9"><b class=k>use</b> uuid::Uuid;</i><i id="L10"></i><i id="L11"><b class=m>#[derive(Debug, Clone, Copy, PartialEq, Eq, TS, Hash)]</b></i><i id="L12"><b class=m>#[ts(type = "string")]</b></i><i id="L13"><b class=k>pub</b> <b class=k>struct</b> ThreadId {</i><i id="L14">    <b class=k>pub</b>(<b class=k>crate</b>) uuid: Uuid,</i><i id="L15">}</i><i id="L16"></i><i id="L17"><b class=k>impl</b> ThreadId {</i><i id="L18">    <b class=k>pub</b> <b class=k>fn</b> new() -&gt; <b class=k>Self</b> {</i><i id="L19">        <b class=k>Self</b> {</i><i id="L20">            uuid: Uuid::now_v7(),</i><i id="L21">        }</i><i id="L22">    }</i><i id="L23"></i><i id="L24">    <b class=k>pub</b> <b class=k>fn</b> from_string(s: &amp;str) -&gt; Result&lt;<b class=k>Self</b>, uuid::Error&gt; {</i><i id="L25">        Ok(<b class=k>Self</b> {</i><i id="L26">            uuid: Uuid::parse_str(s)?,</i><i id="L27">        })</i><i id="L28">    }</i><i id="L29">}</i><i id="L30"></i><i id="L31"><b class=k>impl</b> TryFrom&lt;&amp;str&gt; <b class=k>for</b> ThreadId {</i><i id="L32">    <b class=k>type</b> Error = uuid::Error;</i><i id="L33"></i><i id="L34">    <b class=k>fn</b> try_from(value: &amp;str) -&gt; Result&lt;<b class=k>Self</b>, <b class=k>Self</b>::Error&gt; {</i><i id="L35">        <b class=k>Self</b>::from_string(value)</i><i id="L36">    }</i><i id="L37">}</i><i id="L38"></i><i id="L39"><b class=k>impl</b> TryFrom&lt;String&gt; <b class=k>for</b> ThreadId {</i><i id="L40">    <b class=k>type</b> Error = uuid::Error;</i><i id="L41"></i><i id="L42">    <b class=k>fn</b> try_from(value: String) -&gt; Result&lt;<b class=k>Self</b>, <b class=k>Self</b>::Error&gt; {</i><i id="L43">        <b class=k>Self</b>::from_string(value.as_str())</i><i id="L44">    }</i><i id="L45">}</i><i id="L46"></i><i id="L47"><b class=k>impl</b> From&lt;ThreadId&gt; <b class=k>for</b> String {</i><i id="L48">    <b class=k>fn</b> from(value: ThreadId) -&gt; <b class=k>Self</b> {</i><i id="L49">        value.to_string()</i><i id="L50">    }</i><i id="L51">}</i><i id="L52"></i><i id="L53"><b class=k>impl</b> Default <b class=k>for</b> ThreadId {</i><i id="L54">    <b class=k>fn</b> default() -&gt; <b class=k>Self</b> {</i><i id="L55">        <b class=k>Self</b>::new()</i><i id="L56">    }</i><i id="L57">}</i><i id="L58"></i><i id="L59"><b class=k>impl</b> Display <b class=k>for</b> ThreadId {</i><i id="L60">    <b class=k>fn</b> fmt(&amp;<b class=k>self</b>, f: &amp;<b class=k>mut</b> std::fmt::Formatter&lt;<b class=m>'_</b>&gt;) -&gt; std::fmt::Result {</i><i id="L61">        Display::fmt(&amp;<b class=k>self</b>.uuid, f)</i><i id="L62">    }</i><i id="L63">}</i><i id="L64"></i><i id="L65"><b class=k>impl</b> Serialize <b class=k>for</b> ThreadId {</i><i id="L66">    <b class=k>fn</b> serialize&lt;S&gt;(&amp;<b class=k>self</b>, serializer: S) -&gt; Result&lt;S::Ok, S::Error&gt;</i><i id="L67">    <b class=k>where</b></i><i id="L68">        S: serde::Serializer,</i><i id="L69">    {</i><i id="L70">        serializer.collect_str(&amp;<b class=k>self</b>.uuid)</i><i id="L71">    }</i><i id="L72">}</i><i id="L73"></i><i id="L74"><b class=k>impl</b>&lt;<b class=m>'de</b>&gt; Deserialize&lt;<b class=m>'de</b>&gt; <b class=k>for</b> ThreadId {</i><i id="L75">    <b class=k>fn</b> deserialize&lt;D&gt;(deserializer: D) -&gt; Result&lt;<b class=k>Self</b>, D::Error&gt;</i><i id="L76">    <b class=k>where</b></i><i id="L77">        D: serde::Deserializer&lt;<b class=m>'de</b>&gt;,</i><i id="L78">    {</i><i id="L79">        <b class=k>let</b> value = String::deserialize(deserializer)?;</i><i id="L80">        <b class=k>let</b> uuid = Uuid::parse_str(&amp;value).map_err(serde::de::Error::custom)?;</i><i id="L81">        Ok(<b class=k>Self</b> { uuid })</i><i id="L82">    }</i><i id="L83">}</i><i id="L84"></i><i id="L85"><b class=k>impl</b> JsonSchema <b class=k>for</b> ThreadId {</i><i id="L86">    <b class=k>fn</b> schema_name() -&gt; String {</i><i id="L87">        <b class=s>"ThreadId"</b>.to_string()</i><i id="L88">    }</i><i id="L89"></i><i id="L90">    <b class=k>fn</b> json_schema(generator: &amp;<b class=k>mut</b> SchemaGenerator) -&gt; Schema {</i><i id="L91">        &lt;String&gt;::json_schema(generator)</i><i id="L92">    }</i><i id="L93">}</i><i id="L94"></i><i id="L95"><b class=m>#[cfg(test)]</b></i><i id="L96"><b class=k>mod</b> tests {</i><i id="L97">    <b class=k>use</b> <b class=k>super</b>::*;</i><i id="L98">    <b class=m>#[test]</b></i><i id="L99">    <b class=k>fn</b> test_thread_id_default_is_not_zeroes() {</i><i id="L100">        <b class=k>let</b> id = ThreadId::default();</i><i id="L101">        <b class=m>assert_ne!</b>(id.uuid, Uuid::nil());</i><i id="L102">    }</i><i id="L103">}</i></pre></div>
+</main>
+<script src="../../../assets/app.js"></script>
+</body>
+</html>

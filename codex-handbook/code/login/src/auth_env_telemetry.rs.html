@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>login/src/auth_env_telemetry.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">login/src/auth_env_telemetry.rs</code>
+<span class="code-meta">89 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=k>use</b> codex_model_provider_info::ModelProviderInfo;</i><i id="L2"><b class=k>use</b> codex_otel::AuthEnvTelemetryMetadata;</i><i id="L3"></i><i id="L4"><b class=k>use</b> <b class=k>crate</b>::CODEX_API_KEY_ENV_VAR;</i><i id="L5"><b class=k>use</b> <b class=k>crate</b>::OPENAI_API_KEY_ENV_VAR;</i><i id="L6"><b class=k>use</b> <b class=k>crate</b>::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;</i><i id="L7"></i><i id="L8"><b class=m>#[derive(Debug, Clone, Default, PartialEq, Eq)]</b></i><i id="L9"><b class=k>pub</b> <b class=k>struct</b> AuthEnvTelemetry {</i><i id="L10">    <b class=k>pub</b> openai_api_key_env_present: bool,</i><i id="L11">    <b class=k>pub</b> codex_api_key_env_present: bool,</i><i id="L12">    <b class=k>pub</b> codex_api_key_env_enabled: bool,</i><i id="L13">    <b class=k>pub</b> provider_env_key_name: Option&lt;String&gt;,</i><i id="L14">    <b class=k>pub</b> provider_env_key_present: Option&lt;bool&gt;,</i><i id="L15">    <b class=k>pub</b> refresh_token_url_override_present: bool,</i><i id="L16">}</i><i id="L17"></i><i id="L18"><b class=k>impl</b> AuthEnvTelemetry {</i><i id="L19">    <b class=k>pub</b> <b class=k>fn</b> to_otel_metadata(&amp;<b class=k>self</b>) -&gt; AuthEnvTelemetryMetadata {</i><i id="L20">        AuthEnvTelemetryMetadata {</i><i id="L21">            openai_api_key_env_present: <b class=k>self</b>.openai_api_key_env_present,</i><i id="L22">            codex_api_key_env_present: <b class=k>self</b>.codex_api_key_env_present,</i><i id="L23">            codex_api_key_env_enabled: <b class=k>self</b>.codex_api_key_env_enabled,</i><i id="L24">            provider_env_key_name: <b class=k>self</b>.provider_env_key_name.clone(),</i><i id="L25">            provider_env_key_present: <b class=k>self</b>.provider_env_key_present,</i><i id="L26">            refresh_token_url_override_present: <b class=k>self</b>.refresh_token_url_override_present,</i><i id="L27">        }</i><i id="L28">    }</i><i id="L29">}</i><i id="L30"></i><i id="L31"><b class=k>pub</b> <b class=k>fn</b> collect_auth_env_telemetry(</i><i id="L32">    provider: &amp;ModelProviderInfo,</i><i id="L33">    codex_api_key_env_enabled: bool,</i><i id="L34">) -&gt; AuthEnvTelemetry {</i><i id="L35">    AuthEnvTelemetry {</i><i id="L36">        openai_api_key_env_present: env_var_present(OPENAI_API_KEY_ENV_VAR),</i><i id="L37">        codex_api_key_env_present: env_var_present(CODEX_API_KEY_ENV_VAR),</i><i id="L38">        codex_api_key_env_enabled,</i><i id="L39">        provider_env_key_name: provider.env_key.as_ref().map(|_| <b class=s>"configured"</b>.to_string()),</i><i id="L40">        provider_env_key_present: provider.env_key.as_deref().map(env_var_present),</i><i id="L41">        refresh_token_url_override_present: env_var_present(REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR),</i><i id="L42">    }</i><i id="L43">}</i><i id="L44"></i><i id="L45"><b class=k>fn</b> env_var_present(name: &amp;str) -&gt; bool {</i><i id="L46">    <b class=k>match</b> std::env::var(name) {</i><i id="L47">        Ok(value) =&gt; !value.trim().is_empty(),</i><i id="L48">        Err(std::env::VarError::NotUnicode(_)) =&gt; <b class=k>true</b>,</i><i id="L49">        Err(std::env::VarError::NotPresent) =&gt; <b class=k>false</b>,</i><i id="L50">    }</i><i id="L51">}</i><i id="L52"></i><i id="L53"><b class=m>#[cfg(test)]</b></i><i id="L54"><b class=k>mod</b> tests {</i><i id="L55">    <b class=k>use</b> <b class=k>super</b>::*;</i><i id="L56">    <b class=k>use</b> codex_model_provider_info::WireApi;</i><i id="L57">    <b class=k>use</b> pretty_assertions::assert_eq;</i><i id="L58"></i><i id="L59">    <b class=m>#[test]</b></i><i id="L60">    <b class=k>fn</b> collect_auth_env_telemetry_buckets_provider_env_key_name() {</i><i id="L61">        <b class=k>let</b> provider = ModelProviderInfo {</i><i id="L62">            name: <b class=s>"Custom"</b>.to_string(),</i><i id="L63">            base_url: None,</i><i id="L64">            env_key: Some(<b class=s>"sk-should-not-leak"</b>.to_string()),</i><i id="L65">            env_key_instructions: None,</i><i id="L66">            experimental_bearer_token: None,</i><i id="L67">            auth: None,</i><i id="L68">            aws: None,</i><i id="L69">            wire_api: WireApi::Responses,</i><i id="L70">            query_params: None,</i><i id="L71">            http_headers: None,</i><i id="L72">            env_http_headers: None,</i><i id="L73">            request_max_retries: None,</i><i id="L74">            stream_max_retries: None,</i><i id="L75">            stream_idle_timeout_ms: None,</i><i id="L76">            websocket_connect_timeout_ms: None,</i><i id="L77">            requires_openai_auth: <b class=k>false</b>,</i><i id="L78">            supports_websockets: <b class=k>false</b>,</i><i id="L79">        };</i><i id="L80"></i><i id="L81">        <b class=k>let</b> telemetry =</i><i id="L82">            collect_auth_env_telemetry(&amp;provider, <b class=c>/*codex_api_key_env_enabled*/</b> <b class=k>false</b>);</i><i id="L83"></i><i id="L84">        <b class=m>assert_eq!</b>(</i><i id="L85">            telemetry.provider_env_key_name,</i><i id="L86">            Some(<b class=s>"configured"</b>.to_string())</i><i id="L87">        );</i><i id="L88">    }</i><i id="L89">}</i></pre></div>
+</main>
+<script src="../../../assets/app.js"></script>
+</body>
+</html>

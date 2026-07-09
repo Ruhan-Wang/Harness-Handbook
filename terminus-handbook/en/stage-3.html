@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-3 · Run Onset</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=en"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=en" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>Home</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>State-flow registers</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>Configuration Crystallization</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>Environment Setup</a></div><div class="s-leaf"><a class="s-link cur" href="stage-3.html"><span class="s-num">3</span>Run Onset</a></div><details class="s-node"><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>Iteration Loop</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>Loop Entry Gates</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>Proactive Summarize Probe</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM Query</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>Response Parse</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>Pending Handoff Prompt → User Step (or Split)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>Error Branch</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>Command Execute → Observation → Trajectory Step</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>Completion Gate + Loop Control</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>Parser internal helpers</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>Run Teardown</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>Recording Post-process (External)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>Context Summarization</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token &amp; Cost Accounting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>Output Length Limiting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>Logging</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux internal helpers</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">Index</a></nav><div class="stage-head"><h1>Run Onset</h1><div class="meta"><span class="chip mono">stage-3</span><span class="chip">3 functions</span></div></div>
+<h2 class="sec">Opening Explanation</h2>
+<p>This stage exists to turn a prepared environment into a clean, first-class run that the agent can actually reason over. Environment setup gave Terminus 2 a place to act. Run Onset makes that place usable for <em>this specific task</em>. It clears leftovers from any earlier run, captures the current terminal view, builds the full starting instruction, and records that starting point as the first item in the run’s trajectory (the canonical step-by-step record of what happened). This stage sits right before the core loop because the loop should only begin once the agent has a fresh identity, a clear prompt, and an accurate picture of the terminal. Without this stage, the loop would start half-blind and with stale state mixed in.</p>
+<h2 class="sec">Main Flow</h2>
+
+<ol><li><code> _reset_per_run_state()</code> (clear run-specific memory) runs first. <p>Its job is to wipe data that only makes sense for one run: old trajectory steps, counters, pending handoffs, subagent bookkeeping, timestamps, and the current session id. This matters because the same <code>Terminus2</code> instance can be reused. Without a reset here, one task could leak into the next.</p></li><li>A fresh <code>Chat(...)</code> object is created. <p>Chat is the thin wrapper around the LLM call. A new one is made here so the upcoming run has its own clean conversation context rather than inheriting transient state from a prior run.</p></li><li>The agent captures the initial terminal screen with <code>session.get_incremental_output()</code>. <p>This is the agent’s first real observation. The terminal is the world it acts in, so the loop should start from what is actually on screen now, not from assumptions.</p></li><li>The user instruction is expanded before the first prompt is built. <p>If MCP servers are present, their description is added. MCP servers are external tools exposed to the agent through a standard interface. Then <code>_build_skills_section()</code> (assemble the dynamic list of available skills) adds the current capabilities the agent can use. This matters because the model should know both the task and the tools it has before it plans.</p></li><li>The initial prompt is formatted from the instruction plus terminal state. <p>This creates the starting package the model will reason over: what to do, what tools exist, and what the terminal currently looks like.</p></li><li>That prompt is written as trajectory step 1 with <code>source="user"</code>. <p>This is important for traceability. The run now has an explicit starting record, so later steps can be understood relative to a known beginning.</p></li><li>Only then does control pass into the iteration loop, wrapped in <code>try</code>/<code>finally</code>. <p>The key idea is that the core loop should begin only after initialization is complete and the run has a durable starting record.</p></li></ol>
+<h2 class="sec"> State Flow</h2>
+<ul><li>writes: <a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — writes the initial prompt as step 1 so the run has a canonical starting record</li><li>reads: <a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — this stage treats it as prior-run data that must not carry forward</li><li>clears: <a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — <code>_reset_per_run_state()</code> clears it so stale history does not leak into the new run</li><li>triggers downstream: <code>stage-4 Iteration Loop ★ Core ★</code> — once reset, prompt construction, and initial observation are complete</li></ul>
+<h2 class="sec">Pipeline Hand-Off</h2>
+<p>Upstream gives this stage a ready environment: the terminal/session exists, but it is not yet packaged as a fresh run. This stage turns that into a clean run start — fresh per-run state, a complete initial prompt, the first terminal snapshot, and trajectory step 1 — which the iteration loop then consumes as the basis for all further thinking and action.</p><div class="files-bar"><h2 class="sec">Functions<span class="pill">3</span></h2><span class="spacer"></span><button class="tool" data-x="expand">Expand all</button><button class="tool" data-x="collapse">Collapse all</button></div><details class="file" id="fn-terminus2_reset_per_run_state"><summary><span class="chev"></span><code class="fpath">Terminus2._reset_per_run_state</code><a class="fn-range" href="../code/terminus_2.py.html#L1563-L1578" title="terminus_2.py:1563-1578">terminus_2.py:1563–1578 ↗</a></summary><div class="file-body"><p class="fn-sub">Per-run state reset and session id selection</p>
+<blockquote><p><strong>Stage context</strong>: This helper opens <a href="stage-3.html">stage-3</a> by clearing state that must not leak across separate <code>Terminus2.run()</code> invocations. <code>Terminus2.run</code> calls it before it creates the fresh <code>Chat</code>, captures terminal output, and seeds the initial prompt. In this stage, it is the boundary between long-lived instance configuration and run-scoped accumulators.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_reset_per_run_state</code> reinitializes all run-scoped fields on <code>self</code> before a new <code>run()</code> begins. It takes no inputs beyond <code>self</code>, reads <code>_user_provided_session_id</code>, and overwrites the trajectory list, timing list, counters, pending handoff/completion state, marker storage, subagent tracking, and <code>_session_id</code>. Its only product is this reset state on the reused <code>Terminus2</code> instance.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self) -&gt; None</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — The <code>Terminus2</code> instance whose run-scoped state is being reinitialized.</li><li>reads: <code>self._user_provided_session_id</code></li><li>returns: Returns <code>None</code>; it prepares a clean per-run state on <code>self</code> for the upcoming <code>run()</code> invocation.</li><li>effects: Writes <code>self._trajectory_steps</code>; Writes <code>self._api_request_times</code>; Writes <code>self._n_episodes</code>; Writes <code>self._summarization_count</code>; Writes <code>self._subagent_metrics</code>; Writes <code>self._subagent_rollout_details</code>; Writes <code>self._pending_completion</code>; Writes <code>self._pending_subagent_refs</code>; Writes <code>self._pending_handoff_prompt</code>; Writes <code>self._timestamped_markers</code>; Writes <code>self._session_id</code>; Constructs a new <code>SubagentMetrics()</code> instance; May generate a UUID via <code>uuid.uuid4()</code> when no user session id is supplied</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Replace per-run collection fields with empty containers: <code>_trajectory_steps</code>, <code>_api_request_times</code>, <code>_subagent_rollout_details</code>, and <code>_timestamped_markers</code> become fresh empty lists.</li><li>Reset run counters to their starting values by setting <code>_n_episodes</code> and <code>_summarization_count</code> to <code>0</code>.</li><li>Replace <code>_subagent_metrics</code> with a new <code>SubagentMetrics()</code> accumulator for this run.</li><li>Clear cross-iteration pending state by setting <code>_pending_completion</code> to <code>False</code> and <code>_pending_subagent_refs</code> and <code>_pending_handoff_prompt</code> to <code>None</code>.</li><li>Choose the run's session id by reusing <code>_user_provided_session_id</code> when it is truthy, otherwise generating <code>str(uuid.uuid4())</code> and storing it in <code>_session_id</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _reset_per_run_state(self) -&gt; None:
+        """Reset all per-run state. The same Terminus2 instance is reused
+        across multiple `run()` invocations in multi-step trials, so any
+        accumulator that should be scoped to a single step must be reset here.
+        """
+        self._trajectory_steps = []
+        self._api_request_times = []
+        self._n_episodes = 0
+        self._summarization_count = 0
+        self._subagent_metrics = SubagentMetrics()
+        self._subagent_rollout_details = []
+        self._pending_completion = False
+        self._pending_subagent_refs = None
+        self._pending_handoff_prompt = None
+        self._timestamped_markers = []
+        self._session_id = self._user_provided_session_id or str(uuid.uuid4())</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The function centralizes all run-scoped resets in one place because the class instance survives across multiple <code>run()</code> calls. Without this dedicated scrub step, old <code>_trajectory_steps</code>, counters, or pending flags could bleed into the next trial step.</li><li>It creates fresh containers and a fresh <code>SubagentMetrics()</code> object instead of trying to clear nested state in place. That avoids carrying over references or partially reset subagent accounting.</li><li>It preserves a caller-supplied <code>_user_provided_session_id</code> but falls back to a generated UUID when none is present. This balances stable external session naming with automatic uniqueness for ordinary runs.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Terminus2.run</li><li><strong>Core callees</strong>: SubagentMetrics; uuid.uuid4</li><li><strong>Config / state sources</strong>: self._user_provided_session_id</li><li><strong>Results to</strong>: <a href="stage-3.html">stage-3</a> <code>Terminus2.run</code> setup that constructs a fresh <code>Chat</code>; <a href="stage-3.html">stage-3</a> initial prompt seeding into <code>_trajectory_steps</code>; <a href="stage-4.html">stage-4</a> iteration loop, which starts counting episodes from <code>_n_episodes == 0</code>; <a href="stage-4.5.html">stage-4.5</a> / 4.6 / 4.8 / 4.9, which append new run data into cleared accumulators; <a href="stage-5.html">stage-5</a> metadata and totals assembly, which reads per-run counters and timings</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-pending-completion"><code>reg-pending-completion</code></a> — start new run with no completion pending</li><li><a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — clear stale summary handoff prompt</li><li><a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a> — clear stale subagent trajectory refs</li><li><a class="reg" href="registers.html#reg-n-episodes"><code>reg-n-episodes</code></a> — restart iteration counter at zero</li><li><a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — restart summarization count for run</li><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — begin fresh trajectory for this run</li><li><a class="reg" href="registers.html#reg-asciinema-markers"><code>reg-asciinema-markers</code></a> — discard markers from prior run</li><li><a class="reg" href="registers.html#reg-subagent-metrics"><code>reg-subagent-metrics</code></a> — replace subagent accounting accumulator</li><li><a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — clear per-request timing history</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_run"><summary><span class="chev"></span><code class="fpath">Terminus2.run</code><a class="fn-range" href="../code/terminus_2.py.html#L1586-L1625" title="terminus_2.py:1586-1625">terminus_2.py:1586–1625 ↗</a></summary><div class="file-body"><p class="fn-sub">run setup and initial prompt seeding</p>
+<blockquote><p><strong>Stage context</strong>: This region performs the front half of <code>Terminus2.run()</code> before the main iteration loop starts. It follows <code>Terminus2._reset_per_run_state</code>, then establishes the fresh chat/session context and seeds the first trajectory entry that the loop will build on. Within stage 3, it is the bridge from reset state to a fully prepared first prompt.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>This region prepares a new run from the current <code>instruction</code>, <code>environment</code>, and <code>context</code>. It resets run-scoped state, creates a fresh <code>Chat</code> in <code>self._chat</code>, verifies that <code>self._session</code> exists, captures the current terminal output, augments the instruction with <code>mcp_servers</code> details and <code>_build_skills_section(environment)</code>, formats <code>_prompt_template</code>, and records that formatted prompt as the first <code>Step</code> in <code>_trajectory_steps</code>. It does not return a value; its product is initialized run state plus an initial user-authored trajectory record.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, instruction: str, environment: dict[str, str], context: ContextT) -&gt; TrialT</code></p>
+<ul><li>params: <code>self</code>: <code>Terminus2</code> — runner instance that owns session, prompt, and run-scoped state; <code>instruction</code>: <code>str</code> — base task instruction to augment and embed in the initial prompt; <code>environment</code>: <code>dict[str, str]</code> — environment mapping passed into <code>_build_skills_section</code>; <code>context</code>: <code>ContextT</code> — per-run context object stored on <code>self._context</code></li><li>reads: <code>self._llm</code>, <code>self._interleaved_thinking</code>, <code>self._session</code>, <code>self.mcp_servers</code>, <code>self._prompt_template</code>, <code>self._trajectory_steps</code></li><li>returns: No direct return in this region; it produces initialized run state on <code>self</code>, a formatted initial prompt, and the first appended trajectory step.</li><li>effects: calls <code>self._reset_per_run_state()</code> to clear and rotate run-local state; writes <code>self._chat</code> with a new <code>Chat(self._llm, interleaved_thinking=self._interleaved_thinking)</code>; writes <code>self._context</code>; awaits <code>self._session.get_incremental_output()</code> to read external terminal state; calls <code>self._limit_output_length(...)</code> to truncate terminal output for prompting; awaits <code>self._build_skills_section(environment)</code>; appends a new <code>Step(...)</code> to <code>self._trajectory_steps</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Reset run-scoped fields with <code>self._reset_per_run_state()</code>, create a fresh <code>Chat</code> in <code>self._chat</code> from <code>_llm</code> and <code>_interleaved_thinking</code>, and store the incoming <code>context</code> on <code>self._context</code>.</li><li>Validate that <code>self._session</code> is present; if it is <code>None</code>, stop immediately with <code>RuntimeError("Session is not set")</code>.</li><li>Read the current terminal snapshot by awaiting <code>self._session.get_incremental_output()</code>, then pass that output through <code>_limit_output_length(...)</code> to produce <code>terminal_state</code> for the first prompt.</li><li>Start from <code>instruction</code> as <code>augmented_instruction</code>, and if <code>self.mcp_servers</code> is non-empty, append a generated <code>MCP Servers:</code> section that describes each server from its <code>name</code>, <code>transport</code>, and either <code>command</code> plus <code>args</code> or <code>url</code>.</li><li>Build a dynamic skills block with <code>await self._build_skills_section(environment)</code> and append it to <code>augmented_instruction</code> when the returned <code>skills_section</code> is truthy.</li><li>Format <code>self._prompt_template</code> with <code>instruction=augmented_instruction</code> and <code>terminal_state=terminal_state</code>, then append that prompt to <code>self._trajectory_steps</code> as <code>Step(step_id=1, source="user", ...)</code> with a UTC ISO timestamp.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>        self._reset_per_run_state()
+        self._chat = Chat(self._llm, interleaved_thinking=self._interleaved_thinking)
+        self._context = context
+
+        if self._session is None:
+            raise RuntimeError("Session is not set")
+
+        # Get the terminal state for the initial prompt
+        terminal_state = self._limit_output_length(
+            await self._session.get_incremental_output()
+        )
+
+        augmented_instruction = instruction
+        if self.mcp_servers:
+            mcp_info = "\n\nMCP Servers:\nThe following MCP servers are available for this task.\n"
+            for s in self.mcp_servers:
+                if s.transport == "stdio":
+                    args_str = " ".join(s.args)
+                    mcp_info += f"- {s.name}: stdio transport, command: {s.command} {args_str}\n"
+                else:
+                    mcp_info += f"- {s.name}: {s.transport} transport, url: {s.url}\n"
+            augmented_instruction = instruction + mcp_info
+
+        skills_section = await self._build_skills_section(environment)
+        if skills_section:
+            augmented_instruction += skills_section
+
+        initial_prompt = self._prompt_template.format(
+            instruction=augmented_instruction,
+            terminal_state=terminal_state,
+        )
+
+        self._trajectory_steps.append(
+            Step(
+                step_id=1,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                source="user",
+                message=initial_prompt,
+            )
+        )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It creates a brand-new <code>Chat</code> after <code>_reset_per_run_state()</code> instead of reusing an existing one. That keeps <code>chat.messages</code> isolated per run; reuse would risk carrying old model history into a new trial.</li><li>It raises on <code>self._session is None</code> before prompt construction. That fails fast at the first point where terminal state is required; a later failure would leave partially initialized run state and a misleading first prompt.</li><li>It captures terminal output through <code>_limit_output_length(await self._session.get_incremental_output())</code> before formatting <code>_prompt_template</code>. This bounds prompt size using a dedicated limiter instead of embedding raw terminal output, which would make prompt growth depend directly on session backlog.</li><li>It embeds <code>mcp_servers</code> and <code>_build_skills_section(environment)</code> into the instruction text itself rather than storing them separately on the step. That makes the exact prompt content visible in the first trajectory <code>Step</code>, at the cost of duplicating derived context into the recorded message.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>Terminus2.run</code></li><li><strong>Core callees</strong>: <code>Terminus2._reset_per_run_state</code>; <code>Chat</code>; <code>Terminus2._limit_output_length</code>; <code>TmuxSession.get_incremental_output</code> via <code>self._session</code>; <code>Terminus2._build_skills_section</code>; <code>self._prompt_template.format</code>; <code>Step</code></li><li><strong>Config / state sources</strong>: <code>self._llm</code>; <code>self._interleaved_thinking</code>; <code>self.mcp_servers</code>; <code>self._prompt_template</code>; <code>self._session</code></li><li><strong>Results to</strong>: <code>self._chat</code> for later LLM interaction; <code>self._context</code> for later run stages; <code>self._trajectory_steps</code> as the seed of the run record; the subsequent iteration loop in <code>Terminus2.run</code></li><li><strong>Related siblings</strong>: <code>Terminus2._reset_per_run_state</code>: clears all run-scoped registers before this region seeds fresh state</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-pending-completion"><code>reg-pending-completion</code></a> — cleared indirectly by <code>_reset_per_run_state</code></li><li><a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — cleared indirectly by <code>_reset_per_run_state</code></li><li><a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a> — cleared indirectly by <code>_reset_per_run_state</code></li><li><a class="reg" href="registers.html#reg-n-episodes"><code>reg-n-episodes</code></a> — zeroed indirectly by <code>_reset_per_run_state</code></li><li><a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — zeroed indirectly by <code>_reset_per_run_state</code></li><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — cleared before seeding first step</li><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — append initial prompt as user step</li><li><a class="reg" href="registers.html#reg-asciinema-markers"><code>reg-asciinema-markers</code></a> — cleared indirectly by <code>_reset_per_run_state</code></li><li><a class="reg" href="registers.html#reg-subagent-metrics"><code>reg-subagent-metrics</code></a> — cleared indirectly by <code>_reset_per_run_state</code></li><li><a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — cleared indirectly by <code>_reset_per_run_state</code></li></ul></div>
+</div></details><details class="file" id="fn-terminus2_build_skills_section"><summary><span class="chev"></span><code class="fpath">Terminus2._build_skills_section</code><a class="fn-range" href="../code/terminus_2.py.html#L419-L470" title="terminus_2.py:419-470">terminus_2.py:419–470 ↗</a></summary><div class="file-body"><p class="fn-sub">Remote skills XML section builder</p>
+<blockquote><p><strong>Stage context</strong>: This helper runs during <a href="stage-3.html">stage-3</a> prompt assembly, before <code>Terminus2.run()</code> enters its main loop. <code>run()</code> uses it alongside MCP-server augmentation to expand the initial instruction text. Unlike <code>_reset_per_run_state</code>, it does not prepare mutable run state; it only probes the provided <code>environment</code> and returns optional prompt content.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_build_skills_section</code> inspects <code>self.skills_dir</code> in the given <code>environment</code> and looks for <code>SKILL.md</code> files one directory below it. For each discovered file, it reads the file content, parses frontmatter through <code>self._parse_skill_frontmatter</code>, and collects <code>(fm["name"], fm["description"], skill_md_path)</code> entries. It returns <code>None</code> when <code>self.skills_dir</code> is falsy, <code>environment.is_dir(self.skills_dir)</code> is false, the <code>find</code> command fails or yields blank output, or no files survive the <code>cat</code> and frontmatter checks. Otherwise it returns an indented <code>&lt;available_skills&gt;</code> XML string and does not mutate instance state.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, environment: BaseEnvironment) -&gt; str | None</code></p>
+<ul><li>params: <code>environment</code>: <code>BaseEnvironment</code> — Remote filesystem and command-execution backend used for directory checks and file reads</li><li>reads: <code>self.skills_dir</code>, <code>self._parse_skill_frontmatter</code></li><li>returns: <code>None</code> for all early-exit cases, or a newline-prefixed XML string from <code>xml.etree.ElementTree.tostring(...)</code> containing one <code>&lt;skill&gt;</code> per surviving entry</li><li>effects: Calls <code>environment.is_dir(self.skills_dir)</code>; Runs <code>environment.exec(..., timeout_sec=10)</code> with a <code>find ... -name SKILL.md -type f | sort</code> command; Runs <code>environment.exec(f"cat {shlex.quote(skill_md_path)}", timeout_sec=10)</code> for each discovered path</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Return <code>None</code> immediately if <code>self.skills_dir</code> is falsy, then return <code>None</code> again if <code>await environment.is_dir(self.skills_dir)</code> is false.</li><li>Scan the remote directory by calling <code>environment.exec(...)</code> with <code>find {shlex.quote(self.skills_dir)} -mindepth 2 -maxdepth 2 -name SKILL.md -type f | sort</code> and <code>timeout_sec=10</code>; return <code>None</code> if the command fails, if <code>stdout</code> is missing, or if <code>stdout.strip()</code> is empty.</li><li>Split the <code>find</code> output into <code>skill_md_paths</code>, initialize <code>entries</code>, and for each path run <code>environment.exec(f"cat {shlex.quote(skill_md_path)}", timeout_sec=10)</code>.</li><li>Skip a path when <code>cat_result.return_code != 0</code> or <code>cat_result.stdout</code> is falsy; otherwise parse the file text with <code>self._parse_skill_frontmatter(cat_result.stdout)</code> and skip the path again if that parser returns <code>None</code>.</li><li>For each successful parse, append exactly <code>(fm["name"], fm["description"], skill_md_path)</code> to <code>entries</code>.</li><li>Return <code>None</code> if <code>entries</code> is empty; otherwise import <code>Element</code>, <code>SubElement</code>, <code>indent</code>, and <code>tostring</code>, build an <code>&lt;available_skills&gt;</code> tree with <code>&lt;name&gt;</code>, <code>&lt;description&gt;</code>, and <code>&lt;location&gt;</code> children, indent it with two spaces, and return <code>"\n" + tostring(root, encoding="unicode")</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    async def _build_skills_section(self, environment: BaseEnvironment) -&gt; str | None:
+        """Discover Agent Skills in skills_dir and return an &lt;available_skills&gt; XML block.
+
+        Follows the Agent Skills spec: scans for subdirectories containing SKILL.md
+        inside the remote environment, parses YAML frontmatter for name/description,
+        and provides the absolute path so the model can ``cat`` the file to activate
+        a skill.
+        """
+        if not self.skills_dir:
+            return None
+
+        if not await environment.is_dir(self.skills_dir):
+            return None
+
+        # List subdirectories containing SKILL.md in the remote environment
+        result = await environment.exec(
+            f"find {shlex.quote(self.skills_dir)} -mindepth 2 -maxdepth 2"
+            " -name SKILL.md -type f | sort",
+            timeout_sec=10,
+        )
+
+        if result.return_code != 0 or not result.stdout or not result.stdout.strip():
+            return None
+
+        skill_md_paths = result.stdout.strip().splitlines()
+        entries: list[tuple[str, str, str]] = []  # (name, description, location)
+
+        for skill_md_path in skill_md_paths:
+            cat_result = await environment.exec(
+                f"cat {shlex.quote(skill_md_path)}", timeout_sec=10
+            )
+            if cat_result.return_code != 0 or not cat_result.stdout:
+                continue
+            fm = self._parse_skill_frontmatter(cat_result.stdout)
+            if fm is None:
+                continue
+            entries.append((fm["name"], fm["description"], skill_md_path))
+
+        if not entries:
+            return None
+
+        from xml.etree.ElementTree import Element, SubElement, indent, tostring
+
+        root = Element("available_skills")
+        for name, description, location in entries:
+            skill = SubElement(root, "skill")
+            SubElement(skill, "name").text = name
+            SubElement(skill, "description").text = description
+            SubElement(skill, "location").text = location
+
+        indent(root, space="  ")
+        return "\n" + tostring(root, encoding="unicode")</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The function treats every discovery problem as absence, not as an exception path. The repeated <code>return None</code> checks around <code>self.skills_dir</code>, <code>environment.is_dir(...)</code>, the <code>find</code> result, <code>cat</code> results, and <code>self._parse_skill_frontmatter(...)</code> keep prompt construction tolerant of missing or unusable skill data instead of making <code>run()</code> fail.</li><li>It performs all discovery through <code>environment.exec(...)</code> and <code>environment.is_dir(...)</code> instead of local filesystem APIs. That choice keeps the scan aligned with the remote execution context that owns <code>skills_dir</code>; using local file access here would inspect the wrong machine.</li><li>It preserves the discovered <code>skill_md_path</code> verbatim in the <code>&lt;location&gt;</code> element. The code does not normalize or reinterpret the path, which avoids inventing path semantics and makes the XML reflect exactly what the remote <code>find</code> command returned.</li><li>The XML helpers are imported only after <code>if not entries: return None</code>. That defers XML-tree setup work to the only path that needs it and keeps the no-skills path cheap.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Terminus2.run</li><li><strong>Core callees</strong>: environment.is_dir; environment.exec; self._parse_skill_frontmatter; shlex.quote; xml.etree.ElementTree.Element; xml.etree.ElementTree.SubElement; xml.etree.ElementTree.indent; xml.etree.ElementTree.tostring</li><li><strong>Config / state sources</strong>: self.skills_dir</li><li><strong>Results to</strong>: Terminus2.run uses the returned string from <code>_build_skills_section(environment)</code> while augmenting the initial instruction</li><li><strong>Related siblings</strong>: Terminus2.run; Terminus2._reset_per_run_state</li></ul></div></details><nav class="pn"><a class="pn-prev" href="stage-2.html"><span>← Previous</span><strong>Environment Setup</strong></a><a class="pn-next" href="stage-4.html"><span>Next →</span><strong>Iteration Loop</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

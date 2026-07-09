@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>utils/image/src/error.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">utils/image/src/error.rs</code>
+<span class="code-meta">63 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=k>use</b> image::ImageError;</i><i id="L2"><b class=k>use</b> image::ImageFormat;</i><i id="L3"><b class=k>use</b> std::path::PathBuf;</i><i id="L4"><b class=k>use</b> thiserror::Error;</i><i id="L5"></i><i id="L6"><b class=m>#[derive(Debug, Error)]</b></i><i id="L7"><b class=k>pub</b> <b class=k>enum</b> ImageProcessingError {</i><i id="L8">    <b class=m>#[error("failed to read image at {path}: {source}")]</b></i><i id="L9">    Read {</i><i id="L10">        path: PathBuf,</i><i id="L11">        <b class=m>#[source]</b></i><i id="L12">        source: std::io::Error,</i><i id="L13">    },</i><i id="L14">    <b class=m>#[error("failed to decode image at {path}: {source}")]</b></i><i id="L15">    Decode {</i><i id="L16">        path: PathBuf,</i><i id="L17">        <b class=m>#[source]</b></i><i id="L18">        source: image::ImageError,</i><i id="L19">    },</i><i id="L20">    <b class=m>#[error("failed to encode image as {format:?}: {source}")]</b></i><i id="L21">    Encode {</i><i id="L22">        format: ImageFormat,</i><i id="L23">        <b class=m>#[source]</b></i><i id="L24">        source: image::ImageError,</i><i id="L25">    },</i><i id="L26">    <b class=m>#[error("unsupported image `{mime}`")]</b></i><i id="L27">    UnsupportedImageFormat { mime: String },</i><i id="L28">    <b class=m>#[error("invalid image data URL: {reason}")]</b></i><i id="L29">    InvalidDataUrl { reason: String },</i><i id="L30">    <b class=m>#[error("image {representation} is too large ({size} bytes; max {max} bytes)")]</b></i><i id="L31">    ImageTooLarge {</i><i id="L32">        representation: &amp;<b class=m>'static</b> str,</i><i id="L33">        size: usize,</i><i id="L34">        max: usize,</i><i id="L35">    },</i><i id="L36">}</i><i id="L37"></i><i id="L38"><b class=k>impl</b> ImageProcessingError {</i><i id="L39">    <b class=k>pub</b> <b class=k>fn</b> decode_error(path: &amp;std::path::Path, source: image::ImageError) -&gt; <b class=k>Self</b> {</i><i id="L40">        <b class=k>if</b> <b class=m>matches!</b>(source, ImageError::Decoding(_)) {</i><i id="L41">            <b class=k>return</b> ImageProcessingError::Decode {</i><i id="L42">                path: path.to_path_buf(),</i><i id="L43">                source,</i><i id="L44">            };</i><i id="L45">        }</i><i id="L46"></i><i id="L47">        <b class=k>let</b> mime = mime_guess::from_path(path)</i><i id="L48">            .first()</i><i id="L49">            .map(|mime_guess| mime_guess.essence_str().to_owned())</i><i id="L50">            .unwrap_or_else(|| <b class=s>"unknown"</b>.to_string());</i><i id="L51">        ImageProcessingError::UnsupportedImageFormat { mime }</i><i id="L52">    }</i><i id="L53"></i><i id="L54">    <b class=k>pub</b> <b class=k>fn</b> is_invalid_image(&amp;<b class=k>self</b>) -&gt; bool {</i><i id="L55">        <b class=m>matches!</b>(</i><i id="L56">            <b class=k>self</b>,</i><i id="L57">            ImageProcessingError::Decode {</i><i id="L58">                source: ImageError::Decoding(_),</i><i id="L59">                ..</i><i id="L60">            }</i><i id="L61">        )</i><i id="L62">    }</i><i id="L63">}</i></pre></div>
+</main>
+<script src="../../../../assets/app.js"></script>
+</body>
+</html>

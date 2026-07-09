@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-4.3 · LLM 调用</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=zh"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 手册</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=zh" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>返回主页</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>状态流寄存器</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>配置固化</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>环境搭建</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>运行起点</a></div><details class="s-node" open><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>迭代主循环</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>循环入口门控</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>主动摘要探测</a></div><div class="s-leaf"><a class="s-link cur" href="stage-4.3.html"><span class="s-num">4.3</span>LLM 调用</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>响应解析</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>待交接提示 → 用户步骤(或切分)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>错误分支</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>命令执行 → 观察 → 轨迹步骤</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>完成门控与循环控制</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>解析器内部辅助</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>运行收尾</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>录制后处理(外部)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>上下文摘要</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token 与成本核算</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>输出长度限制</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>日志</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux 内部辅助</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">索引</a><span class="sep">›</span><a href="stage-4.html">迭代主循环</a></nav><div class="stage-head"><h1>LLM 调用</h1><div class="meta"><span class="chip mono">stage-4.3</span><span class="chip">LLM Query</span><span class="chip">6 个函数</span></div></div><p>LLM Query Stage 的存在，是为了把前面准备好的上下文真正送进 LLM（大语言模型），并尽量稳地拿回一条“还能继续往下走”的回复。它不只是一次普通请求，而是整个循环里的抗故障层：记日志、记成本、处理上下文太长、处理输出被截断、必要时降级兜底。它位于“预判是否要先总结”之后、“正式解析回复”之前，负责把一次脆弱的模型调用变成可继续运行的结果。</p>
+<ol><li>先给这次对话开好记录位。 <p><code>_setup_episode_logging()</code>（为本轮 episode 准备专属日志路径）会先把日志文件位置定下来。原因很简单：LLM 调用最容易出问题，也最贵，必须能按轮次回看。与此同时，这个 Stage 还会记下调用前的 token 和 cost 基线，方便后面算“这次到底花了多少”。</p></li><li>然后真正去问模型。 <p><code>_handle_llm_interaction()</code>（包一层 LLM 交互入口）会把请求交给 <code>_query_llm()</code>（真正发起模型调用并处理异常）。这一层的职责不是“调用一下 API”这么简单，而是确保调用结果可用、可追踪、可恢复。成功时，它会留下耗时记录，产出一条给下游解析的原始回复。</p></li><li>如果上下文太长，就当场减负，而不是直接失败。 <p>当出现 <code>ContextLengthExceededError</code>（上下文超出模型可接收长度）时，系统会先用 <code>_unwind_messages_to_free_tokens()</code>（回卷部分消息，腾出 token 空间）给提示词瘦身。 如果还不够，就走三层兜底总结：</p>
+<ul><li>先尝试完整 <code>_summarize</code> </li><li>再退到一次性短总结 </li><li>最后连 LLM 总结都不依赖，只用一个“无 LLM”版本的 handoff 提示，加上一段终端尾部信息 这样设计的原因是：上下文过长是长期运行 Agent 的常态，不应让整轮崩掉。哪怕信息压缩得粗一些，也要尽量保住“继续做事”的能力。</li></ul></li><li>如果模型输出被截断，就尽量抢救，而不是整条作废。 <p>当出现 <code>OutputLengthExceededError</code>（输出太长被截断）时，会先试 <code>parser.salvage_truncated_response</code>（让解析器抢救残缺回复）。这里主要是 XML parser（XML 解析器）有能力从半截结构里捞出可用部分。 如果抢救不了，系统会回给 LLM 一条“你刚才输出被截断了，请按规则重来”的提示，再递归重试。 这一步的意义在于：模型有时已经给出了大半有效答案，直接丢掉会浪费调用和上下文。</p></li><li>其他临时性失败，就重试，不把偶发错误当致命错误。 <p><code>_query_llm()</code> 外面有 <code>@retry</code>（自动重试装饰器，基于 tenacity）兜住其他异常，最多重试 3 次。因为网络抖动、供应商瞬时故障、偶发解析问题，都不值得让 Agent 立刻停机。</p></li><li>在异常路径里，顺手把“交接材料”补上。 <p>如果是被动触发的长上下文处理，这个 Stage 也会写好 pending handoff prompt（待交接提示）。这样后面即使需要切历史、加一步用户消息、或者把长上下文拆开，系统也已经备好了可交接的摘要，不用等到更后面才发现“材料不够”。</p></li></ol>
+<ul><li>写: <a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — 每次实际发起 LLM 调用并返回或进入相应 try 路径时追加耗时；用来记录模型响应时间，后面会进入元数据统计</li><li>写: <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — 当 <code>ContextLengthExceededError</code> 触发被动总结/降级总结时写入；目的是为后续历史切分或交接准备一份可直接使用的摘要提示</li><li>读: <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — 本 Stage 不直接消费，但会判断并补写这份“待交接材料”，确保后续有可用输入</li><li>触发下游: <code>stage-4.4 Response Parse</code> — 只要拿到了可用的 LLM 原始回复（正常返回、截断抢救成功、或重试后成功），就进入解析阶段</li></ul>
+<p>上一阶段 <a href="stage-4.2.html">stage-4.2</a> 已经提前探测过“要不要先总结”，尽量避免把超长上下文直接送去模型。本 Stage 接手真正的调用，并在探测失手时做最后一道补救，产出的是“尽可能完整、可解析”的模型回复，以及必要时补齐的 handoff 摘要；下游 <a href="stage-4.4.html">stage-4.4</a> 会把这条原始回复拆成结构化动作。</p><div class="files-bar"><h2 class="sec">函数细节<span class="pill">6</span></h2><span class="spacer"></span><button class="tool" data-x="expand">全部展开</button><button class="tool" data-x="collapse">全部折叠</button></div><details class="file" id="fn-terminus2_setup_episode_logging"><summary><span class="chev"></span><code class="fpath">Terminus2._setup_episode_logging</code><a class="fn-range" href="../code/terminus_2.py.html#L509-L522" title="terminus_2.py:509-522">terminus_2.py:509–522 ↗</a></summary><div class="file-body"><p class="fn-sub">构造单次 episode 日志路径</p>
+<blockquote><p><strong>stage 上下文</strong>: 该单元是一个很小的路径准备辅助函数，只负责把 <code>logging_dir</code> 与 <code>episode</code> 组合成固定目录与文件名。它不读取任何 <code>self._*</code> 状态，也不直接写入日志内容；与同 stage 里后续更复杂的 LLM 交互逻辑相比，这里仅提供可复用的路径约定与目录创建。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收 <code>logging_dir</code> 与 <code>episode</code>，返回三个 <code>Path | None</code> 值。若 <code>logging_dir is None</code>，直接返回 <code>(None, None, None)</code>；否则创建子目录 <code>episode-{episode}</code>，并返回其下的 <code>debug.json</code>、<code>prompt.txt</code>、<code>response.txt</code> 三个路径对象。其唯一外部副作用是按需创建目录。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, logging_dir: Path | None, episode: int) -&gt; tuple[Path | None, Path | None, Path | None]</code></p>
+<ul><li>参数: <code>logging_dir</code>: <code>Path | None</code> — 日志根目录；为 <code>None</code> 时表示禁用该路径准备逻辑; <code>episode</code>: <code>int</code> — 用于拼接子目录名 <code>episode-{episode}</code></li><li>返回: 返回一个三元组：若 <code>logging_dir is None</code> 则为 <code>(None, None, None)</code>；否则为 <code>episode_logging_dir / "debug.json"</code>、<code>episode_logging_dir / "prompt.txt"</code>、<code>episode_logging_dir / "response.txt"</code> 三个 <code>Path</code> 对象。</li><li>副作用: 当 <code>logging_dir</code> 非空时，在文件系统上执行 <code>episode_logging_dir.mkdir(parents=True, exist_ok=True)</code> 创建目录</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>首先检查 <code>logging_dir is None</code>；若成立，立即返回三个 <code>None</code>，不进行任何目录操作。</li><li>若提供了 <code>logging_dir</code>，则构造子目录路径 <code>logging_dir / f"episode-{episode}"</code>。</li><li>对该子目录调用 <code>mkdir(parents=True, exist_ok=True)</code>，确保目录存在。</li><li>最后返回该子目录下的三个具体文件路径：<code>debug.json</code>、<code>prompt.txt</code>、<code>response.txt</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _setup_episode_logging(
+        self, logging_dir: Path | None, episode: int
+    ) -&gt; tuple[Path | None, Path | None, Path | None]:
+        if logging_dir is None:
+            return None, None, None
+
+        episode_logging_dir = logging_dir / f"episode-{episode}"
+        episode_logging_dir.mkdir(parents=True, exist_ok=True)
+
+        return (
+            episode_logging_dir / "debug.json",
+            episode_logging_dir / "prompt.txt",
+            episode_logging_dir / "response.txt",
+        )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>代码显式把 <code>None</code> 作为禁用分支：通过 <code>if logging_dir is None: return None, None, None</code>，调用方可以用缺省三元组表示“没有日志路径”，而不是依赖异常或空字符串约定。</li><li>目录创建使用 <code>mkdir(parents=True, exist_ok=True)</code>；这是一个源码可见的容错选择，允许父目录链一并创建，且目录已存在时不报错。</li><li>返回值是 <code>Path</code> 对象而不是字符串或已打开文件句柄；该函数只完成路径计算与目录准备，把后续文件写入时机留给调用方。</li><li>三个返回路径被固定命名在 <code>episode-{episode}</code> 子目录下，形成稳定的按 episode 分组的命名结构。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未知的上层调用方：向其提供按 <code>episode</code> 划分的三个日志文件路径</li><li><strong>核心被调用</strong>: Path.mkdir; Path.__truediv__</li><li><strong>配置/状态来源</strong>: 形参 <code>logging_dir</code>; 形参 <code>episode</code></li><li><strong>结果去向</strong>: 返回给调用方的三元组; <code>debug.json</code> 对应的 <code>Path | None</code>; <code>prompt.txt</code> 对应的 <code>Path | None</code>; <code>response.txt</code> 对应的 <code>Path | None</code></li></ul></div></details><details class="file" id="fn-terminus2_run_agent_loop"><summary><span class="chev"></span><code class="fpath">Terminus2._run_agent_loop</code><a class="fn-range" href="../code/terminus_2.py.html#L1296-L1313" title="terminus_2.py:1296-1313">terminus_2.py:1296–1313 (2 regions) ↗</a></summary><div class="file-body"><p class="fn-sub">在一次 agent 循环中，为本轮 LLM 交互建立日志路径、冻结调用前计量基线，并发起实际的模型交互调用。</p>
+<blockquote><p><strong>stage 上下文</strong>: 该单元位于 <a href="stage-4.3.html">stage-4.3</a>「LLM Query」。与前面已翻译的 <code>_setup_episode_logging</code> 相衔接，这里先取得本 episode 的日志路径对象，再在发起模型调用前读取 <code>chat</code> 上的累计 token / cache / cost 计数。随后代码以一次 <code>await self._handle_llm_interaction(...)</code> 获得 6 个局部结果，供后续区域继续处理。</p></blockquote>
+<h3>这段代码在干什么</h3>
+<p>这两段代码先调用 <code>_setup_episode_logging(logging_dir, episode)</code> 取得本轮要传递下去的 <code>logging_paths</code>。接着立即读取 <code>chat.total_input_tokens</code>、<code>chat.total_output_tokens</code>、<code>chat.total_cache_tokens</code> 与 <code>chat.total_cost</code>，把它们保存为本次交互前的基线值。完成基线采样后，代码以 <code>chat</code>、<code>prompt</code>、<code>logging_paths</code>、<code>original_instruction</code> 和 <code>self._session</code> 作为参数，异步调用 <code>_handle_llm_interaction(...)</code>。该调用返回 6 个值，并被解包到 <code>commands</code>、<code>is_task_complete</code>、<code>feedback</code>、<code>analysis</code>、<code>plan</code>、<code>llm_response</code> 这 6 个局部变量中。此片段本身不显示 enclosing function 的最终返回，只显示了本轮中间产物的生成。</p>
+<h3>接口 · 参数 / IO</h3>
+<p><code>async def Terminus2._run_agent_loop(...) -&gt; ?</code></p>
+<ul><li>参数: <code>chat</code>: <code>?</code> — 当前对话对象；其累计 token 与 cost 计数在这里被读取，并作为 LLM 交互实参传入。; <code>prompt</code>: <code>?</code> — 本轮要发送给模型的提示内容；直接传给 <code>_handle_llm_interaction</code>。; <code>logging_dir</code>: <code>?</code> — episode 日志路径配置来源；传给 <code>_setup_episode_logging</code>。; <code>episode</code>: <code>?</code> — 当前轮次标识；用于生成本轮日志路径。; <code>original_instruction</code>: <code>?</code> — 原始任务指令；透传给 <code>_handle_llm_interaction</code>。</li><li>读状态: <code>self._session</code>, <code>chat.total_input_tokens</code>, <code>chat.total_output_tokens</code>, <code>chat.total_cache_tokens</code>, <code>chat.total_cost</code></li><li>返回: 此片段自身不返回值；它产出 6 个局部结果：<code>commands</code>、<code>is_task_complete</code>、<code>feedback</code>、<code>analysis</code>、<code>plan</code>、<code>llm_response</code>，供 <code>_run_agent_loop</code> 后续区域使用。</li><li>副作用: 调用 <code>_setup_episode_logging(...)</code> 与 <code>_handle_llm_interaction(...)</code>；其具体副作用取决于被调函数，本片段仅可直接证明发生了这两次调用。</li></ul>
+<h3>总体结构</h3>
+<div class="table-wrap"><table><thead><tr><th>Region</th><th>行号</th><th>角色</th><th>终态</th></tr></thead><tbody><tr><td>1</td><td>1296-1303</td><td>建立日志路径并冻结调用前计量基线</td><td>得到 <code>logging_paths</code> 与四个 <code>*_before</code> 局部变量，进入 LLM 交互调用区域</td></tr><tr><td>2</td><td>1304-1313</td><td>发起 LLM 交互并解包六项结果</td><td>得到 <code>commands</code>、<code>is_task_complete</code>、<code>feedback</code>、<code>analysis</code>、<code>plan</code>、<code>llm_response</code> 六个局部输出，交给后续区域</td></tr></tbody></table></div>
+<hr>
+<h4>Region 1 · 建立日志路径并冻结调用前计量基线 (<a href="../code/terminus_2.py.html#L1296-L1303"><code>terminus_2.py:1296-1303</code></a>)</h4>
+<p>代码先以 <code>logging_dir</code> 和 <code>episode</code> 调用 <code>self._setup_episode_logging(...)</code>，把结果保存到 <code>logging_paths</code>。随后没有立刻进入模型调用，而是先读取 <code>chat.total_input_tokens</code>、<code>chat.total_output_tokens</code>、<code>chat.total_cache_tokens</code> 和 <code>chat.total_cost</code>，分别存入 <code>tokens_before_input</code>、<code>tokens_before_output</code>、<code>tokens_before_cache</code>、<code>cost_before</code>。这些值都是在本次 LLM 交互发生前采集的局部快照。完成这些准备后，控制流进入下一段异步交互调用。</p>
+<blockquote><p>⤵ 此 region 调用 <a href="#fn-terminus2_setup_episode_logging"><code>Terminus2._setup_episode_logging</code></a> — 先取得本 episode 的日志路径对象</p></blockquote>
+<pre><code>            logging_paths = self._setup_episode_logging(logging_dir, episode)
+
+            # Track token counts and cost before this step
+            tokens_before_input = chat.total_input_tokens
+            tokens_before_output = chat.total_output_tokens
+            tokens_before_cache = chat.total_cache_tokens
+            cost_before = chat.total_cost
+</code></pre>
+<hr>
+<h4>Region 2 · 发起 LLM 交互并解包六项结果 (<a href="../code/terminus_2.py.html#L1304-L1313"><code>terminus_2.py:1304-1313</code></a>)</h4>
+<p>这里以元组解包的形式接收 <code>_handle_llm_interaction(...)</code> 的 6 个返回值。传入的实参依次是 <code>chat</code>、<code>prompt</code>、<code>logging_paths</code>、<code>original_instruction</code> 和 <code>self._session</code>，显示这些上文准备好的输入会被整体交给该辅助流程。<code>await</code> 表明这是一次异步边界；返回后本地得到 <code>commands</code>、<code>is_task_complete</code>、<code>feedback</code>、<code>analysis</code>、<code>plan</code>、<code>llm_response</code> 六项结果，供后续代码继续消费。</p>
+<blockquote><p>⤵ 此 region 调用 <a href="#fn-terminus2_handle_llm_interaction"><code>Terminus2._handle_llm_interaction</code></a> — 统一执行本轮模型交互并返回六项结果</p></blockquote>
+<pre><code>            (
+                commands,
+                is_task_complete,
+                feedback,
+                analysis,
+                plan,
+                llm_response,
+            ) = await self._handle_llm_interaction(
+                chat, prompt, logging_paths, original_instruction, self._session
+            )</code></pre>
+<hr>
+<h3>Non-obvious 设计决策（跨 region 聚合）</h3>
+<ul><li>代码在 <code>await self._handle_llm_interaction(...)</code> 之前先读取四个累计计量字段（<code>chat.total_input_tokens</code>、<code>chat.total_output_tokens</code>、<code>chat.total_cache_tokens</code>、<code>chat.total_cost</code>），这是显式的“调用前基线”设计：后续若要计算本轮增量，必须先冻结 pre-call 状态。</li><li>日志路径不是在 <code>_handle_llm_interaction(...)</code> 内部隐式获取，而是先由 <code>_setup_episode_logging(logging_dir, episode)</code> 生成 <code>logging_paths</code>，再作为显式参数传入；这使“日志落点”成为本轮交互的显式输入，而非隐藏依赖。</li><li>该段把 <code>_handle_llm_interaction(...)</code> 的结果一次性解包为六个具名局部变量，而不是保留为未结构化对象；可见的取舍是让后续区域直接按语义字段消费本轮交互产物。</li></ul>
+<h3>上下游关系</h3>
+<ul><li><strong>调用方</strong>: Terminus2._run_agent_loop（当前多 region 片段所属函数）</li><li><strong>核心被调用</strong>: Terminus2._setup_episode_logging; Terminus2._handle_llm_interaction</li><li><strong>配置/状态来源</strong>: logging_dir; episode; chat.total_input_tokens; chat.total_output_tokens; chat.total_cache_tokens; chat.total_cost; self._session</li><li><strong>结果去向</strong>: 局部变量 <code>logging_paths</code>; 局部变量 <code>tokens_before_input</code>; 局部变量 <code>tokens_before_output</code>; 局部变量 <code>tokens_before_cache</code>; 局部变量 <code>cost_before</code>; 局部变量 <code>commands</code>; 局部变量 <code>is_task_complete</code>; 局部变量 <code>feedback</code>; 局部变量 <code>analysis</code>; 局部变量 <code>plan</code>; 局部变量 <code>llm_response</code>; _run_agent_loop` 后续区域</li><li><strong>同类 sibling</strong>: Terminus2._setup_episode_logging：该兄弟函数负责产生日志路径；本片段消费其返回值并把它继续传给 LLM 交互流程。</li></ul></div></details><details class="file" id="fn-terminus2_handle_llm_interaction"><summary><span class="chev"></span><code class="fpath">Terminus2._handle_llm_interaction</code><a class="fn-range" href="../code/terminus_2.py.html#L1186-L1188" title="terminus_2.py:1186-1188">terminus_2.py:1186–1188 ↗</a></summary><div class="file-body"><p class="fn-sub">LLM 查询的异步委托语句</p>
+<blockquote><p><strong>stage 上下文</strong>: 该代码片段仅展示一次异步方法调用与结果绑定。本单元能直接确认的角色，是把当前作用域中的 5 个局部输入原样交给 <code>self._query_llm(...)</code>，并等待其返回值。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>此语句通过 <code>await self._query_llm(chat, prompt, logging_paths, original_instruction, session)</code> 发起一次异步委托调用。它直接读取 <code>self</code> 上的方法 <code>_query_llm</code> 与 5 个局部变量，并把等待得到的结果绑定到局部变量 <code>llm_response</code>。从可见代码看，这一行本身不做参数加工、不处理异常，也不直接写入任何状态寄存器；若被调方法抛错，异常将继续向外传播。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, chat, prompt, logging_paths, original_instruction, session) -&gt; llm_response</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 提供被解析并调用的实例方法 <code>_query_llm</code>; <code>chat</code>: <code>?</code> — 作为第 1 个实参转交给 <code>_query_llm</code>; <code>prompt</code>: <code>?</code> — 作为第 2 个实参转交给 <code>_query_llm</code>; <code>logging_paths</code>: <code>?</code> — 作为第 3 个实参转交给 <code>_query_llm</code>; <code>original_instruction</code>: <code>?</code> — 作为第 4 个实参转交给 <code>_query_llm</code>; <code>session</code>: <code>?</code> — 作为第 5 个实参转交给 <code>_query_llm</code></li><li>读状态: <code>self（用于解析实例方法 </code>_query_llm<code>）</code></li><li>返回: 本语句不直接 return；其直接产出是把 awaited 结果绑定到局部变量 <code>llm_response</code>。</li><li>副作用: 无可由该语句本身直接证明的副作用；被调 <code>_query_llm</code> 的副作用不属于此行直接可证内容</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>从 <code>self</code> 解析出实例方法 <code>_query_llm</code>。</li><li>按当前位置已有的参数顺序，将 <code>chat</code>、<code>prompt</code>、<code>logging_paths</code>、<code>original_instruction</code>、<code>session</code> 原样作为 5 个实参传入。</li><li>以 <code>await</code> 等待 <code>_query_llm(...)</code> 的异步执行结果。</li><li>把得到的返回值绑定到局部变量 <code>llm_response</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>        llm_response = await self._query_llm(
+            chat, prompt, logging_paths, original_instruction, session
+        )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>可见代码呈现为纯委托点：本地既不改写参数，也不包裹返回值，说明该处选择把查询细节完整下沉到 <code>_query_llm</code>，而非在当前层插入额外转换逻辑。</li><li>该处没有局部 <code>try/except</code>。因此若 <code>_query_llm</code> 失败，异常会直接穿过此 <code>await</code> 向上传播；这是一个明确的边界划分，而不是在此处做容错。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2._handle_llm_interaction（当前翻译单元所在函数）</li><li><strong>核心被调用</strong>: self._query_llm</li><li><strong>配置/状态来源</strong>: 局部变量 <code>chat</code>; 局部变量 <code>prompt</code>; 局部变量 <code>logging_paths</code>; 局部变量 <code>original_instruction</code>; 局部变量 <code>session</code></li><li><strong>结果去向</strong>: 局部变量 <code>llm_response</code></li></ul></div></details><details class="file" id="fn-terminus2_query_llm"><summary><span class="chev"></span><code class="fpath">Terminus2._query_llm</code><a class="fn-range" href="../code/terminus_2.py.html#L1002-L1176" title="terminus_2.py:1002-1176">terminus_2.py:1002–1176 (7 regions) ↗</a></summary><div class="file-body"><p class="fn-sub">执行一次主 LLM 请求，并在上下文超限、输出超限或其他异常时分流到对应恢复路径的查询核心。</p>
+<blockquote><p><strong>stage 上下文</strong>: 本单元位于 <a href="stage-4.3.html">stage-4.3</a> 的末端，请求参数已由更外层准备完毕并传入。函数先尝试一次常规 <code>chat.chat(...)</code>，然后只对两类已知异常实施专门恢复：上下文长度超限与输出长度超限；其余异常仅记录日志并继续抛出。函数还负责记录成功 <code>chat.chat(...)</code> 调用的耗时，以及按分支写入 prompt/response 调试文件。</p></blockquote>
+<h3>这段代码在干什么</h3>
+<p><code>_query_llm</code> 接收 <code>chat</code>、<code>prompt</code>、日志路径三元组、<code>original_instruction</code> 和 <code>session</code>，先在常规路径中可选落盘原始 prompt，再发起一次带计时的 <code>chat.chat(...)</code> 请求。若抛出 <code>ContextLengthExceededError</code>，代码先确认允许摘要回退、要求 <code>session</code> 非空，并调用 <code>_unwind_messages_to_free_tokens(...)</code> 释放 token，然后按“完整摘要 → 短摘要单次 LLM 调用 → 仅屏幕内容”的三级策略构造替代 prompt，再以该 prompt 重试一次 <code>chat.chat(...)</code>。若抛出 <code>OutputLengthExceededError</code>，代码先尝试从 <code>truncated_response</code> 中抢救可接受的部分结果；抢救失败时，再把原 prompt 与截断输出追加进 <code>chat.messages</code>，重置响应链，并递归调用自身向模型发出纠错消息。函数的返回值是分支相关的：通常为 <code>LLMResponse</code>，但在截断输出成功抢救时会直接返回抢救出的文本字符串。</p>
+<h3>接口 · 参数 / IO</h3>
+<p><code>async def _query_llm(self, chat, prompt, logging_paths, original_instruction, session)</code></p>
+<ul><li>参数: <code>chat</code>: <code>?</code> — 主对话对象；提供 <code>chat.chat(...)</code>、<code>messages</code> 与 <code>reset_response_chain()</code>，并在输出超限纠错分支中被原地修改。; <code>prompt</code>: <code>?</code> — 本次主请求的输入文本；常规路径直接发送，输出超限纠错时也会被回填进 <code>chat.messages</code>。; <code>logging_paths</code>: <code>?</code> — 由 <code>(logging_path, prompt_path, response_path)</code> 组成的三元组，控制日志文件写入目标。; <code>original_instruction</code>: <code>?</code> — 任务原始指令；上下文超限时用于构造各级摘要回退 prompt。; <code>session</code>: <code>?</code> — 终端会话对象；上下文超限恢复分支依赖它抓取当前屏幕内容。</li><li>读状态: <code>self._llm_call_kwargs</code>, <code>self._enable_summarize</code>, <code>self._parser</code>, <code>self._llm</code>, <code>self._api_request_times</code>, <code>self.logger</code></li><li>返回: 分支相关：常规路径与上下文超限回退路径返回 <code>LLMResponse</code>；输出超限且 <code>salvage_truncated_response(...)</code> 成功时返回抢救出的字符串；未知异常分支不返回而是重新抛出。</li><li>副作用: 可能写入 <code>prompt_path.write_text(prompt)</code>，以及在上下文超限回退中改写为 <code>prompt_path.write_text(summary_prompt)</code>。; 可能写入 <code>response_path.write_text(...)</code>，内容可能是正常响应、回退响应、抢救出的截断文本或纠错消息。; 在每次成功完成的 <code>chat.chat(...)</code> 调用后向 <code>self._api_request_times</code> 追加一次耗时毫秒值；若回退 <code>chat.chat(...)</code> 自身失败并改用合成 <code>LLMResponse</code>，则不会追加耗时。; 在完整摘要成功时写入 <code>self._pending_subagent_refs</code> 与 <code>self._pending_handoff_prompt</code>。; 在输出超限且无法抢救时，向 <code>chat.messages</code> 追加两条消息（用户原 prompt 与助手截断响应），并单独调用 <code>chat.reset_response_chain()</code> 重置响应链状态。</li></ul>
+<h3>总体结构</h3>
+<div class="table-wrap"><table><thead><tr><th>Region</th><th>行号</th><th>角色</th><th>终态</th></tr></thead><tbody><tr><td>1</td><td>1002-1020</td><td>常规请求与成功日志落盘</td><td>成功时直接返回 <code>LLMResponse</code>；若 <code>chat.chat(...)</code> 抛错则进入后续异常分支。</td></tr><tr><td>2</td><td>1024-1034</td><td>上下文超限前置校验与历史裁剪</td><td>若禁止摘要则重新抛出；否则准备进入三级摘要回退构造。</td></tr><tr><td>3</td><td>1035-1079</td><td>三级摘要回退 prompt 构造</td><td>生成 <code>summary_prompt</code> 并可选重写 <code>prompt_path</code>，随后进入回退请求。</td></tr><tr><td>4</td><td>1080-1099</td><td>回退 prompt 的二次请求</td><td>返回回退 <code>LLMResponse</code>；若回退请求也失败，则返回合成的技术故障 <code>LLMResponse</code>。</td></tr><tr><td>5</td><td>1102-1127</td><td>输出超限后的截断结果抢救</td><td>抢救成功时直接返回字符串；失败则进入纠错重试构造。</td></tr><tr><td>6</td><td>1128-1172</td><td>输出超限纠错消息与递归重试</td><td>把失败交换写回会话历史后递归调用自身，返回递归结果。</td></tr><tr><td>7</td><td>1175-1176</td><td>未知异常记录并继续抛出</td><td>记录错误日志后 <code>raise e</code>。</td></tr></tbody></table></div>
+<hr>
+<h4>Region 1 · 常规请求与成功日志落盘 (<a href="../code/terminus_2.py.html#L1002-L1020"><code>terminus_2.py:1002-1020</code></a>)</h4>
+<p>这段先把 <code>logging_paths</code> 解包为 <code>logging_path, prompt_path, response_path</code>，若存在 <code>prompt_path</code> 就把入参 <code>prompt</code> 原样写入文件。随后在 <code>try</code> 中对 <code>chat.chat(prompt, logging_path=logging_path, **self._llm_call_kwargs)</code> 计时；只有该调用成功返回时，才会把耗时换算成毫秒并追加到 <code>self._api_request_times</code>。若存在 <code>response_path</code>，代码把 <code>llm_response.content</code> 落盘，然后直接返回该 <code>LLMResponse</code>。若这里抛出异常，则由后续各异常分支接管。</p>
+<pre><code>        logging_path, prompt_path, response_path = logging_paths
+
+        if prompt_path is not None:
+            prompt_path.write_text(prompt)
+
+        try:
+            start_time = time.time()
+            llm_response = await chat.chat(
+                prompt,
+                logging_path=logging_path,
+                **self._llm_call_kwargs,
+            )
+            end_time = time.time()
+            request_time_ms = (end_time - start_time) * 1000
+            self._api_request_times.append(request_time_ms)
+
+            if response_path is not None:
+                response_path.write_text(llm_response.content)
+            return llm_response</code></pre>
+<hr>
+<h4>Region 2 · 上下文超限前置校验与历史裁剪 (<a href="../code/terminus_2.py.html#L1024-L1034"><code>terminus_2.py:1024-1034</code></a>)</h4>
+<p>这一段对应 <code>ContextLengthExceededError</code> 的开头处理。代码首先检查 <code>self._enable_summarize</code>：若摘要功能关闭，仅记录 <code>debug</code> 日志并重新抛出，不尝试恢复。若允许恢复，则再强制要求 <code>session</code> 非空；缺少会话时会抛出 <code>RuntimeError</code>。通过这些前置检查后，函数调用 <code>_unwind_messages_to_free_tokens(chat, target_free_tokens=4000)</code>，先对现有对话历史做回退裁剪，再进入后面的摘要 prompt 构造流程。</p>
+<blockquote><p>⤵ 此 region 调用 <a href="#fn-terminus2_unwind_messages_to_free_tokens"><code>Terminus2._unwind_messages_to_free_tokens</code></a> — 上下文超限后先回卷历史以释放 token</p></blockquote>
+<pre><code>            if not self._enable_summarize:
+                self.logger.debug("Context length exceeded and summarization is OFF.")
+                raise
+
+            self.logger.debug("Context length exceeded. Using fallback summarization.")
+
+            if session is None:
+                raise RuntimeError("Cannot handle context length error without session")
+
+            self._unwind_messages_to_free_tokens(chat, target_free_tokens=4000)
+</code></pre>
+<hr>
+<h4>Region 3 · 三级摘要回退 prompt 构造 (<a href="../code/terminus_2.py.html#L1035-L1079"><code>terminus_2.py:1035-1079</code></a>)</h4>
+<p>这段把替代性 <code>summary_prompt</code> 的生成分成三层。第一层优先调用 <code>await self._summarize(chat, original_instruction, session)</code>；若成功，不仅拿到 <code>summary_prompt</code>，还会把 <code>subagent_trajectory_refs</code> 写入 <code>self._pending_subagent_refs</code>，并把 handoff 文本写入 <code>self._pending_handoff_prompt</code>。若完整摘要失败，代码退到第二层：通过 <code>await session.capture_pane(capture_entire=False)</code> 读取当前屏幕，并在 <code>current_screen[-1000:] if current_screen else ""</code> 的约束下截取末尾内容，构造一个请求模型“Next steps (2-3 sentences)”的 <code>short_prompt</code>，再调用未计时的 <code>self._llm.call(...)</code> 生成短摘要。若第二层仍失败，则进入第三层 ultimate fallback：再次按同样的 <code>[-1000:] if ... else ""</code> 规则抓取屏幕尾部，直接把 <code>original_instruction</code> 与当前屏幕拼接成 <code>summary_prompt</code>，不再发起额外 LLM 调用。完成后，若 <code>prompt_path</code> 存在，会用这个 <code>summary_prompt</code> 覆盖先前已写入的原始 prompt 文件。</p>
+<blockquote><p>⤵ 此 region 调用 <a href="#fn-terminus2_summarize"><code>Terminus2._summarize</code></a> — 完整摘要优先，成功时回填待消费寄存器</p></blockquote>
+<pre><code>            summary_prompt = None
+            # Fallback 1: Try full summary
+            try:
+                self.logger.debug("SUMMARIZATION: Attempting full summary")
+                summary_prompt, subagent_trajectory_refs = await self._summarize(
+                    chat, original_instruction, session
+                )
+                # Store subagent_refs to include in the trajectory
+                self._pending_subagent_refs = subagent_trajectory_refs
+                # Store handoff prompt to add as a user step
+                self._pending_handoff_prompt = summary_prompt
+                self.logger.debug("SUMMARIZATION: Full summary succeeded")
+            except Exception as e:
+                self.logger.debug(f"SUMMARIZATION: Full summary failed: {e}")
+
+            # Fallback 2: Try short summary
+            if summary_prompt is None:
+                try:
+                    self.logger.debug("SUMMARIZATION: Attempting short summary")
+                    current_screen = await session.capture_pane(capture_entire=False)
+                    limited_screen = current_screen[-1000:] if current_screen else ""
+
+                    short_prompt = f"Briefly continue this task: {original_instruction}\n\nCurrent state: {limited_screen}\n\nNext steps (2-3 sentences):"
+
+                    short_llm_response: LLMResponse = await self._llm.call(
+                        prompt=short_prompt,
+                        **self._llm_call_kwargs,
+                    )
+                    summary_prompt = f"{original_instruction}\n\nSummary: {short_llm_response.content}"
+                    self.logger.debug("SUMMARIZATION: Short summary succeeded")
+                except Exception as e:
+                    self.logger.error(f"SUMMARIZATION: Short summary failed: {e}")
+
+            # Fallback 3: Ultimate fallback (no LLM calls)
+            if summary_prompt is None:
+                self.logger.debug("SUMMARIZATION: Using ultimate fallback")
+                current_screen = await session.capture_pane(capture_entire=False)
+                limited_screen = current_screen[-1000:] if current_screen else ""
+                summary_prompt = (
+                    f"{original_instruction}\n\nCurrent state: {limited_screen}"
+                )
+
+            if prompt_path is not None:
+                prompt_path.write_text(summary_prompt)
+</code></pre>
+<hr>
+<h4>Region 4 · 回退 prompt 的二次请求 (<a href="../code/terminus_2.py.html#L1080-L1099"><code>terminus_2.py:1080-1099</code></a>)</h4>
+<p>拿到 <code>summary_prompt</code> 后，这段再次调用 <code>chat.chat(summary_prompt, logging_path=logging_path, **self._llm_call_kwargs)</code>，并像常规路径一样只在成功时记录耗时到 <code>self._api_request_times</code>。如果这次回退请求仍然失败，代码不会继续向外抛错，而是记录错误日志并构造一个固定文本的 <code>LLMResponse(content="Technical difficulties. Please continue with the task.")</code>。无论是真实响应还是该合成响应，只要存在 <code>response_path</code> 就写入其 <code>content</code>，随后返回该 <code>LLMResponse</code>。</p>
+<pre><code>            try:
+                start_time = time.time()
+                llm_response = await chat.chat(
+                    summary_prompt,
+                    logging_path=logging_path,
+                    **self._llm_call_kwargs,
+                )
+                end_time = time.time()
+                request_time_ms = (end_time - start_time) * 1000
+                self._api_request_times.append(request_time_ms)
+
+            except Exception as e:
+                self.logger.error(f"Even fallback chat failed: {e}")
+                llm_response = LLMResponse(
+                    content="Technical difficulties. Please continue with the task."
+                )
+
+            if response_path is not None:
+                response_path.write_text(llm_response.content)
+            return llm_response</code></pre>
+<hr>
+<h4>Region 5 · 输出超限后的截断结果抢救 (<a href="../code/terminus_2.py.html#L1102-L1127"><code>terminus_2.py:1102-1127</code></a>)</h4>
+<p>这段处理 <code>OutputLengthExceededError</code>。代码先从异常对象提取 <code>truncated_response</code>，若异常上没有该属性就使用占位字符串。随后它仅在 <code>self._parser</code> 具备 <code>salvage_truncated_response</code> 方法时尝试抢救，并接收 <code>(salvaged_response, has_multiple_blocks)</code> 两个返回值；其中 <code>has_multiple_blocks</code> 在可见代码中只被接收、不参与后续判断。若 <code>salvaged_response</code> 为真值，函数记录一条说明使用截断版本的 <code>debug</code> 日志，可选把该文本写入 <code>response_path</code>，然后直接返回这个抢救出的字符串，而不是 <code>LLMResponse</code>。</p>
+<pre><code>            self.logger.debug(f"Output length exceeded: {e}")
+
+            truncated_response = getattr(
+                e, "truncated_response", "[TRUNCATED RESPONSE NOT AVAILABLE]"
+            )
+
+            # Try to salvage a valid response from the truncated output
+            # Only available for XML parser
+            salvaged_response = None
+            has_multiple_blocks = False
+
+            if hasattr(self._parser, "salvage_truncated_response"):
+                salvaged_response, has_multiple_blocks = (
+                    self._parser.salvage_truncated_response(truncated_response)
+                )
+
+            if salvaged_response:
+                self.logger.debug(
+                    "Output exceeded length but found valid response. "
+                    "Using truncated version."
+                )
+
+                if response_path is not None:
+                    response_path.write_text(salvaged_response)
+
+                return salvaged_response</code></pre>
+<hr>
+<h4>Region 6 · 输出超限纠错消息与递归重试 (<a href="../code/terminus_2.py.html#L1128-L1172"><code>terminus_2.py:1128-1172</code></a>)</h4>
+<p>当无法从截断内容中抢救有效结果时，这段会先做一次尽力而为的解析：调用 <code>self._parser.parse_response(truncated_response)</code> 仅为了提取 <code>parse_result.warning</code>，解析失败只记 <code>debug</code> 日志并忽略，不阻断后续流程。然后代码读取 <code>self._llm.get_model_output_limit()</code> 生成面向模型的限制说明，拼出 <code>error_msg</code>，内容明确声明上一轮动作都未执行，并要求把请求拆成小于上限的块；若前面获得了解析 warning，就把 warning 追加到该消息末尾。接下来它向 <code>chat.messages</code> 依次追加两条消息：<code>{"role": "user", "content": prompt}</code> 与 <code>{"role": "assistant", "content": truncated_response}</code>，再单独调用 <code>chat.reset_response_chain()</code> 清理响应链状态。若存在 <code>response_path</code>，此处写入的是纠错消息 <code>error_msg</code>。最后函数以这个 <code>error_msg</code> 作为新 prompt 递归调用自身，并把递归结果原样返回。</p>
+<pre><code>
+            # If we get here, we couldn't salvage a valid response
+            # Try to parse the truncated response to get warnings
+            warnings_text = ""
+            try:
+                parse_result = self._parser.parse_response(truncated_response)
+                if parse_result.warning:
+                    warnings_text = (
+                        f"\n\nParser warnings from your truncated response:\n"
+                        f"{parse_result.warning}"
+                    )
+            except Exception as parse_error:
+                self.logger.debug(f"Failed to parse truncated response: {parse_error}")
+
+            # Get the actual output limit for the model
+            output_limit = self._llm.get_model_output_limit()
+            if output_limit is not None:
+                limit_str = f"{output_limit} tokens"
+            else:
+                limit_str = "the maximum output length"
+
+            error_msg = (
+                "ERROR!! NONE of the actions you just requested were performed "
+                f"because you exceeded {limit_str}. "
+                f"Your outputs must be less than {limit_str}. Re-issue this request, "
+                f"breaking it into chunks each of which is less than {limit_str}."
+            )
+
+            if warnings_text:
+                error_msg += warnings_text
+
+            chat.messages.append({"role": "user", "content": prompt})
+            chat.messages.append({"role": "assistant", "content": truncated_response})
+            chat.reset_response_chain()
+
+            if response_path is not None:
+                response_path.write_text(error_msg)
+
+            return await self._query_llm(
+                chat=chat,
+                prompt=error_msg,
+                logging_paths=logging_paths,
+                original_instruction=original_instruction,
+                session=session,
+            )</code></pre>
+<hr>
+<h4>Region 7 · 未知异常记录并继续抛出 (<a href="../code/terminus_2.py.html#L1175-L1176"><code>terminus_2.py:1175-1176</code></a>)</h4>
+<p>这两行是兜底异常分支：对于未被前面专门处理的错误，函数只记录 <code>self.logger.error(f"Unknown Error in LLM interaction: {e}")</code>，随后执行 <code>raise e</code>。因此这里不是吞掉异常，而是把决定权交还给更上层调用者。</p>
+<pre><code>            self.logger.error(f"Unknown Error in LLM interaction: {e}")
+            raise e</code></pre>
+<hr>
+<h3>Non-obvious 设计决策（跨 region 聚合）</h3>
+<ul><li>上下文超限恢复采用分层降级，而不是单一路径：先尝试完整 <code>_summarize(...)</code>，失败后退到一次未计时的 <code>self._llm.call(...)</code> 短摘要，再失败才退到完全不依赖 LLM 的屏幕尾部拼接。这种结构把最强恢复能力放在前面，同时保留在摘要子流程失效时的最低保真继续运行能力。</li><li>函数只为成功完成的 <code>chat.chat(...)</code> 记录 API 耗时；短摘要分支使用的 <code>self._llm.call(...)</code> 不参与该计时，回退 <code>chat.chat(...)</code> 失败并改用合成 <code>LLMResponse</code> 时也不会追加耗时。这体现了 <code>self._api_request_times</code> 只追踪主查询链上成功 chat 请求的选择。</li><li>输出超限时优先尝试直接抢救截断内容，而不是一律重试；说明代码把“部分可用结果”视为优于重新生成。只有抢救失败时，才把原始交换写回 <code>chat.messages</code> 并递归重试，以显式告诉模型此前因超限而未执行任何动作。</li><li>对截断输出的二次解析是纯粹的 best-effort 行为：<code>parse_response(truncated_response)</code> 仅用于提取 warning 文本，解析失败只写 <code>debug</code> 日志并忽略，不会改变主恢复路径。这避免了恢复逻辑再次被解析器错误阻断。</li><li>调试文件中的 prompt 不是固定代表原始输入：函数一开始可能先把 <code>prompt</code> 写入 <code>prompt_path</code>，但若进入上下文超限回退并成功构造 <code>summary_prompt</code>，同一路径会被再次写入替代 prompt。因此磁盘上的 prompt 文件反映的是“最终用于请求的 prompt”，而非调用入口实参的不可变快照。</li></ul>
+<h3>上下游关系</h3>
+<ul><li><strong>调用方</strong>: 直接等待其结果，接收 <code>LLMResponse</code> 或抢救出的字符串。</li><li><strong>核心被调用</strong>: 主路径与摘要回退路径的实际 LLM 对话请求。; 上下文超限后先压缩消息历史。; 首选的完整摘要恢复方案。; 短摘要与最终回退都读取当前屏幕尾部。; 短摘要回退时发起一次独立 LLM 调用。; 从截断输出中抢救可接受文本。; 仅为提取截断输出中的 warning。</li><li><strong>配置/状态来源</strong>: 两次 <code>chat.chat(...)</code> 与短摘要 <code>self._llm.call(...)</code> 都复用该调用参数。; 决定上下文超限时是否允许进入摘要恢复。; 决定是否支持截断抢救与 warning 提取。; 提供短摘要调用入口与模型输出上限。</li><li><strong>结果去向</strong>: 返回主查询结果、回退 <code>LLMResponse</code>，或截断抢救字符串。; 保存原始 prompt 或回退后的 <code>summary_prompt</code>。; 保存正常响应、回退响应、抢救文本或纠错消息。</li><li><strong>同类 sibling</strong>: 其返回的三元日志路径在本函数开头被解包并使用。; 更外层在调用链前后负责总体 token/cost 基线采样。; 本函数是其核心下游，后者本身不做异常加工。</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — 每次成功 <code>chat.chat(...)</code> 后追加耗时毫秒值。</li><li><a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a> — 完整摘要成功时暂存摘要子代理引用。</li><li><a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — 完整摘要成功时暂存 handoff prompt。</li><li><a class="reg" href="registers.html#reg-chat-messages"><code>reg-chat-messages</code></a> — 输出超限纠错时追加 user/assistant 两条历史消息。</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_unwind_messages_to_free_tokens"><summary><span class="chev"></span><code class="fpath">Terminus2._unwind_messages_to_free_tokens</code><a class="fn-range" href="../code/terminus_2.py.html#L568-L592" title="terminus_2.py:568-592">terminus_2.py:568–592 ↗</a></summary><div class="file-body"><p class="fn-sub">压缩对话历史以腾出上下文空间</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 <a href="stage-4.3.html">stage-4.3</a> 所属类的方法集合中，是一次局部聊天状态整理工具。它本身不发起 LLM 请求，而是围绕 <code>chat</code> 的消息历史做裁剪，并在结束时重置响应链、输出调试日志。与同 stage 中负责真正请求模型的兄弟函数相比，这里只处理上下文容量相关的前置整理。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收 <code>chat</code> 与目标空闲 token 数 <code>target_free_tokens</code>，读取 <code>self._llm</code> 提供的上下文上限，并反复用 <code>self._count_total_tokens(chat)</code> 估算当前占用。只要空闲额度不足且 <code>chat.messages</code> 仍多于 1 条，它就把内部消息列表缩短为 <code>chat.messages[:-2]</code>，即从尾部一次去掉两条消息。循环结束后，函数重置 <code>chat</code> 的响应链，重新计算一次剩余 token 预算并写出调试日志；返回值为 <code>None</code>，真正产出是对 <code>chat</code> 内部状态的修改。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, chat: Chat, target_free_tokens: int = 4000) -&gt; None</code></p>
+<ul><li>参数: <code>chat</code>: <code>Chat</code> — 被裁剪消息历史并重置响应链的会话对象; <code>target_free_tokens</code>: <code>int</code> — 期望至少保留的空闲 token 数，默认 4000</li><li>读状态: <code>self._llm</code>, <code>self.logger</code>, <code>chat.messages</code></li><li>返回: 返回 <code>None</code>；实际结果是缩短 <code>chat</code> 的内部消息列表并重置其响应链。</li><li>副作用: 调用 <code>chat._messages = chat.messages[:-2]</code> 直接截断消息历史; 调用 <code>chat.reset_response_chain()</code> 重置会话响应链状态; 调用 <code>self.logger.debug(...)</code> 输出调试日志</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先通过 <code>self._llm.get_model_context_limit()</code> 取得模型上下文上限，并保存到局部变量 <code>context_limit</code>。</li><li>进入 <code>while len(chat.messages) &gt; 1</code> 循环；每轮都调用 <code>self._count_total_tokens(chat)</code> 计算当前 token 占用，再以 <code>context_limit - current_tokens</code> 得到 <code>free_tokens</code>。</li><li>若 <code>free_tokens &gt;= target_free_tokens</code>，说明空闲额度已达标，立即 <code>break</code> 结束裁剪。</li><li>若仍不达标，则执行尾部裁剪：代码用 <code>chat._messages = chat.messages[:-2]</code> 一次移除最近两条消息；内层 <code>if len(chat.messages) &gt;= 2 ... else: break</code> 与外层 <code>while len(chat.messages) &gt; 1</code> 条件重复，表现为额外的防御性检查。</li><li>循环结束后，无论是达标退出还是长度不足退出，都会调用 <code>chat.reset_response_chain()</code>，使响应链状态与新的消息历史重新对齐。</li><li>最后再次调用 <code>self._count_total_tokens(chat)</code> 重新估算剩余空间，计算新的 <code>free_tokens</code>，并通过 <code>self.logger.debug(...)</code> 记录剩余消息数与“approximately”标记的空闲 token 数。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _unwind_messages_to_free_tokens(
+        self, chat: Chat, target_free_tokens: int = 4000
+    ) -&gt; None:
+        """Remove recent messages until we have enough free tokens."""
+        context_limit = self._llm.get_model_context_limit()
+
+        while len(chat.messages) &gt; 1:  # Keep at least the first message
+            current_tokens = self._count_total_tokens(chat)
+            free_tokens = context_limit - current_tokens
+
+            if free_tokens &gt;= target_free_tokens:
+                break
+
+            # Remove the most recent pair of messages (user + assistant)
+            if len(chat.messages) &gt;= 2:
+                chat._messages = chat.messages[:-2]
+            else:
+                break
+
+        chat.reset_response_chain()
+        free_tokens = context_limit - self._count_total_tokens(chat)
+        self.logger.debug(
+            f"Unwound messages. Remaining messages: {len(chat.messages)}, "
+            f"Free tokens: approximately {free_tokens}"
+        )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>循环条件写成 <code>len(chat.messages) &gt; 1</code>，对应的可观察取舍是始终保留第一条消息，不会把消息列表裁到空。</li><li>裁剪单位固定为 <code>chat.messages[:-2]</code>，即每次从尾部去掉两条消息，而不是一条条删；这使消息历史按成对粒度回退。</li><li>每轮都重新调用 <code>self._count_total_tokens(chat)</code>，表明是否继续裁剪不是按消息条数估计，而是按实时 token 占用重新判断。</li><li>内层 <code>if len(chat.messages) &gt;= 2</code> 在外层 <code>while len(chat.messages) &gt; 1</code> 之下基本属于冗余的防御性检查；源码显式保留了这层检查而非完全依赖外层条件。</li><li>日志前又重新计算一次 <code>free_tokens</code>，且日志文案使用 <code>approximately</code>，说明这里记录的是一次结束后的近似预算，而不是沿用循环中的旧值。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2._query_llm</li><li><strong>核心被调用</strong>: self._llm.get_model_context_limit; self._count_total_tokens; chat.reset_response_chain; self.logger.debug</li><li><strong>配置/状态来源</strong>: self._llm; chat.messages; target_free_tokens; self.logger</li><li><strong>结果去向</strong>: chat._messages 被缩短后的会话历史; chat.reset_response_chain() 之后的 chat 内部响应链状态; self.logger.debug(...) 输出的调试日志</li><li><strong>同类 sibling</strong>: Terminus2._query_llm：该兄弟函数负责发起请求；本函数只负责在局部对 <code>chat</code> 历史做裁剪与重置。; Terminus2._handle_llm_interaction：该兄弟函数仅转调用 <code>_query_llm</code>；相比之下，本函数直接修改 <code>chat</code> 对象。</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-chat-messages"><code>reg-chat-messages</code></a> — 截断消息尾部并随后重置响应链</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_parse_skill_frontmatter"><summary><span class="chev"></span><code class="fpath">Terminus2._parse_skill_frontmatter</code><a class="fn-range" href="../code/terminus_2.py.html#L402-L417" title="terminus_2.py:402-417">terminus_2.py:402–417 ↗</a></summary><div class="file-body"><p class="fn-sub">技能文档前置元数据提取器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该单元是一个静态风格的纯解析辅助函数：输入仅为 <code>content</code> 字符串，不读取任何 <code>self</code> 状态。与同 stage 中围绕 LLM 调用、回退与消息裁剪的兄弟函数不同，这段代码不参与会话控制，只负责把一段文本开头可能存在的 YAML frontmatter 规整成统一返回值。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数尝试从 <code>content</code> 开头提取一段 YAML frontmatter，并仅在其中同时存在 <code>name</code> 与 <code>description</code> 两个键时返回对应字典。若文本开头不符合 frontmatter 边界、YAML 解析失败，或解析结果不是包含这两个键的映射，则返回 <code>None</code>。它不读写对象状态，也没有外部持久化副作用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(content: str) -&gt; dict[str, str] | None</code></p>
+<ul><li>参数: <code>content</code>: <code>str</code> — 待检查的文档全文；函数只从其起始位置寻找 frontmatter</li><li>返回: 返回 <code>{"name": fm["name"], "description": fm["description"]}</code> 或 <code>None</code>。代码只检查这两个键是否存在，不在运行时验证其值是否真为字符串。</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先导入 <code>re</code> 与 <code>yaml</code>，然后用 <code>re.match(r"^---\n(.*?)\n---", content, re.DOTALL)</code> 只在 <code>content</code> 开头尝试匹配 frontmatter；该模式要求起始处就是 <code>---\n</code>，之后某处出现一个 <code>\n---</code> 作为结束，但不要求结束分隔符后必须跟换行或到达字符串末尾。</li><li>如果 <code>match</code> 为假，说明文本起始不具备该 frontmatter 结构，函数立即返回 <code>None</code>。</li><li>匹配成功后，对 <code>match.group(1)</code> 提取出的中间内容调用 <code>yaml.safe_load(...)</code>；若抛出 <code>yaml.YAMLError</code>，则把该 frontmatter 视为不可用并返回 <code>None</code>。</li><li>YAML 解析成功后，继续检查 <code>fm</code> 是否为 <code>dict</code>，且其中是否同时含有键 <code>"name"</code> 与 <code>"description"</code>；任一条件不满足都返回 <code>None</code>。</li><li>只有在上述检查全部通过时，函数才构造并返回一个只含两项的字典：<code>{"name": fm["name"], "description": fm["description"]}</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _parse_skill_frontmatter(content: str) -&gt; dict[str, str] | None:
+        """Parse YAML frontmatter from SKILL.md content, returning name and description."""
+        import re
+
+        import yaml
+
+        match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
+        if not match:
+            return None
+        try:
+            fm = yaml.safe_load(match.group(1))
+        except yaml.YAMLError:
+            return None
+        if not isinstance(fm, dict) or "name" not in fm or "description" not in fm:
+            return None
+        return {"name": fm["name"], "description": fm["description"]}</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数采用“失败即缺失”的封闭式容错：未匹配到 frontmatter、YAML 语法错误、或字段不完整时都统一返回 <code>None</code>，而不是抛出异常；这样调用方可以把无效 frontmatter 与不存在 frontmatter 一并处理。</li><li>正则使用 <code>re.match</code> 而非搜索全文，明确把解析范围限制在文档开头；这体现了 frontmatter 必须位于顶部的约定，避免把正文中的 <code>---</code> 片段误识别为元数据块。</li><li>返回值刻意只暴露 <code>name</code> 和 <code>description</code> 两个字段，即使 YAML 中还有其他键也被忽略；函数目标是提取最小必需元数据，而非回传完整 frontmatter。</li><li>类型注解写为 <code>dict[str, str] | None</code>，但运行时校验只做到“键存在”，并未验证 <code>fm["name"]</code>、<code>fm["description"]</code> 的实际类型；这是一种偏宽松的输入接受策略。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未在当前代码片段中出现直接调用者；应由上层文本组装/解析流程调用</li><li><strong>核心被调用</strong>: re.match; yaml.safe_load</li><li><strong>配置/状态来源</strong>: 参数 <code>content</code>; 正则字面量 <code>r"^---\n(.*?)\n---"</code>; 正则标志 <code>re.DOTALL</code>; 键名常量 <code>"name"</code>; 键名常量 <code>"description"</code></li><li><strong>结果去向</strong>: 返回给调用方的两键字典; 返回给调用方的 <code>None</code>（表示 frontmatter 不可用或缺失）</li><li><strong>同类 sibling</strong>: 与 <code>_query_llm</code>、<code>_unwind_messages_to_free_tokens</code> 等同 stage 兄弟不同，本函数不操作 <code>chat</code>、日志路径或异常回退链，只做局部文本解析。</li></ul></div></details><nav class="pn"><a class="pn-prev" href="stage-4.2.html"><span>← 上一阶段</span><strong>主动摘要探测</strong></a><a class="pn-next" href="stage-4.4.html"><span>下一阶段 →</span><strong>响应解析</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

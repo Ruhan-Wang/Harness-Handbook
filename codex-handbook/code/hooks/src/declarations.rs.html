@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hooks/src/declarations.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">hooks/src/declarations.rs</code>
+<span class="code-meta">101 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=k>use</b> codex_plugin::PluginHookSource;</i><i id="L2"><b class=k>use</b> codex_protocol::protocol::HookEventName;</i><i id="L3"></i><i id="L4"><b class=c>/// Minimal declaration metadata for one bundled plugin hook handler.</b></i><i id="L5"><b class=m>#[derive(Debug, Clone, PartialEq, Eq)]</b></i><i id="L6"><b class=k>pub</b> <b class=k>struct</b> PluginHookDeclaration {</i><i id="L7">    <b class=k>pub</b> key: String,</i><i id="L8">    <b class=k>pub</b> event_name: HookEventName,</i><i id="L9">}</i><i id="L10"></i><i id="L11"><b class=c>/// Return the hook handlers declared by plugin bundles without projecting live runtime state.</b></i><i id="L12"><b class=k>pub</b> <b class=k>fn</b> plugin_hook_declarations(hook_sources: &amp;[PluginHookSource]) -&gt; Vec&lt;PluginHookDeclaration&gt; {</i><i id="L13">    <b class=k>let</b> <b class=k>mut</b> declarations = Vec::new();</i><i id="L14"></i><i id="L15">    <b class=k>for</b> source <b class=k>in</b> hook_sources {</i><i id="L16">        <b class=k>let</b> key_source = plugin_hook_key_source(</i><i id="L17">            source.plugin_id.as_key().as_str(),</i><i id="L18">            source.source_relative_path.as_str(),</i><i id="L19">        );</i><i id="L20">        <b class=k>for</b> (event_name, groups) <b class=k>in</b> source.hooks.clone().into_matcher_groups() {</i><i id="L21">            <b class=k>for</b> (group_index, group) <b class=k>in</b> groups.iter().enumerate() {</i><i id="L22">                <b class=k>for</b> (handler_index, _) <b class=k>in</b> group.hooks.iter().enumerate() {</i><i id="L23">                    declarations.push(PluginHookDeclaration {</i><i id="L24">                        key: <b class=k>crate</b>::hook_key(&amp;key_source, event_name, group_index, handler_index),</i><i id="L25">                        event_name,</i><i id="L26">                    });</i><i id="L27">                }</i><i id="L28">            }</i><i id="L29">        }</i><i id="L30">    }</i><i id="L31"></i><i id="L32">    declarations</i><i id="L33">}</i><i id="L34"></i><i id="L35"><b class=k>pub</b>(<b class=k>crate</b>) <b class=k>fn</b> plugin_hook_key_source(plugin_id: &amp;str, source_relative_path: &amp;str) -&gt; String {</i><i id="L36">    <b class=m>format!</b>(<b class=s>"{plugin_id}:{source_relative_path}"</b>)</i><i id="L37">}</i><i id="L38"></i><i id="L39"><b class=m>#[cfg(test)]</b></i><i id="L40"><b class=k>mod</b> tests {</i><i id="L41">    <b class=k>use</b> codex_config::HookEventsToml;</i><i id="L42">    <b class=k>use</b> codex_config::HookHandlerConfig;</i><i id="L43">    <b class=k>use</b> codex_config::MatcherGroup;</i><i id="L44">    <b class=k>use</b> codex_plugin::PluginId;</i><i id="L45">    <b class=k>use</b> codex_utils_absolute_path::test_support::PathBufExt;</i><i id="L46">    <b class=k>use</b> codex_utils_absolute_path::test_support::test_path_buf;</i><i id="L47">    <b class=k>use</b> pretty_assertions::assert_eq;</i><i id="L48"></i><i id="L49">    <b class=k>use</b> <b class=k>super</b>::*;</i><i id="L50"></i><i id="L51">    <b class=m>#[test]</b></i><i id="L52">    <b class=k>fn</b> lists_declared_plugin_handlers_with_persisted_hook_keys() {</i><i id="L53">        <b class=k>let</b> plugin_root = test_path_buf(<b class=s>"/tmp/plugin"</b>).abs();</i><i id="L54">        <b class=k>let</b> source_path = plugin_root.join(<b class=s>"hooks/hooks.json"</b>);</i><i id="L55">        <b class=k>let</b> declarations = plugin_hook_declarations(&amp;[PluginHookSource {</i><i id="L56">            plugin_id: PluginId::parse(<b class=s>"demo@test"</b>).expect(<b class=s>"plugin id"</b>),</i><i id="L57">            plugin_root: plugin_root.clone(),</i><i id="L58">            plugin_data_root: plugin_root.join(<b class=s>"data"</b>),</i><i id="L59">            source_path,</i><i id="L60">            source_relative_path: <b class=s>"hooks/hooks.json"</b>.to_string(),</i><i id="L61">            hooks: HookEventsToml {</i><i id="L62">                pre_tool_use: <b class=m>vec!</b>[MatcherGroup {</i><i id="L63">                    matcher: None,</i><i id="L64">                    hooks: <b class=m>vec!</b>[</i><i id="L65">                        HookHandlerConfig::Prompt {},</i><i id="L66">                        HookHandlerConfig::Command {</i><i id="L67">                            command: <b class=s>"echo hi"</b>.to_string(),</i><i id="L68">                            command_windows: None,</i><i id="L69">                            timeout_sec: None,</i><i id="L70">                            r#<b class=k>async</b>: <b class=k>false</b>,</i><i id="L71">                            status_message: None,</i><i id="L72">                        },</i><i id="L73">                    ],</i><i id="L74">                }],</i><i id="L75">                session_start: <b class=m>vec!</b>[MatcherGroup {</i><i id="L76">                    matcher: None,</i><i id="L77">                    hooks: <b class=m>vec!</b>[HookHandlerConfig::Agent {}],</i><i id="L78">                }],</i><i id="L79">                ..Default::default()</i><i id="L80">            },</i><i id="L81">        }]);</i><i id="L82"></i><i id="L83">        <b class=m>assert_eq!</b>(</i><i id="L84">            declarations,</i><i id="L85">            <b class=m>vec!</b>[</i><i id="L86">                PluginHookDeclaration {</i><i id="L87">                    key: <b class=s>"demo@test:hooks/hooks.json:pre_tool_use:0:0"</b>.to_string(),</i><i id="L88">                    event_name: HookEventName::PreToolUse,</i><i id="L89">                },</i><i id="L90">                PluginHookDeclaration {</i><i id="L91">                    key: <b class=s>"demo@test:hooks/hooks.json:pre_tool_use:0:1"</b>.to_string(),</i><i id="L92">                    event_name: HookEventName::PreToolUse,</i><i id="L93">                },</i><i id="L94">                PluginHookDeclaration {</i><i id="L95">                    key: <b class=s>"demo@test:hooks/hooks.json:session_start:0:0"</b>.to_string(),</i><i id="L96">                    event_name: HookEventName::SessionStart,</i><i id="L97">                },</i><i id="L98">            ]</i><i id="L99">        );</i><i id="L100">    }</i><i id="L101">}</i></pre></div>
+</main>
+<script src="../../../assets/app.js"></script>
+</body>
+</html>

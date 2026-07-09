@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-4.3 · LLM Query</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=en"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=en" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>Home</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>State-flow registers</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>Configuration Crystallization</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>Environment Setup</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>Run Onset</a></div><details class="s-node" open><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>Iteration Loop</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>Loop Entry Gates</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>Proactive Summarize Probe</a></div><div class="s-leaf"><a class="s-link cur" href="stage-4.3.html"><span class="s-num">4.3</span>LLM Query</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>Response Parse</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>Pending Handoff Prompt → User Step (or Split)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>Error Branch</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>Command Execute → Observation → Trajectory Step</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>Completion Gate + Loop Control</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>Parser internal helpers</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>Run Teardown</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>Recording Post-process (External)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>Context Summarization</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token &amp; Cost Accounting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>Output Length Limiting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>Logging</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux internal helpers</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">Index</a><span class="sep">›</span><a href="stage-4.html">Iteration Loop</a></nav><div class="stage-head"><h1>LLM Query</h1><div class="meta"><span class="chip mono">stage-4.3</span><span class="chip">6 functions</span></div></div>
+<h2 class="sec">Opening Explanation</h2>
+<p>This stage exists to turn the current conversation state into an actual model answer, and to keep the loop alive when that call hits model limits or transient API failures. It sits right after <a href="stage-4.2.html">stage-4.2</a>, which may have prepared a summary handoff in advance, and right before <a href="stage-4.4.html">stage-4.4</a>, which parses the reply. Its job is not just “call the LLM.” It also records per-episode logging, snapshots token and cost totals before the call, and owns last-minute recovery if the request is too large or the output is cut off. That matters because token overflow is discovered at call time, not just earlier in the pipeline. Without this stage, the agent would fail at the exact moment it needs a usable response.</p>
+<h2 class="sec">Main Flow</h2>
+
+<ol><li><code>_setup_episode_logging()</code> (pick log paths for this episode) runs so this specific model interaction can be traced later. <p>This stage owns the moment where a new LLM exchange is about to happen, so it is the right place to attach episode-specific logs and baseline metrics.</p></li><li>The loop snapshots token and cost totals before the call. <p>The point is simple: after the call returns, the agent can tell what this one interaction consumed rather than only knowing the cumulative totals.</p></li><li><code>_handle_llm_interaction()</code> (the thin wrapper for “get the next model reply”) hands control to <code>_query_llm()</code> (the actual provider call plus recovery logic). <p>On the success path, this produces the primary output of the stage: the raw LLM response object/text that <a href="stage-4.4.html">stage-4.4</a> will parse.</p></li><li>If the request is too large and the provider raises <code>ContextLengthExceededError</code>, recovery happens here, after the failed call. <p>First, <code>_unwind_messages_to_free_tokens()</code> removes older message history to make room. Then this stage tries to rebuild enough context through a three-step fallback: full summarize, then a shorter one-shot summary from the LLM, then a final no-LLM fallback that uses a tail of terminal output. If this reactive path creates a handoff summary, it writes <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> so later stages can reshape the conversation history cleanly. This stage owns that recovery because this is where the system learns the prompt is still too big despite the proactive probe in <a href="stage-4.2.html">stage-4.2</a>.</p></li><li>If the provider cuts off the answer and raises <code>OutputLengthExceededError</code>, this stage first tries to salvage the partial reply. <p>That salvage path only works for the XML parser, because truncated XML can sometimes still be repaired into something parseable. If salvage fails, the stage sends a clear error back to the model and asks again. The goal is to recover a usable reply without making downstream parsing guess at broken output.</p></li><li>Other exceptions are treated differently. <p>The <code>@retry</code> wrapper is for ordinary transient failures around the query path, such as flaky provider/API errors. It retries up to three times. It does <strong>not</strong> mean every failure mode is blindly retried first: context overflow and output truncation have their own explicit recovery branches inside <code>_query_llm()</code>.</p></li><li>On any successful call, this stage also records the request duration in <a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a>. <p>That does not affect control flow, but it gives the system timing data for later metadata and diagnostics.</p></li></ol>
+<h2 class="sec"> State Flow</h2>
+<ul><li>writes: <a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — appended during successful/attempted LLM query timing capture so later stages can report per-request latency</li><li>writes: <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — written only if reactive overflow recovery in this stage generates a summary-handoff prompt after a context-length failure</li><li>triggers downstream: <code>stage-4.4 Response Parse</code> — once this stage has a usable raw LLM response, whether from the normal call path or a recovery path</li></ul>
+<h2 class="sec">Pipeline Hand-Off</h2>
+<p>From <a href="stage-4.2.html">stage-4.2</a>, this stage inherits a prepared prompt state and possibly a proactively prepared handoff summary if the system already suspected the context was getting large. It produces the concrete thing <a href="stage-4.4.html">stage-4.4</a> needs next: a raw model reply to parse, plus timing data and, in overflow cases, a pending handoff prompt that later stages can use to repair or split history.</p><div class="files-bar"><h2 class="sec">Functions<span class="pill">6</span></h2><span class="spacer"></span><button class="tool" data-x="expand">Expand all</button><button class="tool" data-x="collapse">Collapse all</button></div><details class="file" id="fn-terminus2_setup_episode_logging"><summary><span class="chev"></span><code class="fpath">Terminus2._setup_episode_logging</code><a class="fn-range" href="../code/terminus_2.py.html#L509-L522" title="terminus_2.py:509-522">terminus_2.py:509–522 ↗</a></summary><div class="file-body"><p class="fn-sub">Prepare per-episode LLM logging file paths</p>
+<blockquote><p><strong>Stage context</strong>: This helper supports <a href="stage-4.3.html">stage-4.3</a> by setting up the filesystem locations that hold prompt/response diagnostics for one LLM episode. <code>_run_agent_loop</code> invokes it immediately before the stage's LLM call path so later logic can write <code>debug.json</code>, <code>prompt.txt</code>, and <code>response.txt</code> consistently. In this stage it is setup-only; the actual LLM interaction and retry/fallback handling happen in <code>_handle_llm_interaction</code> and <code>_query_llm</code>.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_setup_episode_logging</code> turns <code>logging_dir</code> and <code>episode</code> into three per-episode file paths. If <code>logging_dir</code> is <code>None</code>, it disables episode logging by returning <code>(None, None, None)</code>. Otherwise it creates the <code>episode-{episode}</code> directory on disk and returns paths for <code>debug.json</code>, <code>prompt.txt</code>, and <code>response.txt</code> inside that directory.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, logging_dir: Path | None, episode: int) -&gt; tuple[Path | None, Path | None, Path | None]</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — Terminus2 instance; unused except as method receiver; <code>logging_dir</code>: <code>Path | None</code> — Optional base directory that enables episode-specific logging; <code>episode</code>: <code>int</code> — Episode number used in the <code>episode-{episode}</code> subdirectory name</li><li>returns: A 3-tuple of <code>Path | None</code> values for <code>debug.json</code>, <code>prompt.txt</code>, and <code>response.txt</code>; returns <code>(None, None, None)</code> when <code>logging_dir</code> is <code>None</code></li><li>effects: Creates <code>logging_dir / f"episode-{episode}"</code> on disk with <code>mkdir(parents=True, exist_ok=True)</code> when logging is enabled</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Check <code>logging_dir</code>. If it is <code>None</code>, return <code>None, None, None</code> and skip all filesystem work.</li><li>Build <code>episode_logging_dir</code> as <code>logging_dir / f"episode-{episode}"</code> to give this episode its own namespace.</li><li>Create <code>episode_logging_dir</code> with <code>mkdir(parents=True, exist_ok=True)</code> so later writes can assume the directory exists.</li><li>Return three file paths under <code>episode_logging_dir</code>: <code>debug.json</code>, <code>prompt.txt</code>, and <code>response.txt</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _setup_episode_logging(
+        self, logging_dir: Path | None, episode: int
+    ) -&gt; tuple[Path | None, Path | None, Path | None]:
+        if logging_dir is None:
+            return None, None, None
+
+        episode_logging_dir = logging_dir / f"episode-{episode}"
+        episode_logging_dir.mkdir(parents=True, exist_ok=True)
+
+        return (
+            episode_logging_dir / "debug.json",
+            episode_logging_dir / "prompt.txt",
+            episode_logging_dir / "response.txt",
+        )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The <code>logging_dir is None</code> branch disables logging by contract and returns a full tuple of <code>None</code> placeholders. That lets callers keep one unpacking shape whether logging is on or off, instead of branching around separate path variables.</li><li>The function centralizes the <code>episode-{episode}</code> naming scheme and file names in one place. That avoids duplicating path construction across the <a href="stage-4.3.html">stage-4.3</a> LLM call path, where prompt, response, and debug artifacts must stay aligned.</li><li>It creates the directory eagerly with <code>exist_ok=True</code>. That favors idempotent setup before writing diagnostics and avoids forcing downstream code to handle missing-parent errors or repeated setup.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>Terminus2._run_agent_loop</code> immediately before an LLM interaction</li><li><strong>Core callees</strong>: <code>Path.mkdir</code> on <code>episode_logging_dir</code></li><li><strong>Config / state sources</strong>: <code>logging_dir</code> argument from the caller's logging configuration; <code>episode</code> argument from the current loop iteration</li><li><strong>Results to</strong>: Returned path tuple feeds the <a href="stage-4.3.html">stage-4.3</a> LLM interaction path; Later diagnostic writes target <code>debug.json</code>; Later prompt capture writes target <code>prompt.txt</code>; Later model output capture writes target <code>response.txt</code></li><li><strong>Related siblings</strong>: <code>Terminus2._handle_llm_interaction</code> consumes the prepared paths during the actual LLM call flow; <code>Terminus2._query_llm</code> performs the request whose prompt/response artifacts these paths are meant to hold</li></ul></div></details><details class="file" id="fn-terminus2_run_agent_loop"><summary><span class="chev"></span><code class="fpath">Terminus2._run_agent_loop</code><a class="fn-range" href="../code/terminus_2.py.html#L1296-L1313" title="terminus_2.py:1296-1313">terminus_2.py:1296–1313 (2 regions) ↗</a></summary><div class="file-body"><p class="fn-sub">prepare per-call baselines, then await the LLM interaction result</p>
+<blockquote><p><strong>Stage context</strong>: This mapped slice of <code>Terminus2._run_agent_loop</code> does two things in sequence. It first captures local inputs for this call: <code>logging_paths</code> from <code>_setup_episode_logging(...)</code> and four cumulative usage counters from <code>chat</code>. It then awaits <code>_handle_llm_interaction(...)</code> and binds its six returned values to local names for later use in the surrounding function.</p></blockquote>
+<h3>What this code does</h3>
+<p>This slice starts by assigning <code>logging_paths = self._setup_episode_logging(logging_dir, episode)</code>. It then snapshots <code>chat.total_input_tokens</code>, <code>chat.total_output_tokens</code>, <code>chat.total_cache_tokens</code>, and <code>chat.total_cost</code> into local <code>*_before</code> variables. After those baselines are recorded, it awaits <code>self._handle_llm_interaction(chat, prompt, logging_paths, original_instruction, self._session)</code>. The awaited result is unpacked into <code>commands</code>, <code>is_task_complete</code>, <code>feedback</code>, <code>analysis</code>, <code>plan</code>, and <code>llm_response</code>.</p>
+<h3>Interface · params / IO</h3>
+<p><code>async def _run_agent_loop(self, chat, prompt, logging_dir, episode, original_instruction):</code></p>
+<ul><li>params: <code>self</code>: <code>Terminus2</code> — owner of helper methods and session state; <code>chat</code>: <code>?</code> — source of cumulative usage counters and argument to <code>_handle_llm_interaction</code>; <code>prompt</code>: <code>?</code> — prompt value forwarded to <code>_handle_llm_interaction</code>; <code>logging_dir</code>: <code>?</code> — input forwarded to <code>_setup_episode_logging</code>; <code>episode</code>: <code>?</code> — input forwarded to <code>_setup_episode_logging</code>; <code>original_instruction</code>: <code>?</code> — value forwarded to <code>_handle_llm_interaction</code></li><li>reads: <code>self._session</code>, <code>chat.total_input_tokens</code>, <code>chat.total_output_tokens</code>, <code>chat.total_cache_tokens</code>, <code>chat.total_cost</code></li><li>returns: This slice does not return. Its direct products are local bindings: <code>logging_paths</code>, four <code>*_before</code> usage baselines, and the six values unpacked from <code>_handle_llm_interaction(...)</code>.</li><li>effects: awaits <code>self._handle_llm_interaction(...)</code>; calls <code>self._setup_episode_logging(...)</code> and stores its return value</li></ul>
+<h3>Overall structure</h3>
+<div class="table-wrap"><table><thead><tr><th>Region</th><th>Lines</th><th>Role</th><th>Terminal state</th></tr></thead><tbody><tr><td>1</td><td>1296-1303</td><td>collect logging paths and usage baselines</td><td>continues with the awaited <code>_handle_llm_interaction(...)</code> call</td></tr><tr><td>2</td><td>1304-1313</td><td>await and unpack LLM interaction outputs</td><td>continues in the surrounding function with six local result variables bound</td></tr></tbody></table></div>
+<hr>
+<h4>Region 1 · collect logging paths and usage baselines (<a href="../code/terminus_2.py.html#L1296-L1303"><code>terminus_2.py:1296-1303</code></a>)</h4>
+<p>The code first assigns <code>logging_paths</code> from <code>self._setup_episode_logging(logging_dir, episode)</code>. It then reads the cumulative counters <code>chat.total_input_tokens</code>, <code>chat.total_output_tokens</code>, <code>chat.total_cache_tokens</code>, and <code>chat.total_cost</code> and stores them in <code>tokens_before_input</code>, <code>tokens_before_output</code>, <code>tokens_before_cache</code>, and <code>cost_before</code>. These names make the values explicit pre-call checkpoints. Control then moves to the awaited interaction call in the next region.</p>
+<blockquote><p>⤵ This region calls <a href="#fn-terminus2_setup_episode_logging"><code>Terminus2._setup_episode_logging</code></a> — derive <code>logging_paths</code> for this call</p></blockquote>
+<pre><code>            logging_paths = self._setup_episode_logging(logging_dir, episode)
+
+            # Track token counts and cost before this step
+            tokens_before_input = chat.total_input_tokens
+            tokens_before_output = chat.total_output_tokens
+            tokens_before_cache = chat.total_cache_tokens
+            cost_before = chat.total_cost
+</code></pre>
+<hr>
+<h4>Region 2 · await and unpack LLM interaction outputs (<a href="../code/terminus_2.py.html#L1304-L1313"><code>terminus_2.py:1304-1313</code></a>)</h4>
+<p>This region awaits <code>self._handle_llm_interaction(chat, prompt, logging_paths, original_instruction, self._session)</code>. The awaited result must be a six-item tuple, because the code unpacks it into <code>commands</code>, <code>is_task_complete</code>, <code>feedback</code>, <code>analysis</code>, <code>plan</code>, and <code>llm_response</code>. The region's work is only the call and tuple binding. After unpacking, the surrounding function can use those locals.</p>
+<blockquote><p>⤵ This region calls <a href="#fn-terminus2_handle_llm_interaction"><code>Terminus2._handle_llm_interaction</code></a> — produce six values for local bindings</p></blockquote>
+<pre><code>            (
+                commands,
+                is_task_complete,
+                feedback,
+                analysis,
+                plan,
+                llm_response,
+            ) = await self._handle_llm_interaction(
+                chat, prompt, logging_paths, original_instruction, self._session
+            )</code></pre>
+<hr>
+<h3>Non-obvious design decisions (cross-region)</h3>
+<ul><li>The code snapshots the cumulative <code>chat.total_*</code> and <code>chat.total_cost</code> counters into local <code>*_before</code> variables before the awaited <code>_handle_llm_interaction(...)</code> call. This is a deliberate checkpoint pattern: later code can compare post-call totals against these pre-call baselines to compute per-call deltas.</li></ul>
+<h3>Relations</h3>
+<ul><li><strong>Callers</strong>: Terminus2._run_agent_loop</li><li><strong>Core callees</strong>: Terminus2._setup_episode_logging; Terminus2._handle_llm_interaction</li><li><strong>Config / state sources</strong>: self._session; chat.total_input_tokens; chat.total_output_tokens; chat.total_cache_tokens; chat.total_cost; logging_dir; episode</li><li><strong>Results to</strong>: local <code>logging_paths</code>; local <code>tokens_before_input</code>; local <code>tokens_before_output</code>; local <code>tokens_before_cache</code>; local <code>cost_before</code>; local <code>commands</code>; local <code>is_task_complete</code>; local <code>feedback</code>; local <code>analysis</code>; local <code>plan</code>; local <code>llm_response</code></li><li><strong>Related siblings</strong>: Terminus2._setup_episode_logging</li></ul></div></details><details class="file" id="fn-terminus2_handle_llm_interaction"><summary><span class="chev"></span><code class="fpath">Terminus2._handle_llm_interaction</code><a class="fn-range" href="../code/terminus_2.py.html#L1186-L1188" title="terminus_2.py:1186-1188">terminus_2.py:1186–1188 ↗</a></summary><div class="file-body"><p class="fn-sub">awaits core LLM query into local response</p>
+<blockquote><p><strong>Stage context</strong>: This region sits inside <code>Terminus2._handle_llm_interaction</code> during the stage's actual model call. It runs after sibling code has prepared <code>chat</code>, <code>prompt</code>, and <code>logging_paths</code>, and before later code in the same function inspects <code>llm_response</code>.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>This region awaits <code>self._query_llm(...)</code> with the current local inputs <code>chat</code>, <code>prompt</code>, <code>logging_paths</code>, <code>original_instruction</code>, and <code>session</code>. It stores the awaited result in local <code>llm_response</code>. The snippet shows a simple await-assignment and no direct state mutation.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>region inputs: local names </code>chat<code>, </code>prompt<code>, </code>logging_paths<code>, </code>original_instruction<code>, </code>session<code>; bound method </code>self._query_llm``</p>
+<ul><li>params: <code>chat</code>: <code>?</code> — local conversation object passed through to <code>_query_llm</code>; <code>prompt</code>: <code>?</code> — local prompt value forwarded to <code>_query_llm</code>; <code>logging_paths</code>: <code>?</code> — local logging destination tuple forwarded to <code>_query_llm</code>; <code>original_instruction</code>: <code>?</code> — local original instruction forwarded to <code>_query_llm</code>; <code>session</code>: <code>?</code> — local session value forwarded to <code>_query_llm</code>; <code>self._query_llm</code>: <code>callable</code> — bound async helper invoked and awaited</li><li>reads: <code>self._query_llm</code></li><li>returns: binds local <code>llm_response</code> to the awaited result of <code>self._query_llm(...)</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Call <code>self._query_llm</code> with <code>chat</code>, <code>prompt</code>, <code>logging_paths</code>, <code>original_instruction</code>, and <code>session</code>.</li><li>Await that call and assign the resulting value to local <code>llm_response</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>        llm_response = await self._query_llm(
+            chat, prompt, logging_paths, original_instruction, session
+        )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>No non-obvious behavior is visible here. The region is a direct await-assignment, and any retry, logging, or fallback policy lives outside this line range.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Terminus2._handle_llm_interaction</li><li><strong>Core callees</strong>: Terminus2._query_llm</li><li><strong>Config / state sources</strong>: self._query_llm; local <code>chat</code>; local <code>prompt</code>; local <code>logging_paths</code>; local <code>original_instruction</code>; local <code>session</code></li><li><strong>Results to</strong>: local <code>llm_response</code> in <code>Terminus2._handle_llm_interaction</code></li><li><strong>Related siblings</strong>: Terminus2._setup_episode_logging; Terminus2._run_agent_loop</li></ul></div></details><details class="file" id="fn-terminus2_query_llm"><summary><span class="chev"></span><code class="fpath">Terminus2._query_llm</code><a class="fn-range" href="../code/terminus_2.py.html#L1002-L1176" title="terminus_2.py:1002-1176">terminus_2.py:1002–1176 (7 regions) ↗</a></summary><div class="file-body"><p class="fn-sub">Primary LLM call with overflow recovery and retry shaping</p>
+<blockquote><p><strong>Stage context</strong>: This function sits under <code>_handle_llm_interaction</code>, which simply awaits it and returns the resulting <code>llm_response</code>. The owning stage snapshots token and cost totals before this call, so <code>_query_llm</code> focuses on making the request, timing it, logging prompt/response files, and recovering from the two modeled LLM overflow failures.</p></blockquote>
+<h3>What this code does</h3>
+<p><code>_query_llm</code> sends <code>prompt</code> through <code>chat.chat(...)</code> and returns the resulting LLM response on the normal path. It optionally writes <code>prompt</code> and response text to the per-episode files supplied in <code>logging_paths</code>, and it records each actual <code>chat.chat(...)</code> duration in <code>self._api_request_times</code>. If <code>ContextLengthExceededError</code> occurs, it switches to a three-level recovery path: unwind history, try full <code>_summarize(...)</code>, then a short one-shot summary, then a screen-only fallback prompt. If <code>OutputLengthExceededError</code> occurs, it first asks <code>self._parser</code> to salvage a valid partial answer from <code>truncated_response</code>; otherwise it injects a corrective user message into <code>chat.messages</code> and recursively retries. Any other exception is only logged here and then re-raised for the surrounding retry policy.</p>
+<h3>Interface · params / IO</h3>
+<p><code>async def _query_llm(self, chat, prompt, logging_paths, original_instruction, session)</code></p>
+<ul><li>params: <code>chat</code>: <code>?</code> — Active chat object used for <code>chat.chat(...)</code>, message history, and response-chain reset; <code>prompt</code>: <code>?</code> — Current prompt text to send, or later the corrective retry message; <code>logging_paths</code>: <code>?</code> — Tuple unpacked as <code>(logging_path, prompt_path, response_path)</code> from <code>_setup_episode_logging</code>; <code>original_instruction</code>: <code>?</code> — Task instruction reused when building summarization fallback prompts; <code>session</code>: <code>?</code> — Live terminal session required for screen capture during context-overflow recovery</li><li>reads: <code>self._llm_call_kwargs</code>, <code>self._enable_summarize</code>, <code>self._llm</code>, <code>self._parser</code>, <code>self.logger</code></li><li>returns: An LLM response object on the normal and context-overflow paths; on successful output-overflow salvage it returns the salvaged response value directly</li><li>effects: Appends request timings to <code>self._api_request_times</code>; Writes prompt text to <code>prompt_path</code> when provided; Writes response or corrective text to <code>response_path</code> when provided; May mutate <code>self._pending_subagent_refs</code> and <code>self._pending_handoff_prompt</code> during full summarization fallback; May mutate <code>chat.messages</code> and call <code>chat.reset_response_chain()</code> before recursive retry; May unwind chat history via <code>_unwind_messages_to_free_tokens(...)</code></li></ul>
+<h3>Overall structure</h3>
+<div class="table-wrap"><table><thead><tr><th>Region</th><th>Lines</th><th>Role</th><th>Terminal state</th></tr></thead><tbody><tr><td>1</td><td>1002-1020</td><td>Normal request, timing, and file logging</td><td>Returns <code>llm_response</code> on success; otherwise control moves into exception handling</td></tr><tr><td>2</td><td>1024-1034</td><td>Context-overflow gate and pre-recovery trimming</td><td>Raises if summarization is disabled or <code>session</code> is missing; otherwise continues to fallback prompt construction</td></tr><tr><td>3</td><td>1035-1079</td><td>Construct summary-based replacement prompt</td><td>Produces <code>summary_prompt</code>, optionally logs it, then proceeds to retry the chat call</td></tr><tr><td>4</td><td>1080-1099</td><td>Retry chat with fallback prompt</td><td>Returns fallback <code>llm_response</code>, or a canned technical-difficulties response if retry fails</td></tr><tr><td>5</td><td>1102-1127</td><td>Attempt parser-based salvage of truncated output</td><td>Returns salvaged content when available; otherwise continues to corrective retry setup</td></tr><tr><td>6</td><td>1128-1172</td><td>Build corrective retry after unsalvageable truncation</td><td>Recursively calls <code>_query_llm(...)</code> with an error prompt after updating chat history</td></tr><tr><td>7</td><td>1175-1176</td><td>Log and re-raise unknown failure</td><td>Raises the original exception to the caller</td></tr></tbody></table></div>
+<hr>
+<h4>Region 1 · Normal request, timing, and file logging (<a href="../code/terminus_2.py.html#L1002-L1020"><code>terminus_2.py:1002-1020</code></a>)</h4>
+<p>This path unpacks <code>logging_paths</code> into <code>logging_path</code>, <code>prompt_path</code>, and <code>response_path</code>, then writes the outgoing <code>prompt</code> when <code>prompt_path is not None</code>. It wraps the main <code>await chat.chat(...)</code> call with <code>time.time()</code> measurements and appends the elapsed milliseconds to <code>self._api_request_times</code>. On success, it optionally writes <code>llm_response.content</code> to <code>response_path</code> and returns the <code>llm_response</code> object immediately. Any exception leaves this region through the surrounding exception handlers rather than being handled inline here.</p>
+<pre><code>        logging_path, prompt_path, response_path = logging_paths
+
+        if prompt_path is not None:
+            prompt_path.write_text(prompt)
+
+        try:
+            start_time = time.time()
+            llm_response = await chat.chat(
+                prompt,
+                logging_path=logging_path,
+                **self._llm_call_kwargs,
+            )
+            end_time = time.time()
+            request_time_ms = (end_time - start_time) * 1000
+            self._api_request_times.append(request_time_ms)
+
+            if response_path is not None:
+                response_path.write_text(llm_response.content)
+            return llm_response</code></pre>
+<hr>
+<h4>Region 2 · Context-overflow gate and pre-recovery trimming (<a href="../code/terminus_2.py.html#L1024-L1034"><code>terminus_2.py:1024-1034</code></a>)</h4>
+<p>This region handles the <code>ContextLengthExceededError</code> entry into fallback logic. It first checks <code>self._enable_summarize</code>; when that flag is off, it logs the condition and re-raises instead of attempting recovery. It also requires <code>session</code> for the later screen-based fallbacks and raises <code>RuntimeError</code> if no session is available. When both gates pass, it calls <code>_unwind_messages_to_free_tokens(chat, target_free_tokens=4000)</code> to shrink the live chat history before building any replacement prompt.</p>
+<blockquote><p>⤵ This region calls <a href="#fn-terminus2_unwind_messages_to_free_tokens"><code>Terminus2._unwind_messages_to_free_tokens</code></a> — Trim history before retrying after context overflow</p></blockquote>
+<pre><code>            if not self._enable_summarize:
+                self.logger.debug("Context length exceeded and summarization is OFF.")
+                raise
+
+            self.logger.debug("Context length exceeded. Using fallback summarization.")
+
+            if session is None:
+                raise RuntimeError("Cannot handle context length error without session")
+
+            self._unwind_messages_to_free_tokens(chat, target_free_tokens=4000)
+</code></pre>
+<hr>
+<h4>Region 3 · Construct summary-based replacement prompt (<a href="../code/terminus_2.py.html#L1035-L1079"><code>terminus_2.py:1035-1079</code></a>)</h4>
+<p>This region builds <code>summary_prompt</code> through three fallback levels. It first tries <code>await self._summarize(chat, original_instruction, session)</code>; when that succeeds, it stores <code>subagent_trajectory_refs</code> in <code>self._pending_subagent_refs</code> and stores the produced handoff text in <code>self._pending_handoff_prompt</code>. If full summarization fails, it captures the current terminal view from <code>session.capture_pane(...)</code>, asks <code>self._llm.call(...)</code> for a brief continuation summary, and wraps that into a new prompt. If that also fails, it falls back to a no-LLM prompt that combines <code>original_instruction</code> with the last 1000 characters of the current screen. Before handing off to the retry region, it writes the synthesized <code>summary_prompt</code> to <code>prompt_path</code> when logging is enabled.</p>
+<blockquote><p>⤵ This region calls <a href="#fn-terminus2_summarize"><code>Terminus2._summarize</code></a> — Produce full handoff prompt and subagent refs</p></blockquote>
+<pre><code>            summary_prompt = None
+            # Fallback 1: Try full summary
+            try:
+                self.logger.debug("SUMMARIZATION: Attempting full summary")
+                summary_prompt, subagent_trajectory_refs = await self._summarize(
+                    chat, original_instruction, session
+                )
+                # Store subagent_refs to include in the trajectory
+                self._pending_subagent_refs = subagent_trajectory_refs
+                # Store handoff prompt to add as a user step
+                self._pending_handoff_prompt = summary_prompt
+                self.logger.debug("SUMMARIZATION: Full summary succeeded")
+            except Exception as e:
+                self.logger.debug(f"SUMMARIZATION: Full summary failed: {e}")
+
+            # Fallback 2: Try short summary
+            if summary_prompt is None:
+                try:
+                    self.logger.debug("SUMMARIZATION: Attempting short summary")
+                    current_screen = await session.capture_pane(capture_entire=False)
+                    limited_screen = current_screen[-1000:] if current_screen else ""
+
+                    short_prompt = f"Briefly continue this task: {original_instruction}\n\nCurrent state: {limited_screen}\n\nNext steps (2-3 sentences):"
+
+                    short_llm_response: LLMResponse = await self._llm.call(
+                        prompt=short_prompt,
+                        **self._llm_call_kwargs,
+                    )
+                    summary_prompt = f"{original_instruction}\n\nSummary: {short_llm_response.content}"
+                    self.logger.debug("SUMMARIZATION: Short summary succeeded")
+                except Exception as e:
+                    self.logger.error(f"SUMMARIZATION: Short summary failed: {e}")
+
+            # Fallback 3: Ultimate fallback (no LLM calls)
+            if summary_prompt is None:
+                self.logger.debug("SUMMARIZATION: Using ultimate fallback")
+                current_screen = await session.capture_pane(capture_entire=False)
+                limited_screen = current_screen[-1000:] if current_screen else ""
+                summary_prompt = (
+                    f"{original_instruction}\n\nCurrent state: {limited_screen}"
+                )
+
+            if prompt_path is not None:
+                prompt_path.write_text(summary_prompt)
+</code></pre>
+<hr>
+<h4>Region 4 · Retry chat with fallback prompt (<a href="../code/terminus_2.py.html#L1080-L1099"><code>terminus_2.py:1080-1099</code></a>)</h4>
+<p>This region sends <code>summary_prompt</code> through the same <code>chat.chat(...)</code> path as the normal request and records the retry duration in <code>self._api_request_times</code>. If this second <code>chat.chat(...)</code> also raises, the code logs the failure and substitutes a minimal <code>LLMResponse(content="Technical difficulties. Please continue with the task.")</code> instead of propagating the error. It then optionally writes the resulting content to <code>response_path</code> and returns the fallback response.</p>
+<pre><code>            try:
+                start_time = time.time()
+                llm_response = await chat.chat(
+                    summary_prompt,
+                    logging_path=logging_path,
+                    **self._llm_call_kwargs,
+                )
+                end_time = time.time()
+                request_time_ms = (end_time - start_time) * 1000
+                self._api_request_times.append(request_time_ms)
+
+            except Exception as e:
+                self.logger.error(f"Even fallback chat failed: {e}")
+                llm_response = LLMResponse(
+                    content="Technical difficulties. Please continue with the task."
+                )
+
+            if response_path is not None:
+                response_path.write_text(llm_response.content)
+            return llm_response</code></pre>
+<hr>
+<h4>Region 5 · Attempt parser-based salvage of truncated output (<a href="../code/terminus_2.py.html#L1102-L1127"><code>terminus_2.py:1102-1127</code></a>)</h4>
+<p>This region handles <code>OutputLengthExceededError</code> by pulling <code>truncated_response</code> from the exception, with a placeholder string when that attribute is absent. It only attempts structured salvage when <code>self._parser</code> exposes <code>salvage_truncated_response</code>, which matches the comment that this path is XML-parser-specific. When salvage succeeds, it logs that the truncated output still contains a valid answer, optionally writes the salvaged text to <code>response_path</code>, and returns early. If no salvageable response exists, control falls through to the corrective retry logic.</p>
+<pre><code>            self.logger.debug(f"Output length exceeded: {e}")
+
+            truncated_response = getattr(
+                e, "truncated_response", "[TRUNCATED RESPONSE NOT AVAILABLE]"
+            )
+
+            # Try to salvage a valid response from the truncated output
+            # Only available for XML parser
+            salvaged_response = None
+            has_multiple_blocks = False
+
+            if hasattr(self._parser, "salvage_truncated_response"):
+                salvaged_response, has_multiple_blocks = (
+                    self._parser.salvage_truncated_response(truncated_response)
+                )
+
+            if salvaged_response:
+                self.logger.debug(
+                    "Output exceeded length but found valid response. "
+                    "Using truncated version."
+                )
+
+                if response_path is not None:
+                    response_path.write_text(salvaged_response)
+
+                return salvaged_response</code></pre>
+<hr>
+<h4>Region 6 · Build corrective retry after unsalvageable truncation (<a href="../code/terminus_2.py.html#L1128-L1172"><code>terminus_2.py:1128-1172</code></a>)</h4>
+<p>This region turns an unsalvageable truncated output into a new prompt that tells the model to re-issue its request within the actual output limit. It tries <code>self._parser.parse_response(truncated_response)</code> only to extract <code>parse_result.warning</code>; parse failures are logged at debug level and do not block recovery. It derives <code>limit_str</code> from <code>self._llm.get_model_output_limit()</code>, builds <code>error_msg</code>, then appends the failed exchange into <code>chat.messages</code> as a user/assistant pair and calls <code>chat.reset_response_chain()</code>. If <code>response_path</code> exists, it writes the corrective message there, then recursively calls <code>_query_llm(...)</code> with <code>prompt=error_msg</code> so the normal request machinery runs again.</p>
+<blockquote><p>⤵ This region calls <a href="#fn-terminus2_query_llm"><code>Terminus2._query_llm</code></a> — Retry through the same request pipeline recursively</p></blockquote>
+<pre><code>
+            # If we get here, we couldn't salvage a valid response
+            # Try to parse the truncated response to get warnings
+            warnings_text = ""
+            try:
+                parse_result = self._parser.parse_response(truncated_response)
+                if parse_result.warning:
+                    warnings_text = (
+                        f"\n\nParser warnings from your truncated response:\n"
+                        f"{parse_result.warning}"
+                    )
+            except Exception as parse_error:
+                self.logger.debug(f"Failed to parse truncated response: {parse_error}")
+
+            # Get the actual output limit for the model
+            output_limit = self._llm.get_model_output_limit()
+            if output_limit is not None:
+                limit_str = f"{output_limit} tokens"
+            else:
+                limit_str = "the maximum output length"
+
+            error_msg = (
+                "ERROR!! NONE of the actions you just requested were performed "
+                f"because you exceeded {limit_str}. "
+                f"Your outputs must be less than {limit_str}. Re-issue this request, "
+                f"breaking it into chunks each of which is less than {limit_str}."
+            )
+
+            if warnings_text:
+                error_msg += warnings_text
+
+            chat.messages.append({"role": "user", "content": prompt})
+            chat.messages.append({"role": "assistant", "content": truncated_response})
+            chat.reset_response_chain()
+
+            if response_path is not None:
+                response_path.write_text(error_msg)
+
+            return await self._query_llm(
+                chat=chat,
+                prompt=error_msg,
+                logging_paths=logging_paths,
+                original_instruction=original_instruction,
+                session=session,
+            )</code></pre>
+<hr>
+<h4>Region 7 · Log and re-raise unknown failure (<a href="../code/terminus_2.py.html#L1175-L1176"><code>terminus_2.py:1175-1176</code></a>)</h4>
+<p>This final exception path catches any remaining <code>Exception</code> not handled by the overflow-specific branches. It records the failure with <code>self.logger.error(...)</code> and immediately re-raises the same exception. The caller therefore sees the original error, which matches the stage description that higher-level retry logic handles generic failures.</p>
+<pre><code>            self.logger.error(f"Unknown Error in LLM interaction: {e}")
+            raise e</code></pre>
+<hr>
+<h3>Non-obvious design decisions (cross-region)</h3>
+<ul><li>The function distinguishes two overflow classes instead of treating all failures alike: <code>ContextLengthExceededError</code> triggers history reduction plus prompt replacement, while <code>OutputLengthExceededError</code> tries to preserve the model's partial work through <code>self._parser.salvage_truncated_response(...)</code> before asking for a retry.</li><li>Context-overflow recovery is deliberately layered. It prefers <code>_summarize(...)</code> first because that path can also populate <code>self._pending_subagent_refs</code> and <code>self._pending_handoff_prompt</code>, but it still keeps a short-summary path and a no-LLM terminal-screen fallback so the run can continue when summarization helpers fail.</li><li>Request timing is only appended around actual <code>chat.chat(...)</code> calls, both on the normal path and the summary-prompt retry path. The short-summary helper call <code>self._llm.call(...)</code> is not timed here, which keeps <code>self._api_request_times</code> aligned with primary chat requests rather than every auxiliary model call.</li><li>When output truncation cannot be salvaged, the code inserts the failed prompt and truncated assistant text into <code>chat.messages</code> and calls <code>chat.reset_response_chain()</code> before recursion. That preserves conversational context about the failed attempt while forcing the next request to start a fresh response chain.</li><li>The fallback chat retry after context overflow degrades to a canned <code>LLMResponse</code> instead of raising again. By contrast, unknown exceptions are re-raised untouched. This split keeps the known overflow path user-recoverable while leaving generic fault handling to the outer retry wrapper described by the owning stage.</li></ul>
+<h3>Relations</h3>
+<ul><li><strong>Callers</strong>: Terminus2._handle_llm_interaction</li><li><strong>Core callees</strong>: chat.chat; Terminus2._unwind_messages_to_free_tokens; Terminus2._summarize; session.capture_pane; self._llm.call; self._parser.salvage_truncated_response; self._parser.parse_response; chat.reset_response_chain</li><li><strong>Config / state sources</strong>: self._llm_call_kwargs; self._enable_summarize; self._llm; self._parser</li><li><strong>Results to</strong>: Terminus2._handle_llm_interaction; episode prompt/response log files from <code>_setup_episode_logging</code>; <a href="stage-5.html">stage-5</a> context metadata via <code>self._api_request_times</code></li><li><strong>Related siblings</strong>: Terminus2._setup_episode_logging; Terminus2._run_agent_loop; Terminus2._handle_llm_interaction; Terminus2._summarize</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — Append elapsed ms for each chat.chat call</li><li><a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a> — Store summarization subagent refs on full-summary success</li><li><a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — Store fallback handoff prompt from full summary</li><li><a class="reg" href="registers.html#reg-chat-messages"><code>reg-chat-messages</code></a> — Append failed prompt and truncated assistant output</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_unwind_messages_to_free_tokens"><summary><span class="chev"></span><code class="fpath">Terminus2._unwind_messages_to_free_tokens</code><a class="fn-range" href="../code/terminus_2.py.html#L568-L592" title="terminus_2.py:568-592">terminus_2.py:568–592 ↗</a></summary><div class="file-body"><p class="fn-sub">Context-history trimming before LLM retry</p>
+<blockquote><p><strong>Stage context</strong>: This helper supports stage 4.3's context-length recovery path. <code>_query_llm</code> calls it after <code>ContextLengthExceededError</code> to shrink <code>chat.messages</code> before trying the summarization fallback chain. Compared with sibling <code>_query_llm</code>, this function does not talk to the model; it only rewrites the live chat history and clears response-chain state so the next attempt starts from the shorter transcript.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_unwind_messages_to_free_tokens</code> trims recent history from a <code>Chat</code> until the model context has at least <code>target_free_tokens</code> available. It reads the model limit from <code>self._llm</code>, measures current usage through <code>self._count_total_tokens(chat)</code>, mutates <code>chat._messages</code> to a shorter prefix, and then resets the chat's response chain. It returns <code>None</code>; its product is the shortened <code>chat</code> state plus a debug log that reports the remaining message count and approximate free-token budget.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, chat: Chat, target_free_tokens: int = 4000) -&gt; None</code></p>
+<ul><li>params: <code>chat</code>: <code>Chat</code> — Live conversation history to trim in place; <code>target_free_tokens</code>: <code>int</code> — Minimum free context budget to reach before stopping</li><li>reads: <code>self._llm</code>, <code>self._count_total_tokens</code>, <code>self.logger</code></li><li>returns: Returns <code>None</code>; the real result is an in-place reduction of <code>chat</code> history and a reset response chain.</li><li>effects: Mutates <code>chat._messages</code> by dropping recent messages; Calls <code>chat.reset_response_chain()</code> after trimming; Emits a debug log through <code>self.logger.debug(...)</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>It reads <code>context_limit</code> from <code>self._llm.get_model_context_limit()</code> to establish the maximum token budget for this model.</li><li>While <code>chat.messages</code> still has more than one message, it recomputes <code>current_tokens = self._count_total_tokens(chat)</code> and <code>free_tokens = context_limit - current_tokens</code>, then stops once <code>free_tokens &gt;= target_free_tokens</code>.</li><li>If more space is needed, it shortens history by assigning <code>chat._messages = chat.messages[:-2]</code>, which removes the most recent two messages as one pair; the loop keeps the first message because of the <code>while len(chat.messages) &gt; 1</code> guard.</li><li>After the loop, it calls <code>chat.reset_response_chain()</code> so any derived response-chain state matches the shortened message list.</li><li>It recalculates free space from the final <code>chat</code> state and logs <code>len(chat.messages)</code> plus the approximate remaining budget.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _unwind_messages_to_free_tokens(
+        self, chat: Chat, target_free_tokens: int = 4000
+    ) -&gt; None:
+        """Remove recent messages until we have enough free tokens."""
+        context_limit = self._llm.get_model_context_limit()
+
+        while len(chat.messages) &gt; 1:  # Keep at least the first message
+            current_tokens = self._count_total_tokens(chat)
+            free_tokens = context_limit - current_tokens
+
+            if free_tokens &gt;= target_free_tokens:
+                break
+
+            # Remove the most recent pair of messages (user + assistant)
+            if len(chat.messages) &gt;= 2:
+                chat._messages = chat.messages[:-2]
+            else:
+                break
+
+        chat.reset_response_chain()
+        free_tokens = context_limit - self._count_total_tokens(chat)
+        self.logger.debug(
+            f"Unwound messages. Remaining messages: {len(chat.messages)}, "
+            f"Free tokens: approximately {free_tokens}"
+        )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It preserves at least the first message by looping only while <code>len(chat.messages) &gt; 1</code>. That keeps the conversation anchored to its original opening context instead of allowing a complete wipe, which would make the retry less grounded.</li><li>It removes history in two-message chunks via <code>chat.messages[:-2]</code> instead of single messages. The comment names these as a <code>user + assistant</code> pair, so the function favors keeping turn structure coherent over extracting the smallest possible amount of text each iteration.</li><li>It recomputes token usage on every pass with <code>self._count_total_tokens(chat)</code> rather than estimating the impact of the removed messages. That costs repeated counting work, but it stays aligned with the model's actual token accounting as the remaining transcript changes.</li><li>It always calls <code>chat.reset_response_chain()</code> after trimming, even if the loop made no cuts. That avoids leaving response-chain state tied to a longer prior message list, which matters because <code>_query_llm</code> will reuse the same <code>chat</code> object on the recovery path.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Terminus2._query_llm</li><li><strong>Core callees</strong>: self._llm.get_model_context_limit; self._count_total_tokens; chat.reset_response_chain; self.logger.debug</li><li><strong>Config / state sources</strong>: self._llm; target_free_tokens</li><li><strong>Results to</strong>: Mutated <code>chat.messages</code> consumed by <code>Terminus2._query_llm</code> fallback retries; Reset response-chain state used by the next <code>chat.chat(...)</code> attempt; Debug logging stream for context-recovery diagnostics</li><li><strong>Related siblings</strong>: Terminus2._query_llm; Terminus2._handle_llm_interaction</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-chat-messages"><code>reg-chat-messages</code></a> — trim live history during context recovery</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_parse_skill_frontmatter"><summary><span class="chev"></span><code class="fpath">Terminus2._parse_skill_frontmatter</code><a class="fn-range" href="../code/terminus_2.py.html#L402-L417" title="terminus_2.py:402-417">terminus_2.py:402–417 ↗</a></summary><div class="file-body"><p class="fn-sub">Parse SKILL.md frontmatter into prompt-ready metadata</p>
+<blockquote><p><strong>Stage context</strong>: This helper sits upstream of the <a href="stage-4.3.html">stage-4.3</a> LLM query path. <code>_build_skills_section</code> uses it while assembling the skills text that will later be embedded in the prompt sent through <code>_handle_llm_interaction</code> and <code>_query_llm</code>. Unlike the stage's sibling functions that manage logging, token pressure, and LLM retries, this function only filters a skill document down to the two fields the prompt builder needs.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_parse_skill_frontmatter</code> inspects the start of a <code>SKILL.md</code> <code>content</code> string for a YAML frontmatter block and extracts only <code>name</code> and <code>description</code>. It returns <code>{"name": ..., "description": ...}</code> when the frontmatter exists, parses as YAML, and produces a mapping containing both keys. If the frontmatter is missing, malformed, or incomplete, it returns <code>None</code>. It reads no instance state and mutates nothing.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(content: str) -&gt; dict[str, str] | None</code></p>
+<ul><li>params: <code>content</code>: <code>str</code> — Full <code>SKILL.md</code> text to inspect for leading YAML frontmatter</li><li>returns: Either a two-key dictionary containing <code>name</code> and <code>description</code>, or <code>None</code> when extraction fails any validation step</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>It matches <code>content</code> against the leading-frontmatter pattern <code>r"^---\n(.*?)\n---"</code> with <code>re.DOTALL</code> and stops immediately with <code>None</code> if no opening block appears at the start.</li><li>If the regex matches, it parses the captured block with <code>yaml.safe_load(match.group(1))</code>.</li><li>If <code>yaml.safe_load(...)</code> raises <code>yaml.YAMLError</code>, it catches that specific parse failure and returns <code>None</code>.</li><li>It validates that the parsed object <code>fm</code> is a <code>dict</code> and that both <code>"name"</code> and <code>"description"</code> are present; otherwise it returns <code>None</code>.</li><li>On the success path, it returns a new dictionary containing only <code>{"name": fm["name"], "description": fm["description"]}</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _parse_skill_frontmatter(content: str) -&gt; dict[str, str] | None:
+        """Parse YAML frontmatter from SKILL.md content, returning name and description."""
+        import re
+
+        import yaml
+
+        match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
+        if not match:
+            return None
+        try:
+            fm = yaml.safe_load(match.group(1))
+        except yaml.YAMLError:
+            return None
+        if not isinstance(fm, dict) or "name" not in fm or "description" not in fm:
+            return None
+        return {"name": fm["name"], "description": fm["description"]}</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It fails closed at every validation step (<code>not match</code>, <code>yaml.YAMLError</code>, missing keys) so a bad skill file does not break prompt assembly in <code>_build_skills_section</code>. The alternative would be to raise and force the caller to handle malformed skill metadata.</li><li>It uses <code>yaml.safe_load(...)</code> instead of a more permissive loader to keep frontmatter parsing limited to basic YAML data structures. That fits the function's narrow goal: read metadata, not execute or construct arbitrary objects.</li><li>It returns only <code>name</code> and <code>description</code> even if <code>fm</code> contains more keys. That keeps the contract small and aligned with the prompt builder's immediate need, rather than leaking the whole frontmatter schema outward.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Terminus2._build_skills_section</li><li><strong>Core callees</strong>: <code>re.match</code>; <code>yaml.safe_load</code></li><li><strong>Config / state sources</strong>: <code>content</code> argument</li><li><strong>Results to</strong>: Skill metadata selection inside <code>Terminus2._build_skills_section</code>; Prompt text that is later consumed by <code>Terminus2._handle_llm_interaction</code>; Prompt text that is later sent by <code>Terminus2._query_llm</code></li><li><strong>Related siblings</strong>: Terminus2._handle_llm_interaction; Terminus2._query_llm</li></ul></div></details><nav class="pn"><a class="pn-prev" href="stage-4.2.html"><span>← Previous</span><strong>Proactive Summarize Probe</strong></a><a class="pn-next" href="stage-4.4.html"><span>Next →</span><strong>Response Parse</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

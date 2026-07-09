@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-4.1 · 循环入口门控</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=zh"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 手册</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=zh" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>返回主页</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>状态流寄存器</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>配置固化</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>环境搭建</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>运行起点</a></div><details class="s-node" open><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>迭代主循环</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link cur" href="stage-4.1.html"><span class="s-num">4.1</span>循环入口门控</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>主动摘要探测</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM 调用</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>响应解析</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>待交接提示 → 用户步骤(或切分)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>错误分支</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>命令执行 → 观察 → 轨迹步骤</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>完成门控与循环控制</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>解析器内部辅助</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>运行收尾</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>录制后处理(外部)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>上下文摘要</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token 与成本核算</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>输出长度限制</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>日志</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux 内部辅助</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">索引</a><span class="sep">›</span><a href="stage-4.html">迭代主循环</a></nav><div class="stage-head"><h1>循环入口门控</h1><div class="meta"><span class="chip mono">stage-4.1</span><span class="chip">Loop Entry Gates</span><span class="chip">2 个函数</span></div></div><p>这个 Stage 在解决<strong>“这一轮能不能合法开始”</strong>的问题。它是每轮迭代的入口检查：先给这次尝试一个稳定的轮次编号，再确认终端会话（tmux session，可被程序远程控制的终端）还活着。它不负责观察、思考或行动，而是在真正进入后续 Stage 前，先把“可追踪”和“可继续”这两个前提立住。</p>
+<ol><li>先记轮次。 <p>这里会先更新内部轮次计数，并把它对外表现为 <a class="reg" href="registers.html#reg-n-episodes"><code>reg-n-episodes</code></a>。这样做的意义是：<strong>哪怕这轮刚准备开始就发现 session 已结束，这次尝试也仍然有编号可查</strong>。对用户侧遥测来说，轮次是稳定的、连续的，不会因为检查失败而“少一轮”。</p></li><li>再查 session 还活不活。 <p><code>TmuxSession.is_session_alive()</code>（检查当前 tmux 会话是否还存在）负责回答一个很基础的问题：后面那些 Stage 还有没有运行土壤。 如果会话已经没了，后面的观察、总结、行动都失去对象，继续跑只会制造噪音。</p></li><li>根据检查结果走两条明确路径。 <ul><li><code>alive = True</code>：说明运行前提成立，调度继续，进入 <code>stage-4.2 Proactive Summarize Probe</code>。 </li><li><code>alive = False</code>：记录 “Session has ended”，<strong>终止当前迭代，并阻断后续 Stage 调度</strong>。控制权直接返回循环外层；之后 <code>run()</code> 里的 <code>finally</code> 仍会照常收尾。 </li></ul></li><li>为什么这个检查必须放在这里。 <p>因为它属于“入口门禁”。太早放，还没有轮次上下文；太晚放，后面的 Stage 可能已经开始读终端、拼上下文、调 LLM（大语言模型），浪费成本。放在迭代最前面，能用最小代价挡住一整轮无效工作。</p></li></ol>
+<ul><li>写: <a class="reg" href="registers.html#reg-n-episodes"><code>reg-n-episodes</code></a> — 每轮迭代一开始写入；来源是内部轮次计数的最新值，对外作为本轮的 1-based 轮次编号，供后续遥测与上下文使用</li><li>触发下游: <code>stage-4.2 Proactive Summarize Probe</code> — 仅当外部 session 存活检查结果为 <code>alive=True</code> 时进入</li></ul>
+<p>上游 <code>stage-4 Iteration Loop ★ Core ★</code> 给的是“开始新一轮”的控制权。这个 Stage 产出两样东西：一个可追踪的轮次编号，以及一个明确的入口判定；前者会在后面进入上下文元数据，后者决定是继续调度到 <a href="stage-4.2.html">[stage-4.2</a>](<a href="stage-4.2.html">stage-4.2</a>.html)，还是直接停止后续 Stage。</p><div class="files-bar"><h2 class="sec">函数细节<span class="pill">2</span></h2><span class="spacer"></span><button class="tool" data-x="expand">全部展开</button><button class="tool" data-x="collapse">全部折叠</button></div><details class="file" id="fn-tmuxsession_is_session_alive"><summary><span class="chev"></span><code class="fpath">TmuxSession.is_session_alive</code><a class="fn-range" href="../code/tmux_session.py.html#L518-L524" title="tmux_session.py:518-524">tmux_session.py:518–524 ↗</a></summary><div class="file-body"><p class="fn-sub">tmux 会话存活性的布尔探针</p>
+<blockquote><p><strong>stage 上下文</strong>: 该条目属于 <a href="stage-4.1.html">stage-4.1</a> 所需的会话存活检查能力，但这里仅覆盖 <code>TmuxSession.is_session_alive</code> 这一底层探针本身。函数体只负责发起一次 <code>self.environment.exec(...)</code> 调用并把其 <code>return_code</code> 映射为布尔值，不包含外层循环、日志或提前退出控制。作为本 stage 当前唯一已翻译单元，它提供的是兄弟逻辑可复用的原子检查结果。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>该方法异步执行一次命令探测：以 <code>self._session_name</code> 组装 <code>tmux has-session -t ...</code>，并以 <code>self._user</code> 身份通过 <code>self.environment.exec(...)</code> 发出。它读取 <code>self.environment</code>、<code>self._session_name</code> 与 <code>self._user</code>，等待得到 <code>result</code> 后返回 <code>result.return_code == 0</code> 的布尔值。方法本身不写入实例状态；唯一外部作用是委托环境层执行该命令。若 <code>exec(...)</code> 抛出异常，此处不捕获，异常将直接传播给调用方。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>async def is_session_alive(self) -&gt; bool</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 提供执行环境、会话名与用户身份的实例对象</li><li>读状态: <code>self.environment</code>, <code>self._session_name</code>, <code>self._user</code></li><li>返回: 返回布尔值：当等待得到的 <code>result.return_code == 0</code> 时为 <code>True</code>，否则为 <code>False</code>；若 <code>self.environment.exec(...)</code> 抛出异常，则本方法不返回布尔值而是向上传播异常。</li><li>副作用: 通过 <code>self.environment.exec(...)</code> 委托外部环境执行一次命令 <code>tmux has-session -t &lt;session&gt;</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>构造传给 <code>self.environment.exec(...)</code> 的参数：<code>command</code> 为 <code>"tmux has-session -t {}".format(self._session_name)</code>，<code>user</code> 为 <code>self._user</code>。</li><li>异步等待 <code>self.environment.exec(...)</code> 完成，并将结果绑定到局部变量 <code>result</code>。</li><li>读取 <code>result.return_code</code>，计算表达式 <code>result.return_code == 0</code>。</li><li>返回上述比较结果作为方法的布尔返回值。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    async def is_session_alive(self) -&gt; bool:
+        """Check if the tmux session is still alive."""
+        result = await self.environment.exec(
+            command="tmux has-session -t {}".format(self._session_name),
+            user=self._user,
+        )
+        return result.return_code == 0</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>该实现把命令结果压缩为 <code>return_code == 0</code> 的单一判定，而不检查 <code>result</code> 的其他字段；这是代码中直接可见的取舍，意味着调用方只得到成败布尔值而非更细粒度的执行信息。</li><li>命令字符串通过 <code>"tmux has-session -t {}".format(self._session_name)</code> 直接由会话名插入，函数体未做额外转义或校验；这是当前实现选择的最直接参数化方式。</li><li>方法不在本地直接启动进程，而是统一委托给 <code>self.environment.exec(...)</code>；这样本函数只承担探测请求与结果映射，不承担环境执行细节。</li><li>对 <code>await self.environment.exec(...)</code> 没有 <code>try/except</code> 包裹，因此执行阶段出现的异常不会被吞掉或转换为 <code>False</code>，而是保持原样传播给调用方。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未在所给源码片段中展示；调用方未知，但应为需要布尔化会话探测结果的上层逻辑</li><li><strong>核心被调用</strong>: self.environment.exec</li><li><strong>配置/状态来源</strong>: self._session_name; self._user; self.environment</li><li><strong>结果去向</strong>: 直接作为本方法的布尔返回值交给调用方; 若 <code>self.environment.exec(...)</code> 失败，则异常直接传播到调用方</li></ul></div></details><details class="file" id="fn-terminus2_run_agent_loop"><summary><span class="chev"></span><code class="fpath">Terminus2._run_agent_loop</code><a class="fn-range" href="../code/terminus_2.py.html#L1260-L1281" title="terminus_2.py:1260-1281">terminus_2.py:1260–1281 ↗</a></summary><div class="file-body"><p class="fn-sub">代理循环入口的上下文与会话闸门</p>
+<blockquote><p><strong>stage 上下文</strong>: 这段代码位于 <code>_run_agent_loop</code> 的循环入口，承担本 stage 所定义的两道前置闸门：先把对外可见的轮次计数写成 1-based 的 <code>self._n_episodes</code>，再检查 tmux 会话是否仍然存活。它只在正式 episode 逻辑开始前运行，因此既负责建立本次 run 的基础统计上下文，也负责执行 loop 内唯一的非完成态早退路径。与兄弟函数 <code>TmuxSession.is_session_alive</code> 的关系是：这里消费其布尔结果决定是否立即结束整个 agent loop，而不再进入后续 stage。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>该片段先验证运行所需的两个关键对象 <code>self._context</code> 与 <code>self._session</code> 均已就绪；若任一缺失，立即抛出 <code>RuntimeError</code>，拒绝在不完整状态下继续执行。随后它用 <code>initial_prompt</code> 初始化工作提示词，并把共享上下文中的输入/输出/cache token 计数与成本字段重置为本次 run 的初始值。进入 <code>for episode in range(self._max_episodes)</code> 后，每轮先将 <code>self._n_episodes</code> 更新为对外展示的 1-based 计数，再调用 <code>await self._session.is_session_alive()</code>；若会话已结束，则仅记录 debug 日志并直接 <code>return</code> 退出整个循环函数。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, initial_prompt: str) -&gt; None</code></p>
+<ul><li>参数: <code>self</code>: <code>Terminus2</code> — 持有运行上下文、tmux 会话、循环配置与统计状态的宿主对象; <code>initial_prompt</code>: <code>str</code> — 本次 agent loop 的初始工作提示词来源，被赋给局部变量 <code>prompt</code></li><li>读状态: <code>self._context</code>, <code>self._session</code>, <code>self._max_episodes</code>, <code>self.logger</code></li><li>返回: 返回 <code>None</code>。真正产出是：初始化 <code>self._context</code> 中的聚合统计字段、写入当前轮次 <code>self._n_episodes</code>，并在会话已死时提前终止 <code>_run_agent_loop</code>。</li><li>副作用: 写入局部变量 <code>prompt = initial_prompt</code> 作为后续循环工作的起点; 写入 <code>self._context.n_input_tokens = 0</code>; 写入 <code>self._context.n_output_tokens = 0</code>; 写入 <code>self._context.n_cache_tokens = 0</code>; 写入 <code>self._context.cost_usd = None</code>; 每轮写入 <code>self._n_episodes = episode + 1</code>; 异步调用 <code>self._session.is_session_alive()</code> 探测外部 tmux 会话状态; 在会话已结束时调用 <code>self.logger.debug(...)</code> 记录日志并提前返回</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>首先检查 <code>self._context is None</code>；若为真，抛出 <code>RuntimeError("Agent context is not set. This should never happen.")</code>，阻止在缺失运行上下文时继续。</li><li>将入参 <code>initial_prompt</code> 赋给局部变量 <code>prompt</code>，作为后续 episode 流程的当前工作提示词起点。</li><li>把 <code>self._context</code> 上的聚合统计字段统一重置：<code>n_input_tokens</code>、<code>n_output_tokens</code>、<code>n_cache_tokens</code> 归零，<code>cost_usd</code> 设为 <code>None</code>，为本次 run 建立干净的累计面板。</li><li>随后检查 <code>self._session is None</code>；若会话对象缺失，同样抛出 <code>RuntimeError("Session is not set. This should never happen.")</code>，拒绝进入循环。</li><li>进入 <code>for episode in range(self._max_episodes)</code> 的 episode 主循环；每轮起始先执行 <code>self._n_episodes = episode + 1</code>，把内部从 0 开始的循环索引转换为对用户友好的 1-based 计数。</li><li>紧接着调用 <code>await self._session.is_session_alive()</code>；若结果为假，则记录 debug 日志 <code>"Session has ended, breaking out of agent loop"</code>，并直接 <code>return</code> 结束 <code>_run_agent_loop</code>，不再进入本轮后续阶段，也不再尝试下一轮。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>        if self._context is None:
+            raise RuntimeError("Agent context is not set. This should never happen.")
+
+        prompt = initial_prompt
+
+        self._context.n_input_tokens = 0
+        self._context.n_output_tokens = 0
+        self._context.n_cache_tokens = 0
+        self._context.cost_usd = None
+
+        if self._session is None:
+            raise RuntimeError("Session is not set. This should never happen.")
+
+        # Step ID offset accounts for initial steps in the trajectory:
+        # Step 1: system message (includes task instruction)
+        # Steps 2+: agent episodes (starting from episode 0)
+
+        for episode in range(self._max_episodes):
+            self._n_episodes = episode + 1
+            if not await self._session.is_session_alive():
+                self.logger.debug("Session has ended, breaking out of agent loop")
+                return</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>这里对 <code>self._context</code> 与 <code>self._session</code> 使用显式 <code>None</code> 检查并抛出异常，而不是依赖后续属性访问自然报错；取舍点在于把失败原因固定为更清晰的运行前置条件违例，并用 <code>"This should never happen."</code> 标明这是内部不变量破坏而非常规业务分支。</li><li>统计字段在进入 episode 循环前一次性重置到 <code>self._context</code>，而不是按轮重置；这表明这些 token/cost 指标是 run 级累计量，不是单轮局部量，否则 <a href="stage-5.html">stage-5</a> 将无法直接汇总整个试验过程。</li><li><code>self._n_episodes</code> 写成 <code>episode + 1</code> 而不是直接暴露循环索引，体现了用户可见遥测与内部 0-based 控制变量分离的选择；若直接使用 <code>episode</code>，外部元数据会出现从 0 开始的轮次数，和注释所述的轨迹 step 编号语义也更难对齐。</li><li>会话存活检查被放在每轮一开始，并在失败时直接 <code>return</code> 整个函数，而不是 <code>break</code> 后继续执行循环后逻辑；这样可保证这是 loop 内唯一的非完成态早退路径，并避免在底层 tmux 已终止时继续追加轨迹、发起 LLM 调用或执行其他后续阶段。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2.run; Terminus2.run 内部在完成 <a href="stage-3.html">stage-3</a> 状态准备后进入 <code>_run_agent_loop</code></li><li><strong>核心被调用</strong>: TmuxSession.is_session_alive; self.logger.debug</li><li><strong>配置/状态来源</strong>: self._context; self._session; self._max_episodes; initial_prompt</li><li><strong>结果去向</strong>: self._context.n_input_tokens; self._context.n_output_tokens; self._context.n_cache_tokens; self._context.cost_usd; self._n_episodes; 调用方 <code>Terminus2.run</code> 的后续 <code>finally</code> 清理路径</li><li><strong>同类 sibling</strong>: TmuxSession.is_session_alive：兄弟函数只负责通过 <code>tmux has-session</code> 返回会话是否存在；本段把该布尔值提升为 agent loop 的进入闸门，并在失败时执行本 stage 规定的唯一早退。</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-n-episodes"><code>reg-n-episodes</code></a> — 每轮入口写入 1-based 轮次</li></ul></div>
+</div></details><nav class="pn"><a class="pn-prev" href="stage-4.html"><span>← 上一阶段</span><strong>迭代主循环</strong></a><a class="pn-next" href="stage-4.2.html"><span>下一阶段 →</span><strong>主动摘要探测</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

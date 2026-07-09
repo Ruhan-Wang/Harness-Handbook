@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-4.5 · 待交接提示 → 用户步骤(或切分)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=zh"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 手册</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=zh" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>返回主页</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>状态流寄存器</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>配置固化</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>环境搭建</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>运行起点</a></div><details class="s-node" open><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>迭代主循环</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>循环入口门控</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>主动摘要探测</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM 调用</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>响应解析</a></div><div class="s-leaf"><a class="s-link cur" href="stage-4.5.html"><span class="s-num">4.5</span>待交接提示 → 用户步骤(或切分)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>错误分支</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>命令执行 → 观察 → 轨迹步骤</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>完成门控与循环控制</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>解析器内部辅助</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>运行收尾</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>录制后处理(外部)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>上下文摘要</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token 与成本核算</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>输出长度限制</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>日志</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux 内部辅助</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">索引</a><span class="sep">›</span><a href="stage-4.html">迭代主循环</a></nav><div class="stage-head"><h1>待交接提示 → 用户步骤(或切分)</h1><div class="meta"><span class="chip mono">stage-4.5</span><span class="chip">Pending Handoff Prompt → User Step (or Split)</span><span class="chip">2 个函数</span></div></div>
+<h2 class="sec">开场解释</h2>
+<p>这个 Stage 在解决什么问题：把“该不该把总结交接词真正写进对话记录”这件事，放到一个统一位置收口。前面阶段可能已经产出了 handoff prompt（交接提示词：让后续上下文接着当前总结继续工作的那段用户话），但此时还不能立刻落盘，因为要先看当前是线性历史模式，还是普通模式。这个 Stage 就是在响应已解析完之后，决定这段提示词该变成一个新的 user step（用户消息步），还是改成一次轨迹切分。</p>
+<h2 class="sec">主流程</h2>
+
+<ol><li>先看有没有待处理的 handoff prompt。 <p>这个值放在 <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a>。如果这里是空，说明这轮没有要交接的内容，这个 Stage 就什么都不做，直接往下走。</p></li><li>如果有，就看是不是线性历史模式。 <p><code>self._linear_history</code> 可以理解成一种“历史只能沿一条线往前写”的模式。这里分支的原因很重要：</p>
+<ul><li>在线性模式里，不能简单把 handoff prompt 追加成一条新 user step，否则会把“总结前”和“总结后”的历史混在同一条轨迹里。 </li><li>在普通模式里，直接把它当成一条新的用户消息接上去就够了。</li></ul></li><li>线性模式：调用 <code>_split_trajectory_on_summarization()</code>（按总结边界把当前轨迹切开，并开始一段新的延续轨迹）。 <p>这里的重点不是“再加一条消息”，而是“换一段历史”。这样做的意义是：总结前的长轨迹到这里收口；总结后的新轨迹从更干净的上下文继续。handoff prompt 在新轨迹里是隐含生效的，不需要再显式写成一步。</p></li><li>非线性模式：把 handoff prompt 追加到当前 live trajectory（当前正在增长的轨迹记录）里，来源记为 <code>user</code>。 <p>这相当于明确告诉后面的 Agent：“现在把这段交接词当作用户刚说的话，按它继续。”</p></li><li>只有在真正消费了这个 handoff prompt 之后，才清掉寄存器。 <p>这样可以保证：前面阶段先“提出一个待处理交接”，这里再“按当前历史策略落地”。之所以要延后到这个 Stage 才写，是因为前面产出 prompt 时，还不知道最终应该“加一步”还是“切轨迹”。</p></li></ol>
+<h2 class="sec"> 状态流动</h2>
+<ul><li>读: <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — 进入本 Stage 时先检查；若为 <code>None</code>，表示没有待处理交接，本 Stage 走空操作路径，不写入轨迹，也不清这个寄存器以外的任何状态（它本来就为空）。</li><li>读: <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — 若非 <code>None</code>，把其中的 handoff prompt 当作本 Stage 要消费的输入；后续要么写成 user step，要么用于切分轨迹。</li><li>读: <code>self._linear_history</code>（历史模式标志，不是 register）— 用来决定消费方式：线性模式走“切轨迹”，非线性模式走“追加 user step”。这里是控制所依赖的状态，但不是寄存器。</li><li>写: live trajectory（当前轨迹容器，不是 register）— 仅在非线性模式下，追加 <code>Step(source="user", message=handoff_prompt)</code>；目的是把交接提示词显式变成后续可见的一步用户消息。</li><li>写: trajectory files / continuation trajectory（轨迹文件与新的延续轨迹，不是 register）— 仅在线性模式下，由 <code>_split_trajectory_on_summarization()</code> 按总结边界切开当前轨迹，并开始新的 continuation；目的是让总结后的历史从新段继续，而不是把 handoff prompt 直接塞进旧段。</li><li>清: <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — 仅在 handoff prompt 被真正消费之后清空；不论消费方式是“追加 user step”还是“切轨迹”，都会在完成后清掉，避免同一段交接词在后续循环里重复生效。</li></ul>
+<blockquote><p>注：本 Stage 还依赖“live trajectory / 轨迹文件 / 历史模式”这类状态承载体，但输入材料里没有给出它们对应的 register id，所以这里明确按“非 register 状态”说明，不伪造寄存器名。</p></blockquote>
+
+<h2 class="sec">与前后 Stage 的衔接</h2>
+<p>上游在更早阶段已经把 handoff prompt 放进 <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a>，而前一站 <code>stage-4.4 Response Parse</code> 则完成了本轮响应解析，让系统进入“该不该落地这段交接词”的时点。本 Stage 的产出不是新的模型响应，而是一次历史写入策略：要么往当前轨迹补一条 user step，要么在线性模式下切出一段新轨迹；做完后，后续阶段再按更新后的轨迹状态继续往下跑。</p><div class="files-bar"><h2 class="sec">函数细节<span class="pill">2</span></h2><span class="spacer"></span><button class="tool" data-x="expand">全部展开</button><button class="tool" data-x="collapse">全部折叠</button></div><details class="file" id="fn-terminus2_run_agent_loop"><summary><span class="chev"></span><code class="fpath">Terminus2._run_agent_loop</code><a class="fn-range" href="../code/terminus_2.py.html#L1318-L1354" title="terminus_2.py:1318-1354">terminus_2.py:1318–1354 ↗</a></summary><div class="file-body"><p class="fn-sub">汇总并落地交接提示的轨迹分支段</p>
+<blockquote><p><strong>stage 上下文</strong>: 这段代码位于 <a href="stage-4.6.html">stage-4.6</a>，负责把前面 summarization 侧流程暂存下来的产物真正写入当前 trial 的 trajectory。触发条件是 <code>self._pending_subagent_refs</code> 或 <code>self._pending_handoff_prompt</code> 至少其一非空。它与同 stage 的前后段形成顺序配合：前序路径负责产生这些 pending 寄存状态，本段负责消费并清空，后续阶段则继续记录 marker、assistant 输出与完成态。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>该段先检查 <code>self._pending_subagent_refs</code>，若存在，则向 <code>self._trajectory_steps</code> 追加一条合成的 <code>system</code> 步骤，用于声明已执行上下文摘要并保留子代理轨迹引用。随后检查 <code>self._pending_handoff_prompt</code>，并根据 <code>self._linear_history</code> 决定是调用 <code>_split_trajectory_on_summarization(...)</code> 立即切分轨迹，还是直接把该 prompt 作为 <code>user</code> 步骤追加到当前轨迹。两类 pending 状态在消费后都会被显式清空，因此本段的真实产出是 trajectory 状态更新与寄存器回收，而非返回值。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self) -&gt; None</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — Terminus2 实例；提供 pending 状态、trajectory 容器与 linear-history 配置</li><li>读状态: <code>self._pending_subagent_refs</code>, <code>self._trajectory_steps</code>, <code>self._pending_handoff_prompt</code>, <code>self._linear_history</code></li><li>返回: None；实际产出是向 <code>self._trajectory_steps</code> 追加步骤、可能触发轨迹切分，并清空对应 pending 状态。</li><li>副作用: 向 <code>self._trajectory_steps</code> 追加一条 <code>source="system"</code> 的摘要/交接记录; 将 <code>self._pending_subagent_refs</code> 置为 None; 在非 linear-history 模式下，向 <code>self._trajectory_steps</code> 追加一条 <code>source="user"</code> 的 handoff prompt; 在 linear-history 模式下调用 <code>self._split_trajectory_on_summarization(self._pending_handoff_prompt)</code>; 将 <code>self._pending_handoff_prompt</code> 置为 None</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>若 <code>self._pending_subagent_refs</code> 非空，则构造一条新的 <code>Step</code> 并追加到 <code>self._trajectory_steps</code>：其 <code>source</code> 固定为 <code>"system"</code>，<code>message</code> 固定为“Performed context summarization and handoff to continue task.”，并把 <code>self._pending_subagent_refs</code> 包装进 <code>ObservationResult(subagent_trajectory_ref=...)</code> 后写入 <code>observation.results</code>。</li><li>完成上述 system 步骤落地后，立即把 <code>self._pending_subagent_refs</code> 设为 <code>None</code>，避免同一批摘要引用在后续循环中被重复写入。</li><li>随后检查 <code>self._pending_handoff_prompt</code>；若该交接提示存在，则进入 handoff 处理分支。</li><li>当 <code>self._linear_history</code> 为真时，不向当前 <code>self._trajectory_steps</code> 追加用户步骤，而是直接调用 <code>_split_trajectory_on_summarization(self._pending_handoff_prompt)</code>，把轨迹切分责任交给专门的 split 机制处理。</li><li>当 <code>self._linear_history</code> 为假时，直接在当前轨迹中追加一条新的 <code>Step</code>，其 <code>source="user"</code>，<code>message</code> 为 <code>self._pending_handoff_prompt</code>，从而把交接提示显式写入 live trajectory。</li><li>无论走哪条 handoff 分支，最后都把 <code>self._pending_handoff_prompt</code> 设为 <code>None</code>，表示该 deferred prompt 已被消费。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>            if self._pending_subagent_refs:
+                self._trajectory_steps.append(
+                    Step(
+                        step_id=len(self._trajectory_steps) + 1,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        source="system",
+                        message="Performed context summarization and handoff to continue task.",
+                        observation=Observation(
+                            results=[
+                                ObservationResult(
+                                    subagent_trajectory_ref=self._pending_subagent_refs
+                                )
+                            ]
+                        ),
+                    )
+                )
+                self._pending_subagent_refs = None
+
+            # Handle handoff prompt based on linear_history mode
+            if self._pending_handoff_prompt:
+                # If linear_history mode is enabled, split trajectory immediately WITHOUT adding handoff step
+                # The handoff step will be added to the continuation trajectory during the split
+                if self._linear_history:
+                    self._split_trajectory_on_summarization(
+                        self._pending_handoff_prompt
+                    )
+                else:
+                    # For non-linear mode, add the handoff prompt as a user step
+                    self._trajectory_steps.append(
+                        Step(
+                            step_id=len(self._trajectory_steps) + 1,
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                            source="user",
+                            message=self._pending_handoff_prompt,
+                        )
+                    )
+                self._pending_handoff_prompt = None</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>对子代理摘要引用采用单独的合成 <code>system</code> 步骤记录，而不是把它们混入 handoff prompt 的 <code>user</code> 步骤中；这样做把“系统发生了 summarization”与“后续任务如何继续”分离成两类语义不同的轨迹事件，便于后续回放与审计。</li><li>对 handoff prompt 采用 <code>self._linear_history</code> 分支，是一个显式的轨迹建模取舍：在线性历史模式下，不在当前文件中追加这条用户步骤，而是交由 <code>_split_trajectory_on_summarization(...)</code> 在切分边界处处理，以保持单条 trajectory 的时间线整洁；非线性模式则保留该 prompt 作为当前 live trajectory 的普通用户输入。</li><li>两类 pending 状态都使用显式 truthy 检查并在消费后立刻清空，体现的是“一次生产、一次消费”的寄存器语义；若不及时置 <code>None</code>，后续迭代会重复物化同一摘要引用或同一 handoff prompt。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2._run_agent_loop; _run_agent_loop 的主迭代流程在进入 assistant 响应生成前执行该段</li><li><strong>核心被调用</strong>: Step; Observation; ObservationResult; datetime.now; timezone.utc; self._split_trajectory_on_summarization</li><li><strong>配置/状态来源</strong>: self._pending_subagent_refs; self._pending_handoff_prompt; self._linear_history; self._trajectory_steps</li><li><strong>结果去向</strong>: reg-trajectory-steps; 当前 trial 的 trajectory 持久化内容; 后续 <a href="stage-4.9.html">stage-4.9</a> / <a href="stage-5.html">stage-5</a> 的 trajectory dump; linear-history 模式下的 continuation trajectory 切分结果</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a> — 检查是否有待落地子代理引用</li><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — 追加摘要交接的 system 步骤</li><li><a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a> — 写入轨迹后立即清空</li><li><a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — 检查是否有待消费交接提示</li><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — 非线性模式追加 user 交接步骤</li><li><a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — 切分或追加后统一清空</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_split_trajectory_on_summarization"><summary><span class="chev"></span><code class="fpath">Terminus2._split_trajectory_on_summarization</code><a class="fn-range" href="../code/terminus_2.py.html#L1884-L1909" title="terminus_2.py:1884-1909">terminus_2.py:1884–1909 ↗</a></summary><div class="file-body"><p class="fn-sub">线性历史摘要后的轨迹切分器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数服务于 <a href="stage-4.6.html">stage-4.6</a> 在线性历史模式下处理 pending handoff prompt 的分支。与同 stage 中直接把 handoff prompt 追加为 <code>user</code> 步骤的非线性路径不同，它不新增当前步，而是把摘要边界之前的轨迹封存，并为后续 continuation 重新建立内存中的轨迹。它由 <code>_run_agent_loop</code> 在消费 <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> 时触发，是该 stage 中“切分而非追加”的具体执行点。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>该函数在摘要发生后，把当前已记录的 trajectory 按 continuation 边界切开：先将当前段落持久化，再派生新的 <code>self._session_id</code>，最后依据现有 <code>self._chat.messages</code> 重建新的 <code>self._trajectory_steps</code>。输入参数 <code>handoff_prompt</code> 在签名中出现，但本函数体内并未实际使用；真正依赖的是 <code>self._summarization_count</code>、<code>self._session_id</code> 以及 <code>self._chat</code> 的消息历史。它的产出完全体现为状态变更与落盘副作用，而不是返回值。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, handoff_prompt: str) -&gt; None</code></p>
+<ul><li>参数: <code>handoff_prompt</code>: <code>str</code> — 来自 <a href="stage-4.6.html">stage-4.6</a> 的交接提示词；此函数签名接收但函数体内未直接使用</li><li>读状态: <code>self._summarization_count</code>, <code>self._session_id</code>, <code>self._chat</code>, <code>self._trajectory_steps</code></li><li>返回: 返回 <code>None</code>；真正产出是当前 trajectory 分段落盘、<code>self._session_id</code> 更新，以及 <code>self._trajectory_steps</code> 被替换为带 copied 标记的上下文步骤。</li><li>副作用: 调用 <code>_dump_trajectory_with_continuation_index(...)</code> 持久化当前轨迹段; 写入新的 <code>self._session_id</code>; 在 <code>self._chat</code> 存在时重置 <code>self._trajectory_steps</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先以 <code>self._summarization_count - 1</code> 作为 continuation index，调用 <code>_dump_trajectory_with_continuation_index(...)</code>，把摘要边界之前的当前 trajectory 段写出到对应文件。</li><li>随后基于现有 <code>self._session_id</code> 生成 continuation 版本：先取 <code>-cont-</code> 之前的基础 session id，再拼接 <code>-cont-{self._summarization_count}</code>，并回写到 <code>self._session_id</code>。</li><li>接着检查 <code>if self._chat:</code>；只有在聊天对象存在时，才会从聊天历史重建新的内存轨迹。</li><li>重建时使用 <code>self._chat.messages[:-1]</code> 而不是全部消息，将除最后一条响应外的历史转换为步骤，并通过 <code>mark_as_copied=True</code> 将其标记为复制上下文，然后整体替换 <code>self._trajectory_steps</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _split_trajectory_on_summarization(self, handoff_prompt: str) -&gt; None:
+        """Split trajectory on summarization when linear_history is enabled.
+
+        Saves current trajectory segment and resets for continuation with full linear history.
+
+        Args:
+            handoff_prompt: The handoff prompt containing answers
+        """
+        # Save current trajectory segment before creating a continuation
+        # When _summarization_count is 1, dump to trajectory.json (continuation_index = 0)
+        # When _summarization_count is 2, dump to trajectory.cont-1.json (continuation_index = 1)
+        self._dump_trajectory_with_continuation_index(self._summarization_count - 1)
+
+        # Create new session_id for continuation
+        self._session_id = (
+            f"{self._session_id.split('-cont-')[0]}-cont-{self._summarization_count}"
+        )
+
+        # After dumping the trajectory till the summarization stage, reset trajectory by
+        # converting from chat messages (excluding the last response which will be added
+        # by the normal agent loop flow). Mark all these steps as copied context since they
+        # were already present in the previous trajectory segment.
+        if self._chat:
+            self._trajectory_steps = self._convert_chat_messages_to_steps(
+                self._chat.messages[:-1], mark_as_copied=True
+            )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>continuation 文件编号故意使用 <code>self._summarization_count - 1</code>，使第一次摘要仍落到主 <code>trajectory.json</code>，后续才进入 <code>cont-N</code> 命名；这体现的是“先封存当前段，再为下一段编号”的边界定义，而不是把当前摘要次数直接映射到当前落盘文件。</li><li>新 <code>session_id</code> 生成时先做 <code>split('-cont-')[0]</code>，说明 continuation 命名总是回到基础 session id 再追加当前摘要次数，避免在已有 <code>-cont-</code> 后继续级联嵌套，保持续段标识稳定且可预测。</li><li>重建 <code>self._trajectory_steps</code> 时显式排除最后一条 chat message（<code>self._chat.messages[:-1]</code>），因为该响应会由正常 agent loop 流程另行追加；若此处一并纳入，会导致续段中出现重复记录。</li><li>复制历史步骤时使用 <code>mark_as_copied=True</code>，明确区分“从前一段继承的上下文”与“本续段新产生的步骤”；这不是功能正确性所必需的最低实现，但有助于后续轨迹解释与审计。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2._run_agent_loop 在线性历史且存在 pending handoff prompt 时调用</li><li><strong>核心被调用</strong>: Terminus2._dump_trajectory_with_continuation_index; Terminus2._convert_chat_messages_to_steps</li><li><strong>配置/状态来源</strong>: self._summarization_count 决定落盘 continuation index 与新 session_id 后缀; self._session_id 提供 continuation 派生的基础标识; self._chat.messages 提供续段初始上下文来源; <a href="stage-4.6.html">stage-4.6</a> 的 <code>self._linear_history</code> 分支决定本函数是否被选用</li><li><strong>结果去向</strong>: 新的 trajectory 段文件写入磁盘，供后续 trial 记录与 <a href="stage-5.html">stage-5</a> 汇总使用; 更新后的 <code>self._session_id</code> 影响后续 continuation 轨迹命名; 替换后的 <code>self._trajectory_steps</code> 成为后续 agent loop 继续追加步骤的基础; 与兄弟路径相比，它避免在当前 live trajectory 中直接追加 <code>Step(source="user", message=handoff_prompt)</code></li><li><strong>同类 sibling</strong>: Terminus2._run_agent_loop：该兄弟函数负责在 <a href="stage-4.6.html">stage-4.6</a> 判定走“切分轨迹”还是“直接追加 user 步骤”的分支；本函数实现前者的具体状态迁移。</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — 决定落盘段号与续段编号</li><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — 重建为 copied 上下文步骤</li><li><a class="reg" href="registers.html#reg-chat-messages"><code>reg-chat-messages</code></a> — 从现有聊天历史恢复续段上下文</li></ul></div>
+</div></details><nav class="pn"><a class="pn-prev" href="stage-4.4.html"><span>← 上一阶段</span><strong>响应解析</strong></a><a class="pn-next" href="stage-4.6.html"><span>下一阶段 →</span><strong>错误分支</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

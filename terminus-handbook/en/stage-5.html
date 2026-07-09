@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-5 · Run Teardown</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=en"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=en" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>Home</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>State-flow registers</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>Configuration Crystallization</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>Environment Setup</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>Run Onset</a></div><details class="s-node"><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>Iteration Loop</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>Loop Entry Gates</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>Proactive Summarize Probe</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM Query</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>Response Parse</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>Pending Handoff Prompt → User Step (or Split)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>Error Branch</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>Command Execute → Observation → Trajectory Step</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>Completion Gate + Loop Control</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>Parser internal helpers</a></div></div></details><div class="s-leaf"><a class="s-link cur" href="stage-5.html"><span class="s-num">5</span>Run Teardown</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>Recording Post-process (External)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>Context Summarization</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token &amp; Cost Accounting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>Output Length Limiting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>Logging</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux internal helpers</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">Index</a></nav><div class="stage-head"><h1>Run Teardown</h1><div class="meta"><span class="chip mono">stage-5</span><span class="chip">4 functions</span></div></div>
+<h2 class="sec">Opening Explanation</h2>
+<p>This stage exists to turn a messy, just-finished run into a clean final record. By the time the agent loop stops, the system may have ended normally, returned early because the session died, or crashed with an exception. Teardown makes those endings look consistent from the outside. Its job is to gather the last run-wide facts, fold subagent usage into the main totals, attach final metadata, and write one last trajectory snapshot. It sits at the very end of <code>Terminus2.run()</code> inside the <code>finally</code> block, which means it runs no matter how the loop ended. Without it, the trial could finish with incomplete metrics, missing rollout details, or an on-disk record that stops one step too early.</p>
+<h2 class="sec">Main Flow</h2>
+
+<ol><li><code>Terminus2.run()</code> enters its <code>finally</code> block because the run is over, regardless of why it ended. <p>This is the stage boundary: final context cleanup and final record capture for the run.</p></li><li>It combines the main chat's rollout details with the separately collected subagent rollout details. <p>A subagent is a smaller helper agent called during the run. Its activity is tracked off to the side so the main chat stays clean while the loop is still active. Teardown is where those two views get merged into one trial-level story.</p></li><li>It folds subagent token usage into the final trial totals. <p>During the run, main-chat usage and subagent usage are tracked separately on purpose. That keeps per-chat accounting simple while the agent is working. At teardown, those numbers are added together so the final context reflects the true cost of the whole run, not just the main chat.</p></li><li>It sets the final cost field, but only if the result is meaningful. <p>If the computed cost is zero or below, the stored value becomes <code>None</code>. This avoids pretending there was a billable cost when there effectively was not.</p></li><li>It attaches final metadata such as episode count, API request times, and summarization count. <p>This is not new live state for the loop. It is a compact summary of what happened during the run, prepared for anything that reads the finished context later.</p></li><li>It optionally includes <code>all_messages</code> when <code>_store_all_messages</code> is enabled. <p>That branch is simple: if full message retention was requested, teardown adds them; if not, it leaves them out to save space and avoid over-recording.</p></li><li><code>Terminus2._dump_trajectory()</code> (write the in-memory step history to disk) runs one last time. <p>The loop may already have dumped trajectory data incrementally, but this final write matters because teardown has just finalized the run-level context. Without this last dump, the file on disk could miss the final totals and end-state that only become complete here.</p></li></ol>
+<h2 class="sec"> State Flow</h2>
+<ul><li>reads: <a class="reg" href="registers.html#reg-subagent-metrics"><code>reg-subagent-metrics</code></a> — read at teardown so subagent token and cost totals can be folded into the final run-level totals published on <code>context</code></li><li>reads: <a class="reg" href="registers.html#reg-n-episodes"><code>reg-n-episodes</code></a> — read to publish the final episode count into <code>context.metadata</code></li><li>reads: <a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — read to publish how many summarization passes happened during the run</li><li>reads: <a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — read to publish per-request latency history into <code>context.metadata</code></li><li>reads: <a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — read by <code>_dump_trajectory()</code> so the final on-disk trajectory includes the complete recorded step sequence</li><li>triggers downstream: <code>stage-6 Recording Post-process (External)</code> — after teardown has finalized <code>context</code> and written the final trajectory snapshot, external post-processing can consume that finished record</li></ul>
+<h2 class="sec">Pipeline Hand-Off</h2>
+<p>Upstream stages leave this stage with a finished-or-aborted run, accumulated step history, and metrics still split across main-agent and subagent tracking. This stage turns that into a finalized <code>context</code> plus the last on-disk trajectory write, which the next step—an external post-process, not another internal loop stage—can treat as the authoritative trial record.</p><div class="files-bar"><h2 class="sec">Functions<span class="pill">4</span></h2><span class="spacer"></span><button class="tool" data-x="expand">Expand all</button><button class="tool" data-x="collapse">Collapse all</button></div><details class="file" id="fn-terminus2_run"><summary><span class="chev"></span><code class="fpath">Terminus2.run</code><a class="fn-range" href="../code/terminus_2.py.html#L1637-L1665" title="terminus_2.py:1637-1665">terminus_2.py:1637–1665 ↗</a></summary><div class="file-body"><p class="fn-sub">Context totals and metadata finalization region</p>
+<blockquote><p><strong>Stage context</strong>: This region performs the stage's visible bookkeeping work on <code>context</code>. It runs after prior <a href="stage-5.html">stage-5</a> translations would have finished any earlier teardown work, and it focuses on exporting accumulated run data plus making a final <code>_dump_trajectory()</code> call. This is the first translated entry in the stage, so there are no translated sibling cross-references yet.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>This region copies accumulated rollout and token-accounting data from <code>self</code> into <code>context</code>. It merges main-chat data from <code>self._chat</code> with subagent data from <code>self._subagent_rollout_details</code> and <code>self._subagent_metrics</code>, builds <code>context.metadata</code> from several counters, and optionally includes <code>self._chat.messages</code> when <code>self._store_all_messages</code> is true. It then calls <code>_dump_trajectory()</code>; the visible product of the region is updated <code>context</code> fields plus that method call.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, context, ...unseen...) -&gt; unknown in this region</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — owner of chat, subagent accumulators, counters, and <code>_dump_trajectory()</code>; <code>context</code>: <code>?</code> — external result object that receives rollout details, token totals, cost, and metadata</li><li>reads: <code>self._chat.rollout_details</code>, <code>self._subagent_rollout_details</code>, <code>self._chat.total_input_tokens</code>, <code>self._subagent_metrics.total_prompt_tokens</code>, <code>self._chat.total_output_tokens</code>, <code>self._subagent_metrics.total_completion_tokens</code>, <code>self._chat.total_cache_tokens</code>, <code>self._subagent_metrics.total_cached_tokens</code>, <code>self._chat.total_cost</code>, <code>self._subagent_metrics.total_cost_usd</code>, <code>self._n_episodes</code>, <code>self._api_request_times</code>, <code>self._summarization_count</code>, <code>self._store_all_messages</code>, <code>self._chat.messages</code></li><li>returns: No return is visible in this region; its product is mutation of <code>context</code> and a call to <code>_dump_trajectory()</code>.</li><li>effects: writes <code>context.rollout_details</code>; writes <code>context.n_input_tokens</code>; writes <code>context.n_output_tokens</code>; writes <code>context.n_cache_tokens</code>; writes <code>context.cost_usd</code>; writes <code>context.metadata</code>; conditionally writes <code>context.metadata["all_messages"]</code>; calls <code>self._dump_trajectory()</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Set <code>context.rollout_details</code> to the concatenation of <code>self._chat.rollout_details</code> and <code>self._subagent_rollout_details</code>.</li><li>Compute aggregate token totals by adding <code>self._chat</code> totals to the matching fields on <code>self._subagent_metrics</code>, then store them in <code>context.n_input_tokens</code>, <code>context.n_output_tokens</code>, and <code>context.n_cache_tokens</code>.</li><li>Add <code>self._chat.total_cost</code> and <code>self._subagent_metrics.total_cost_usd</code>, then store that value in <code>context.cost_usd</code> only when the sum is greater than zero; otherwise store <code>None</code>.</li><li>Build <code>context.metadata</code> with <code>n_episodes</code> from <code>self._n_episodes</code>, <code>api_request_times_msec</code> from <code>self._api_request_times</code>, and <code>summarization_count</code> from <code>self._summarization_count</code>.</li><li>If <code>self._store_all_messages</code> is true, extend <code>context.metadata</code> with an <code>all_messages</code> entry taken from <code>self._chat.messages</code>.</li><li>Call <code>self._dump_trajectory()</code> after the <code>context</code> assignments.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>            context.rollout_details = (
+                self._chat.rollout_details + self._subagent_rollout_details
+            )
+
+            # Include subagent metrics in context totals
+            context.n_input_tokens = (
+                self._chat.total_input_tokens
+                + self._subagent_metrics.total_prompt_tokens
+            )
+            context.n_output_tokens = (
+                self._chat.total_output_tokens
+                + self._subagent_metrics.total_completion_tokens
+            )
+            context.n_cache_tokens = (
+                self._chat.total_cache_tokens
+                + self._subagent_metrics.total_cached_tokens
+            )
+            total_cost = self._chat.total_cost + self._subagent_metrics.total_cost_usd
+            context.cost_usd = total_cost if total_cost &gt; 0 else None
+            context.metadata = {
+                "n_episodes": self._n_episodes,
+                "api_request_times_msec": self._api_request_times,
+                "summarization_count": self._summarization_count,
+            }
+            if self._store_all_messages:
+                context.metadata["all_messages"] = self._chat.messages
+
+            # Dump trajectory to JSON
+            self._dump_trajectory()</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The region keeps subagent accounting separate until export time: it reads main-chat totals from <code>self._chat</code> and subagent totals from <code>self._subagent_metrics</code>, then combines them only when filling <code>context</code>. That preserves the distinction in the internal accumulators while still publishing one set of totals.</li><li>The cost field uses an explicit <code>total_cost &gt; 0</code> check and writes <code>None</code> otherwise. This chooses a sentinel for zero-or-negative totals instead of always exposing a numeric value.</li><li>The metadata dictionary is created in one assignment and then conditionally extended with <code>all_messages</code> under <code>if self._store_all_messages:</code>. That keeps the optional payload isolated behind one flag instead of mixing it into the base metadata shape.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>Terminus2.run</code> region containing this snippet</li><li><strong>Core callees</strong>: <code>self._dump_trajectory()</code></li><li><strong>Config / state sources</strong>: <code>self._store_all_messages</code> gates whether full chat history is exported; <code>self._chat</code> supplies rollout details, token totals, cost, and optional messages; <code>self._subagent_metrics</code> supplies subagent token and cost totals; <code>self._subagent_rollout_details</code> supplies additional rollout records</li><li><strong>Results to</strong>: <code>context.rollout_details</code>; <code>context.n_input_tokens</code>; <code>context.n_output_tokens</code>; <code>context.n_cache_tokens</code>; <code>context.cost_usd</code>; <code>context.metadata</code>; <code>self._dump_trajectory()</code> side effect</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-subagent-metrics"><code>reg-subagent-metrics</code></a> — fold subagent token and cost totals</li><li><a class="reg" href="registers.html#reg-n-episodes"><code>reg-n-episodes</code></a> — publish episode count into metadata</li><li><a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — publish summarization count into metadata</li><li><a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — publish request timings into metadata</li><li><a class="reg" href="registers.html#reg-chat-messages"><code>reg-chat-messages</code></a> — read messages for optional all_messages export</li><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — indirectly consumed by called <code>_dump_trajectory()</code></li></ul></div>
+</div></details><details class="file" id="fn-terminus2_dump_trajectory"><summary><span class="chev"></span><code class="fpath">Terminus2._dump_trajectory</code><a class="fn-range" href="../code/terminus_2.py.html#L1979-L1981" title="terminus_2.py:1979-1981">terminus_2.py:1979–1981 ↗</a></summary><div class="file-body"><p class="fn-sub">Wrapper for trajectory dump continuation index</p>
+<blockquote><p><strong>Stage context</strong>: This unit is a thin wrapper around <code>self._dump_trajectory_with_continuation_index(...)</code>. In this body, its only visible role is to supply <code>self._summarization_count</code> as the argument instead of requiring a caller to provide that value.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_dump_trajectory</code> reads <code>self._summarization_count</code> and passes it to <code>self._dump_trajectory_with_continuation_index(...)</code>. It returns <code>None</code> and does not directly write any <code>self</code> attributes or registers. Any serialization or I/O behavior belongs to the callee, not to this wrapper body.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self) -&gt; None</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — Bound <code>Terminus2</code> instance that provides <code>_summarization_count</code> and <code>_dump_trajectory_with_continuation_index</code></li><li>reads: <code>self._summarization_count</code>, <code>self._dump_trajectory_with_continuation_index (method lookup and invocation)</code></li><li>returns: Returns <code>None</code>; the visible product of this body is the delegated call to <code>self._dump_trajectory_with_continuation_index(self._summarization_count)</code>.</li><li>effects: Invokes <code>self._dump_trajectory_with_continuation_index(self._summarization_count)</code>; Writes no <code>self</code> fields or registers directly in this body</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Read <code>self._summarization_count</code> from the instance.</li><li>Call <code>self._dump_trajectory_with_continuation_index(...)</code> with that count as the sole argument.</li><li>Return <code>None</code> after the delegated call completes.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _dump_trajectory(self) -&gt; None:
+        """Dump trajectory data to JSON file following ATIF format."""
+        self._dump_trajectory_with_continuation_index(self._summarization_count)</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The wrapper hardcodes <code>self._summarization_count</code> as the continuation index instead of accepting an argument. That visible choice fixes the argument source at this call site and keeps callers from supplying a different index through this method.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>Terminus2</code> methods that want the default continuation index wrapper</li><li><strong>Core callees</strong>: <code>Terminus2._dump_trajectory_with_continuation_index</code></li><li><strong>Config / state sources</strong>: <code>self._summarization_count</code></li><li><strong>Results to</strong>: The delegated call to <code>self._dump_trajectory_with_continuation_index(...)</code></li><li><strong>Related siblings</strong>: <code>Terminus2.run</code> calls <code>_dump_trajectory()</code> in the translated sibling synopsis</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — used as continuation index argument</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_dump_trajectory_with_continuation_index"><summary><span class="chev"></span><code class="fpath">Terminus2._dump_trajectory_with_continuation_index</code><a class="fn-range" href="../code/terminus_2.py.html#L1911-L1977" title="terminus_2.py:1911-1977">terminus_2.py:1911–1977 ↗</a></summary><div class="file-body"><p class="fn-sub">Serialize trajectory segment to JSON log</p>
+<blockquote><p><strong>Stage context</strong>: This helper is the file-writing end of trajectory dumping. The sibling <code>Terminus2._dump_trajectory</code> supplies the <code>continuation_index</code>; this function turns current in-memory state into a validated <code>Trajectory</code>, chooses the output filename, and writes JSON under <code>self.logs_dir</code>.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_dump_trajectory_with_continuation_index</code> builds a <code>Trajectory</code> record for the current run state and writes it to a JSON file. It requires a live <code>_context</code>; otherwise it logs a warning and returns without writing anything. The written file includes final token and cost totals, agent metadata, the current <code>steps</code>, and optional continuation linkage when <code>_linear_history</code> and the <code>continuation_index</code> rules apply. It returns <code>None</code>; its visible product is the file write plus debug or error logging.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, continuation_index: int) -&gt; None</code></p>
+<ul><li>params: <code>continuation_index</code>: <code>int</code> — Index that controls continuation metadata and the output filename</li><li>reads: <code>self._context</code>, <code>self._context.n_input_tokens</code>, <code>self._context.n_output_tokens</code>, <code>self._context.n_cache_tokens</code>, <code>self._context.cost_usd</code>, <code>self._parser_name</code>, <code>self._temperature</code>, <code>self._llm_kwargs</code>, <code>self._linear_history</code>, <code>self._summarization_count</code>, <code>self._session_id</code>, <code>self._model_name</code>, <code>self._trajectory_steps</code>, <code>self.logs_dir</code>, <code>self.logger</code>, <code>self.name()</code>, <code>self.version()</code></li><li>returns: None; the real product is a trajectory JSON file written via <code>Trajectory(...).to_json_dict()</code>, <code>format_trajectory_json(...)</code>, and <code>f.write(...)</code>, or a logged warning/error when dumping does not proceed</li><li>effects: logs a warning with <code>self.logger.warning(...)</code> and returns early when <code>self._context</code> is missing; writes a JSON file under <code>self.logs_dir</code>; logs a debug message with the chosen path after a successful write; logs an error message if opening, serializing, formatting, or writing raises inside the <code>try</code> block</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>It first checks <code>self._context</code>. If that attribute is falsy, it logs <code>"No context available, skipping trajectory dump"</code> through <code>self.logger.warning(...)</code> and returns.</li><li>It builds <code>final_metrics</code> from <code>_context</code> token and cost fields. The code preserves prompt and completion totals directly, uses <code>_context.n_cache_tokens or 0</code> for cached tokens, and converts falsy <code>_context.cost_usd</code> values to <code>None</code>.</li><li>It assembles <code>agent_extra</code> starting with <code>{"parser": self._parser_name}</code>. It adds <code>"temperature"</code> only when <code>self._temperature is not None</code>, adds <code>"llm_kwargs"</code> only when <code>self._llm_kwargs</code> is truthy, and adds <code>"continuation_index"</code> only when both <code>self._linear_history</code> and <code>continuation_index &gt; 0</code> hold.</li><li>It initializes <code>continued_trajectory_ref = None</code>, then may replace it with <code>f"trajectory.cont-{continuation_index + 1}.json"</code> when <code>self._linear_history</code> is true and <code>continuation_index &lt; self._summarization_count</code>.</li><li>It constructs a <code>Trajectory</code> with <code>session_id=self._session_id</code>, an <code>Agent</code> built from <code>self.name()</code>, <code>self.version() or "unknown"</code>, <code>self._model_name</code>, and <code>agent_extra</code>, plus <code>steps=self._trajectory_steps</code>, the <code>final_metrics</code>, and the computed <code>continued_trajectory_ref</code>.</li><li>Before entering the <code>try/except</code>, it chooses the output path: <code>trajectory.cont-{continuation_index}.json</code> for linear-history continuation files (<code>self._linear_history</code> and <code>continuation_index &gt; 0</code>), otherwise <code>trajectory.json</code>.</li><li>Inside the <code>try</code>, it opens the selected path for writing, serializes the model with <code>trajectory.to_json_dict()</code>, formats that JSON with <code>format_trajectory_json(...)</code>, writes the resulting string, and logs a debug message. Any exception from that block is caught and logged with <code>self.logger.error(...)</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _dump_trajectory_with_continuation_index(self, continuation_index: int) -&gt; None:
+        """Dump trajectory data to JSON file with specified continuation index.
+
+        Args:
+            continuation_index: The continuation index to use for filename and metadata.
+                               For the initial trajectory, use 0.
+                               For the first continuation, use 1, etc.
+        """
+        if not self._context:
+            self.logger.warning("No context available, skipping trajectory dump")
+            return
+
+        # Construct the trajectory using Pydantic models for validation
+        final_metrics = FinalMetrics(
+            total_prompt_tokens=self._context.n_input_tokens,
+            total_completion_tokens=self._context.n_output_tokens,
+            total_cached_tokens=self._context.n_cache_tokens or 0,
+            total_cost_usd=self._context.cost_usd if self._context.cost_usd else None,
+        )
+
+        agent_extra: dict[str, Any] = {
+            "parser": self._parser_name,
+        }
+        if self._temperature is not None:
+            agent_extra["temperature"] = self._temperature
+        if self._llm_kwargs:
+            agent_extra["llm_kwargs"] = self._llm_kwargs
+        if self._linear_history and continuation_index &gt; 0:
+            agent_extra["continuation_index"] = continuation_index
+
+        # Determine if this trajectory will be continued
+        # In linear_history mode, when saving during summarization (i.e., continuation_index &lt; _summarization_count),
+        # this trajectory will have a continuation
+        continued_trajectory_ref = None
+        if self._linear_history and continuation_index &lt; self._summarization_count:
+            # This trajectory segment will be continued in the next file
+            next_continuation_index = continuation_index + 1
+            continued_trajectory_ref = f"trajectory.cont-{next_continuation_index}.json"
+
+        trajectory = Trajectory(
+            session_id=self._session_id,
+            agent=Agent(
+                name=self.name(),
+                version=self.version() or "unknown",
+                model_name=self._model_name,
+                extra=agent_extra,
+            ),
+            steps=self._trajectory_steps,
+            final_metrics=final_metrics,
+            continued_trajectory_ref=continued_trajectory_ref,
+        )
+
+        # Determine trajectory filename based on continuation index
+        if self._linear_history and continuation_index &gt; 0:
+            trajectory_path = (
+                self.logs_dir / f"trajectory.cont-{continuation_index}.json"
+            )
+        else:
+            trajectory_path = self.logs_dir / "trajectory.json"
+
+        try:
+            with open(trajectory_path, "w") as f:
+                json_str = format_trajectory_json(trajectory.to_json_dict())
+                f.write(json_str)
+            self.logger.debug(f"Trajectory dumped to {trajectory_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to dump trajectory: {e}")</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The early <code>if not self._context</code> guard avoids emitting a partial file with no trial metrics source. The function chooses to skip the dump and record a warning instead of inventing defaults.</li><li>The metric normalization is intentionally uneven: <code>_context.n_cache_tokens or 0</code> forces a numeric cached-token count, while <code>_context.cost_usd if self._context.cost_usd else None</code> turns any falsy cost into <code>None</code>. That preserves the distinction the code makes between token counts and an absent-or-falsy cost field.</li><li>The <code>agent_extra</code> rules are precise and not all truthiness-based. <code>self._temperature</code> uses <code>is not None</code>, so <code>0</code> is preserved as a meaningful configured value, while <code>self._llm_kwargs</code> must be truthy before the function includes it.</li><li>Continuation metadata is split across two branches on purpose. The file gets its own <code>continuation_index</code> only for continuation files (<code>continuation_index &gt; 0</code>), while <code>continued_trajectory_ref</code> appears only when the current segment should point to a later one (<code>continuation_index &lt; self._summarization_count</code> under <code>_linear_history</code>).</li><li>The broad <code>try/except Exception</code> wraps the actual file write and serialization path and converts failures into <code>self.logger.error(...)</code>. This keeps trajectory-dump failures from escaping this helper.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>Terminus2._dump_trajectory</code></li><li><strong>Core callees</strong>: <code>FinalMetrics(...)</code>; <code>Agent(...)</code>; <code>Trajectory(...)</code>; <code>trajectory.to_json_dict()</code>; <code>format_trajectory_json(...)</code>; <code>open(...)</code>; <code>self.logger.warning(...)</code>; <code>self.logger.debug(...)</code>; <code>self.logger.error(...)</code>; <code>self.name()</code>; <code>self.version()</code></li><li><strong>Config / state sources</strong>: <code>self._parser_name</code>; <code>self._temperature</code>; <code>self._llm_kwargs</code>; <code>self._linear_history</code>; <code>self._model_name</code>; <code>self.logs_dir</code></li><li><strong>Results to</strong>: JSON file at <code>self.logs_dir / "trajectory.json"</code>; JSON file at <code>self.logs_dir / f"trajectory.cont-{continuation_index}.json"</code>; warning/debug/error log output through <code>self.logger</code></li><li><strong>Related siblings</strong>: <code>Terminus2._dump_trajectory</code>: passes <code>self._summarization_count</code> as the <code>continuation_index</code> argument</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — checks <code>continuation_index &lt; self._summarization_count</code></li><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — passes current steps into <code>Trajectory(..., steps=...)</code></li></ul></div>
+</div></details><details class="file" id="fn-tmuxsession_stop"><summary><span class="chev"></span><code class="fpath">TmuxSession.stop</code><a class="fn-range" href="../code/tmux_session.py.html#L473-L493" title="tmux_session.py:473-493">tmux_session.py:473–493 ↗</a></summary><div class="file-body"><p class="fn-sub">stop remote asciinema and fetch local cast</p>
+<blockquote><p><strong>Stage context</strong>: This region is the recording-shutdown part of <code>TmuxSession.stop</code>. It runs only when <code>self._remote_asciinema_recording_path</code> is set, and it handles the final remote-to-local cast transfer when <code>self._local_asciinema_recording_path</code> is also set.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>This region attempts to stop an active remote asciinema recording and, when configured, downloads the finished cast file to a local path. It reads <code>self._remote_asciinema_recording_path</code> to decide whether to do any recording teardown, uses <code>self.send_keys(...)</code> and <code>self.environment.download_file(...)</code>, and may create the local parent directory for <code>self._local_asciinema_recording_path</code>. It returns no value; its visible product is the attempted recorder shutdown plus an optional local cast file.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self) -&gt; None</code></p>
+<ul><li>params: <code>self</code>: <code>TmuxSession</code> — session object that holds recording paths, logger, and environment access</li><li>reads: <code>self._remote_asciinema_recording_path</code>, <code>self._logger</code>, <code>self._local_asciinema_recording_path</code>, <code>self.environment</code></li><li>returns: None; the real product is sending <code>C-d</code>, waiting briefly, and optionally downloading the remote cast file to the local filesystem.</li><li>effects: logs <code>Stopping recording.</code> with <code>self._logger.debug(...)</code>; awaits <code>self.send_keys(keys=["C-d"], min_timeout_sec=0.1)</code>; imports <code>asyncio</code> inside the branch and awaits <code>asyncio.sleep(0.5)</code>; may create <code>self._local_asciinema_recording_path.parent</code> with <code>mkdir(parents=True, exist_ok=True)</code>; may download a file with <code>self.environment.download_file(source_path=str(self._remote_asciinema_recording_path), target_path=self._local_asciinema_recording_path)</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Check <code>self._remote_asciinema_recording_path</code>; if it is falsy, this region does nothing.</li><li>Log <code>Stopping recording.</code> and attempt recorder shutdown by awaiting <code>self.send_keys(keys=["C-d"], min_timeout_sec=0.1)</code>.</li><li>Import <code>asyncio</code> inside this branch and await <code>asyncio.sleep(0.5)</code> to pause before any file transfer.</li><li>If <code>self._local_asciinema_recording_path</code> is set, create its parent directory with <code>parents=True, exist_ok=True</code>.</li><li>Still in that local-path branch, call <code>self.environment.download_file(...)</code> with <code>source_path=str(self._remote_asciinema_recording_path)</code> and <code>target_path=self._local_asciinema_recording_path</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>        if self._remote_asciinema_recording_path:
+            self._logger.debug("Stopping recording.")
+            await self.send_keys(
+                keys=["C-d"],
+                min_timeout_sec=0.1,
+            )
+
+            # Wait a moment for the recording to finish writing
+            import asyncio
+
+            await asyncio.sleep(0.5)
+
+            if self._local_asciinema_recording_path:
+                self._local_asciinema_recording_path.parent.mkdir(
+                    parents=True, exist_ok=True
+                )
+                # Ensure recording exists locally before merging markers
+                await self.environment.download_file(
+                    source_path=str(self._remote_asciinema_recording_path),
+                    target_path=self._local_asciinema_recording_path,
+                )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The code waits <code>0.5</code> seconds after sending <code>C-d</code> because the inline comment says it wants to give the recording time to finish writing before download.</li><li>It creates the local parent directory only when <code>self._local_asciinema_recording_path</code> exists, so local filesystem setup stays tied to the download path branch.</li><li>It converts <code>self._remote_asciinema_recording_path</code> with <code>str(...)</code> at the <code>download_file</code> call site, which matches the callee's <code>source_path</code> argument shape used here without changing how the path is stored on <code>self</code>.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>TmuxSession.stop</code></li><li><strong>Core callees</strong>: <code>self.send_keys</code>; <code>asyncio.sleep</code>; <code>self.environment.download_file</code>; <code>Path.mkdir</code> on <code>self._local_asciinema_recording_path.parent</code></li><li><strong>Config / state sources</strong>: <code>self._remote_asciinema_recording_path</code> gates all work; <code>self._local_asciinema_recording_path</code> gates directory creation and download; <code>self.environment</code> supplies file transfer; <code>self._logger</code> supplies debug logging</li><li><strong>Results to</strong>: remote recording process via <code>send_keys(keys=["C-d"], min_timeout_sec=0.1)</code>; local filesystem under <code>self._local_asciinema_recording_path.parent</code>; local cast file at <code>self._local_asciinema_recording_path</code> when download runs; debug log output</li></ul></div></details><nav class="pn"><a class="pn-prev" href="stage-4.9.html"><span>← Previous</span><strong>Parser internal helpers</strong></a><a class="pn-next" href="stage-6.html"><span>Next →</span><strong>Recording Post-process (External)</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

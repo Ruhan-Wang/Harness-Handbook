@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-4.6 · 错误分支</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=zh"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 手册</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=zh" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>返回主页</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>状态流寄存器</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>配置固化</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>环境搭建</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>运行起点</a></div><details class="s-node" open><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>迭代主循环</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>循环入口门控</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>主动摘要探测</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM 调用</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>响应解析</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>待交接提示 → 用户步骤(或切分)</a></div><div class="s-leaf"><a class="s-link cur" href="stage-4.6.html"><span class="s-num">4.6</span>错误分支</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>命令执行 → 观察 → 轨迹步骤</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>完成门控与循环控制</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>解析器内部辅助</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>运行收尾</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>录制后处理(外部)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>上下文摘要</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token 与成本核算</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>输出长度限制</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>日志</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux 内部辅助</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">索引</a><span class="sep">›</span><a href="stage-4.html">迭代主循环</a></nav><div class="stage-head"><h1>错误分支</h1><div class="meta"><span class="chip mono">stage-4.6</span><span class="chip">Error Branch</span><span class="chip">2 个函数</span></div></div>
+<h2 class="sec">开场解释</h2>
+<p>这个 Stage 在解决一个很具体的问题：<strong>LLM（大语言模型）这次回话没按约定格式返回，系统没法安全往下跑命令</strong>。它只处理“解析失败”这条分支，不处理别的异常。它的职责不是修命令，而是<strong>拦住错误输出、把错误原因喂回给 LLM、要求它重答一次</strong>。这样做的目的，是把一次“格式错了”的回复，变成下一轮可修复的输入，避免错误结果直接流入命令执行路径。</p>
+<h2 class="sec">主流程</h2>
+
+<ol><li><strong>先判定：这是不是解析失败分支。</strong> <p>进入条件很简单：<code>feedback</code> 里出现 <code>"ERROR:"</code>。这说明上一轮 LLM 的回复在结构上没过解析器，系统拿不到可靠的分析、计划或命令。 如果<strong>没有</strong>这个标记，就不走这里，而是继续正常的命令执行路径。</p></li><li><strong>把这次失败，改写成下一轮的“纠错题”。</strong> <p>这里会重建一个新的 <code>prompt</code>，核心意思是：</p>
+<ul><li>你上一次的回复有解析错误 </li><li>错在哪，<code>feedback</code> 里已经写明 </li><li>请按指定的响应类型重新回答 </li></ul>
+<p><code>_get_error_response_type()</code>（把“该用哪种回复格式”翻成给模型看的标签）就是为这个服务的。 这一步为什么重要？因为模型如果只听到“你错了”，往往会继续乱答；但如果明确告诉它“你应该产出哪一类结构化回复”，纠错成功率会高很多。</p></li><li><strong>即使失败，也把这一步记进轨迹。</strong> <p>系统会照样记一次 <code>Step</code>（一次运行轨迹里的步骤记录），并补上这一步的成本指标，比如 token cache 使用量和本步花费。 这里有个关键设计：<strong>记录的是 LLM 的原始文本，而不是解析后的结构化内容</strong>。原因很简单：这次本来就没解析成功，结构化结果不可信；但原始文本对追错和重试很有价值。以后回看轨迹时，你能看到模型当时到底说了什么，而不是只看到一句抽象的“解析失败”。</p></li><li><strong>立刻中断本轮后续动作，回到外层循环。</strong> <p>这条分支会直接 <code>continue</code>。意思是：</p>
+<ul><li>不执行命令 </li><li>不做完成判定 </li><li>不走本轮剩下的控制逻辑 </li></ul>
+<p>系统带着刚刚重建的纠错 <code>prompt</code>，进入下一轮，让 LLM 重新答。 所以这个 Stage 本质上是一个<strong>短路保护</strong>：格式不对，就别碰终端（终端环境），先把回答修正。</p></li></ol>
+<h2 class="sec"> 状态流动</h2>
+<ul><li>写: 无 — 输入给出的 register list 中未显式提供任何 register-id；因此不能把 <code>prompt</code> 重建、轨迹追加或指标记录写成已验证的寄存器写入</li><li>读: 无 — 输入给出的 register list 中未显式提供任何 register-id；<code>feedback</code> 条件判断属于实现行为，但不能在此块中冒充为已验证 register 读取</li><li>清: 无 — 输入给出的 register list 中未显式提供任何 register-id</li><li>触发下游: <code>Command Execute → Observation → Trajectory Step</code> — <strong>仅在不满足错误分支时</strong>，流程才会落到正常命令执行路径；若命中本 Stage 的解析失败分支，则不会进入该路径，而是直接回到外层循环开始下一轮</li></ul>
+<h2 class="sec">与前后 Stage 的衔接</h2>
+<p>上游交进来的，是一份<strong>待处理的模型回复及其解析反馈</strong>：如果前面已经发现 <code>feedback</code> 带有 <code>"ERROR:"</code>，就说明“回复内容到了，但格式没法用”。本 Stage 产出的不是命令，而是一个<strong>新的纠错 prompt 和一条失败轨迹记录</strong>，然后直接回到外层循环，再向 LLM 发起下一轮；只有未命中这条错误分支时，系统才会继续走后面的命令执行路径。</p><div class="files-bar"><h2 class="sec">函数细节<span class="pill">2</span></h2><span class="spacer"></span><button class="tool" data-x="expand">全部展开</button><button class="tool" data-x="collapse">全部折叠</button></div><details class="file" id="fn-terminus2_run_agent_loop"><summary><span class="chev"></span><code class="fpath">Terminus2._run_agent_loop</code><a class="fn-range" href="../code/terminus_2.py.html#L1378-L1420" title="terminus_2.py:1378-1420">terminus_2.py:1378–1420 ↗</a></summary><div class="file-body"><p class="fn-sub">解析错误分支的轨迹记录段</p>
+<blockquote><p><strong>stage 上下文</strong>: 本段是 <code>_run_agent_loop</code> 在 <a href="stage-4.8.html">stage-4.8</a> 的错误分支：仅当局部变量 <code>feedback</code> 存在且包含字符串 <code>"ERROR:"</code> 时进入。它不尝试修复当前响应本身，而是把本轮失败响应记录进 trajectory，并把局部变量 <code>prompt</code> 改写为纠错提示，供后续循环代码继续使用。作为该 stage 的首个已翻译单元，它对应的是“解析失败时如何落盘与计量”的部分，而非正常解析/执行路径。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>当 <code>feedback</code> 指示解析错误时，这段代码生成一段新的纠错提示文本 <code>prompt</code>，文本中嵌入原始 <code>feedback</code> 与 <code>self._get_error_response_type()</code> 返回的响应类型标签。随后它基于 <code>chat.total_*</code>、<code>tokens_before_*</code> 和 <code>cost_before</code> 计算本步增量指标，并把原始 <code>llm_response.content</code> 连同一条只含该 <code>prompt</code> 的 <code>Observation</code> 追加到 <code>self._trajectory_steps</code>。若 <code>llm_response.model_name</code> 非空，还会同步更新 <code>self._last_response_model_name</code>；最后通过 <code>continue</code> 提前结束当前循环轮次在本段之后的处理。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, environment) -&gt; ?</code></p>
+<ul><li>参数: <code>self</code>: <code>Terminus2</code> — 宿主对象；提供 <code>_get_error_response_type()</code>、模型名回退值及 trajectory / 最近模型名状态; <code>environment</code>: <code>?</code> — 函数签名参数；本源码片段内未直接读取; <code>feedback</code>: <code>?</code> — 局部输入；用 <code>feedback and "ERROR:" in feedback</code> 判定是否进入错误分支，并原样嵌入纠错 <code>prompt</code>; <code>llm_response</code>: <code>?</code> — 局部输入；提供 <code>model_name</code>、<code>content</code>、<code>reasoning_content</code>、<code>prompt_token_ids</code>、<code>completion_token_ids</code>、<code>logprobs</code> 以构造轨迹步骤; <code>chat</code>: <code>?</code> — 局部输入；提供 <code>total_cache_tokens</code>、<code>total_cost</code>、<code>total_input_tokens</code>、<code>total_output_tokens</code> 以计算本步增量 metrics; <code>tokens_before_cache</code>: <code>?</code> — 局部输入；作为 <code>cache_tokens_used</code> 的基线; <code>cost_before</code>: <code>?</code> — 局部输入；作为 <code>step_cost</code> 的基线; <code>tokens_before_input</code>: <code>?</code> — 局部输入；作为 <code>prompt_tokens</code> 的基线; <code>tokens_before_output</code>: <code>?</code> — 局部输入；作为 <code>completion_tokens</code> 的基线; <code>prompt</code>: <code>str</code> — 局部变量；在错误分支中被重新赋值为新的纠错提示文本</li><li>读状态: <code>self._get_error_response_type()</code>, <code>self._trajectory_steps</code>, <code>self._model_name</code></li><li>返回: 本片段本身不直接返回值；可观察产出是：局部变量 <code>prompt</code> 被重写、可能更新 <code>self._last_response_model_name</code>、向 <code>self._trajectory_steps</code> 追加一条 <code>Step</code>，并以 <code>continue</code> 结束当前循环轮次在本段之后的执行。</li><li>副作用: 局部重写 <code>prompt = "Previous response had parsing errors:\n{feedback}\n\nPlease fix these issues and provide a proper {self._get_error_response_type()}."</code>; 局部计算 <code>cache_tokens_used = chat.total_cache_tokens - tokens_before_cache</code>; 局部计算 <code>step_cost = chat.total_cost - cost_before</code>; 当 <code>llm_response.model_name</code> 为真值时，写入 <code>self._last_response_model_name = llm_response.model_name</code>; 向 <code>self._trajectory_steps</code> 追加 <code>Step(...)</code>，其关键字段包括：<code>step_id=len(self._trajectory_steps)+1</code>、<code>timestamp=datetime.now(timezone.utc).isoformat()</code>、<code>source="agent"</code>、<code>model_name=llm_response.model_name or self._model_name</code>、<code>message=llm_response.content</code>、<code>reasoning_content=llm_response.reasoning_content</code>、<code>observation.results=[ObservationResult(content=prompt)]</code>; 写入 <code>Metrics(...)</code>，其中 <code>prompt_tokens=chat.total_input_tokens - tokens_before_input</code>、<code>completion_tokens=chat.total_output_tokens - tokens_before_output</code>、<code>cached_tokens=cache_tokens_used if cache_tokens_used &gt; 0 else None</code>、<code>cost_usd=step_cost if step_cost &gt; 0 else None</code>，并携带 <code>llm_response.prompt_token_ids</code>、<code>completion_token_ids</code>、<code>logprobs</code>; 执行 <code>continue</code>，跳过当前循环轮次本片段之后的代码</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先用条件 <code>feedback and "ERROR:" in feedback</code> 检查是否进入解析错误分支；只有满足该条件才执行下面逻辑。</li><li>构造新的局部 <code>prompt</code>：固定前缀为“Previous response had parsing errors”，中间嵌入原始 <code>feedback</code>，结尾要求返回 <code>self._get_error_response_type()</code> 指定的正确响应类型。</li><li>从累计计数中减去本轮调用前基线，得到 <code>cache_tokens_used</code> 与 <code>step_cost</code> 两个增量值，分别来自 <code>chat.total_cache_tokens - tokens_before_cache</code> 和 <code>chat.total_cost - cost_before</code>。</li><li>若 <code>llm_response.model_name</code> 存在，则把它写入 <code>self._last_response_model_name</code>，使最近一次响应的模型名状态与本次原始响应保持一致。</li><li>向 <code>self._trajectory_steps</code> 追加一条 <code>Step</code>：<code>step_id</code> 取当前长度加一，<code>timestamp</code> 为 <code>datetime.now(timezone.utc).isoformat()</code> 的 UTC ISO 字符串，<code>source</code> 固定为 <code>"agent"</code>，<code>model_name</code> 取 <code>llm_response.model_name or self._model_name</code>，<code>message</code> 直接记录 <code>llm_response.content</code>，并附带 <code>reasoning_content</code>。</li><li>该 <code>Step</code> 的 <code>observation</code> 只含一个 <code>ObservationResult(content=prompt)</code>；其 <code>metrics</code> 记录输入/输出 token 增量、按正值条件保留的 <code>cached_tokens</code> 与 <code>cost_usd</code>，以及 <code>llm_response</code> 自带的 token ids 与 <code>logprobs</code>。</li><li>完成记录后立即执行 <code>continue</code>，结束当前循环轮次在此处之后的后续代码。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>            if feedback and "ERROR:" in feedback:
+                prompt = (
+                    f"Previous response had parsing errors:\n{feedback}\n\n"
+                    f"Please fix these issues and provide a proper "
+                    f"{self._get_error_response_type()}."
+                )
+                # For error cases, we still want to record the step
+                # Use the raw response as the message since parsing failed
+                cache_tokens_used = chat.total_cache_tokens - tokens_before_cache
+                step_cost = chat.total_cost - cost_before
+
+                if llm_response.model_name:
+                    self._last_response_model_name = llm_response.model_name
+                self._trajectory_steps.append(
+                    Step(
+                        step_id=len(self._trajectory_steps) + 1,
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        source="agent",
+                        model_name=llm_response.model_name or self._model_name,
+                        message=llm_response.content,
+                        reasoning_content=llm_response.reasoning_content,
+                        observation=Observation(
+                            results=[
+                                ObservationResult(
+                                    content=prompt,
+                                )
+                            ]
+                        ),
+                        metrics=Metrics(
+                            prompt_tokens=chat.total_input_tokens - tokens_before_input,
+                            completion_tokens=chat.total_output_tokens
+                            - tokens_before_output,
+                            cached_tokens=cache_tokens_used
+                            if cache_tokens_used &gt; 0
+                            else None,
+                            cost_usd=step_cost if step_cost &gt; 0 else None,
+                            prompt_token_ids=llm_response.prompt_token_ids,
+                            completion_token_ids=llm_response.completion_token_ids,
+                            logprobs=llm_response.logprobs,
+                        ),
+                    )
+                )
+                continue</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>错误分支记录的是 <code>llm_response.content</code> 原文，而不是任何解析后的结构化内容；这一取舍直接写在注释“Use the raw response as the message since parsing failed”与 <code>message=llm_response.content</code> 中，意图是在解析失败时仍保留最原始、可追责的模型输出。</li><li><code>Step.model_name</code> 采用 <code>llm_response.model_name or self._model_name</code> 的回退策略，而 <code>_last_response_model_name</code> 只在 <code>llm_response.model_name</code> 真值时才更新；这表明记录层允许用默认模型名补全字段，但对象级“最近响应模型”状态不愿被空值覆盖。</li><li><code>cached_tokens</code> 与 <code>cost_usd</code> 在不为正时被写成 <code>None</code> 而非 <code>0</code>，对应代码中的 <code>if ... &gt; 0 else None</code>；这是一种显式区分“本步没有正向增量/不值得记录”与“确实记录到零值”的表示策略。</li><li>即便是解析错误，本段仍然追加完整 <code>Step</code>，并把纠错文本放入 <code>observation.results</code>；这使 trajectory 同时保存“模型给了什么”和“系统反馈了什么”，而不是仅保留内部错误状态。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2._run_agent_loop（本 region 所属循环体）; _run_agent_loop 内部在获得 <code>feedback</code> 与 <code>llm_response</code> 后的解析后处理逻辑; 当前 agent episode 的主循环分支选择代码; 由 <code>_run_agent_loop</code> 驱动的单轮 LLM 响应处理路径</li><li><strong>核心被调用</strong>: self._get_error_response_type; Step; Observation; ObservationResult; Metrics; datetime.now; timezone.utc; self._trajectory_steps.append</li><li><strong>配置/状态来源</strong>: self._model_name（用于 <code>Step.model_name</code> 回退）; self._trajectory_steps（用于生成 <code>step_id</code> 基线并作为追加目标）; feedback（决定是否进入分支并提供错误文本）; llm_response.model_name / content / reasoning_content / prompt_token_ids / completion_token_ids / logprobs; chat.total_cache_tokens / total_cost / total_input_tokens / total_output_tokens; tokens_before_cache / cost_before / tokens_before_input / tokens_before_output</li><li><strong>结果去向</strong>: 局部变量 <code>prompt</code>（被重写为纠错提示）; self._last_response_model_name（条件写入）; self._trajectory_steps（追加一条错误响应步骤）; 当前循环控制流（通过 <code>continue</code> 提前转入下一轮）</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — 解析错误时追加一条 agent Step</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_get_error_response_type"><summary><span class="chev"></span><code class="fpath">Terminus2._get_error_response_type</code><a class="fn-range" href="../code/terminus_2.py.html#L472-L484" title="terminus_2.py:472-484">terminus_2.py:472–484 ↗</a></summary><div class="file-body"><p class="fn-sub">解析器错误文案类型选择器</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数是一个局部辅助例程，职责是把当前解析器名称 <code>self._parser_name</code> 映射为错误消息中使用的响应类型标签。它本身不推进 stage 流程，也不修改运行态；其价值在于为上层错误分支提供一致的、可读的类型名。与同 stage 中负责组装错误提示与记录轨迹的兄弟逻辑相比，这里只负责名称选择与非法配置拒绝。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数读取实例状态 <code>self._parser_name</code>，并按分支返回一个短字符串标签。若该值为 <code>"json"</code>，返回 <code>"JSON response"</code>；若为 <code>"xml"</code>，返回 <code>"response"</code>；否则抛出 <code>ValueError</code>，并把未知的解析器名插入异常消息。函数没有正常路径下的副作用，唯一的异常出口是对不支持的解析器名进行显式拒绝。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self) -&gt; str</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 实例对象；提供 <code>self._parser_name</code>，既用于分支判断，也用于未知分支时拼入 <code>ValueError</code> 消息</li><li>读状态: <code>self._parser_name</code></li><li>返回: 返回错误消息使用的响应类型名称：<code>"JSON response"</code> 或 <code>"response"</code></li><li>副作用: 无状态写入; 当 <code>self._parser_name</code> 不是 <code>"json"</code> 或 <code>"xml"</code> 时抛出 <code>ValueError</code>，异常消息包含未知的解析器名</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先读取 <code>self._parser_name</code>，进入 <code>if / elif / else</code> 三分支选择。</li><li>当 <code>self._parser_name == "json"</code> 时，直接返回字面量 <code>"JSON response"</code>。</li><li>当 <code>self._parser_name == "xml"</code> 时，直接返回字面量 <code>"response"</code>。</li><li>其余取值统一走 <code>else</code>，抛出 <code>ValueError</code>；异常文本为 <code>Unknown parser_name: {self._parser_name}. Use 'json' or 'xml'.</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _get_error_response_type(self) -&gt; str:
+        """Return the response type name for error messages.
+
+        Examples: 'JSON response', 'response'
+        """
+        if self._parser_name == "json":
+            return "JSON response"
+        elif self._parser_name == "xml":
+            return "response"
+        else:
+            raise ValueError(
+                f"Unknown parser_name: {self._parser_name}. Use 'json' or 'xml'."
+            )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>代码对两种支持的解析器名采用显式枚举，而不是提供默认回退值；这使未识别配置不会被静默接受，而是立即经 <code>ValueError</code> 暴露。</li><li>返回值不是机械地回显解析器名：<code>json</code> 被映射为较具体的 <code>"JSON response"</code>，而 <code>xml</code> 被映射为更短的 <code>"response"</code>；这是源码中明确写死的文案选择。</li><li>异常消息不仅说明只接受 <code>'json'</code> 或 <code>'xml'</code>，还插入当前 <code>self._parser_name</code>，便于定位实际收到的非法值。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 上层错误处理路径会调用本函数以取得错误消息中的响应类型标签</li><li><strong>核心被调用</strong>: ValueError</li><li><strong>配置/状态来源</strong>: self._parser_name</li><li><strong>结果去向</strong>: 函数返回的字符串会被上层作为错误消息中的响应类型名称使用; 异常路径把包含未知解析器名的 <code>ValueError</code> 交给调用方处理</li><li><strong>同类 sibling</strong>: Terminus2._run_agent_loop：兄弟逻辑负责在解析错误时重建提示并记录轨迹；本函数只提供其中用到的类型标签，不处理提示拼装或状态记录。</li></ul></div></details><nav class="pn"><a class="pn-prev" href="stage-4.5.html"><span>← 上一阶段</span><strong>待交接提示 → 用户步骤(或切分)</strong></a><a class="pn-next" href="stage-4.7.html"><span>下一阶段 →</span><strong>命令执行 → 观察 → 轨迹步骤</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

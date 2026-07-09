@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-4 · Iteration Loop</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=en"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=en" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>Home</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>State-flow registers</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>Configuration Crystallization</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>Environment Setup</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>Run Onset</a></div><details class="s-node" open><summary><span class="chev"></span><a class="s-link cur" href="stage-4.html"><span class="s-num">4</span>Iteration Loop</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>Loop Entry Gates</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>Proactive Summarize Probe</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM Query</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>Response Parse</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>Pending Handoff Prompt → User Step (or Split)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>Error Branch</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>Command Execute → Observation → Trajectory Step</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>Completion Gate + Loop Control</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>Parser internal helpers</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>Run Teardown</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>Recording Post-process (External)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>Context Summarization</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token &amp; Cost Accounting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>Output Length Limiting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>Logging</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux internal helpers</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">Index</a></nav><div class="stage-head"><h1>Iteration Loop</h1><div class="meta"><span class="chip mono">stage-4</span><span class="chip">5 functions</span><span class="badge-x">★ Core</span></div></div>
+<h2 class="sec">Opening Explanation</h2>
+<p>This stage exists to give the agent a controlled place to think, act, observe results, and decide whether to continue. It is the core work loop of Terminus 2. A single prompt is not enough for real terminal work, because the agent often needs several rounds: inspect the machine, ask the LLM (the language model), run commands, read outputs, and revise the plan. This loop owns that repeat-until-done behavior. It sits after run setup and before final result packaging. Its job is to keep progress moving across iterations while carrying just enough state from one turn to the next: completion confirmation, summary handoff when context gets too large, and the growing trajectory record of what happened.</p>
+<h2 class="sec">Main Flow</h2>
+
+<ol><li><code>run()</code> (the top-level entry point for one task) hands control to <code>_run_agent_loop()</code> because this is where actual task progress happens, not setup.</li><li><code>_run_agent_loop()</code> runs the agent in repeated episodes. Each episode is one full pass through the in-iteration stages: check whether the session is still usable, gather context, query the LLM, record what happened, and decide whether to stop.</li><li>The loop exists because terminal work is incremental. The agent rarely knows the full answer up front. It needs a place to react to new command output and keep adjusting.</li><li>This stage also owns the stop conditions. It can end because:<ul><li>the task looks complete twice in a row, which is a guard against false finishes,</li><li>the tmux session (a terminal you can drive remotely) dies,</li><li>or the maximum number of episodes is reached.</li></ul></li><li>It carries cross-iteration memory in a few small registers instead of recomputing everything each time. That is important for two reasons:<ul><li>completion needs a two-step confirmation,</li><li>and long runs may need a summary handoff when the LLM context gets too full.</li></ul></li><li><code>_record_asciinema_marker()</code> (records timestamped labels for terminal replay) supports observability, not decision-making. It helps later stages and humans understand where important moments happened in the run.</li><li><code>_dump_trajectory()</code>, and <code>_dump_trajectory_with_continuation_index()</code> (write the run history to disk, with support for split or continued histories), exist so the loop leaves behind a durable record. That matters because the loop is the main source of truth about what the agent tried, saw, and concluded.</li><li>In short, this stage is the agent’s heartbeat. Without it, the system would have setup and teardown, but no place where real multi-step work happens.</li></ol>
+<h2 class="sec"> State Flow</h2>
+<ul><li>writes: <a class="reg" href="registers.html#reg-n-episodes"><code>reg-n-episodes</code></a> — incremented at loop entry so the system knows which iteration it is on and can report that later in metadata</li><li>writes: <a class="reg" href="registers.html#reg-pending-completion"><code>reg-pending-completion</code></a> — set when the agent first believes the task is complete, so the next iteration can confirm before returning</li><li>writes: <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — set when the run needs a summary handoff because context is getting too large; this preserves continuity into the next iteration</li><li>writes: <a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a> — set alongside the handoff prompt so later stages can record references to summarization subagents in the trajectory</li><li>writes: <a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — appended throughout the loop as the canonical history of system notes, user-facing handoff material, assistant actions, and completion checks</li><li>writes: <a class="reg" href="registers.html#reg-asciinema-markers"><code>reg-asciinema-markers</code></a> — updated when markers are recorded so terminal replay can later show notable points in the run</li><li>writes: <a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — appended during LLM calls so the final run metadata can describe API timing</li><li>reads: <a class="reg" href="registers.html#reg-pending-completion"><code>reg-pending-completion</code></a> — checked to tell the difference between “first time we think we are done” and “confirmed done, now return”</li><li>reads: <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — consumed on the next iteration to inject the summary handoff into the working history</li><li>reads: <a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a> — consumed on the next iteration to log the summarization subagent outputs into the trajectory</li><li>reads: <a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — used when dumping the trajectory so the current run history is persisted</li><li>clears: <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — cleared after the handoff is consumed so the same summary is not replayed again</li><li>clears: <a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a> — cleared after those refs are recorded so they are not duplicated</li><li>triggers downstream: <code>stage-4.1 Loop Entry Gates</code> — each new episode enters the per-iteration pipeline</li><li>triggers downstream: <a href="stage-5.html">[stage-5</a>](<a href="stage-5.html">stage-5</a>.html) — when the loop ends by confirmed completion, dead session, or episode limit, final result packaging takes over</li></ul>
+<h2 class="sec">Pipeline Hand-Off</h2>
+<p>Upstream, stage 3 gives this loop a clean per-run state and a live task context. This stage turns that starting state into the full run history, stop decision, and carry-over registers that the inner sub-stages use each iteration, then hands the finished trajectory and metadata-ready state to downstream finalization in stage 5.</p><div class="files-bar"><h2 class="sec">Functions<span class="pill">5</span></h2><span class="spacer"></span><button class="tool" data-x="expand">Expand all</button><button class="tool" data-x="collapse">Collapse all</button></div><details class="file" id="fn-terminus2_run"><summary><span class="chev"></span><code class="fpath">Terminus2.run</code><a class="fn-range" href="../code/terminus_2.py.html#L1627-L1633" title="terminus_2.py:1627-1633">terminus_2.py:1627–1633 ↗</a></summary><div class="file-body"><p class="fn-sub">enter core agent iteration loop</p>
+<blockquote><p><strong>Stage context</strong>: This region hands execution from <code>Terminus2.run</code> into stage 4's main loop. It runs when <code>run</code> reaches the <code>try</code> block that wraps the core work phase, and it delegates to <code>_run_agent_loop</code> with the prepared prompt, active chat object, logging directory, and instruction text. As the first translated entry in this stage, it is the stage boundary handoff rather than an in-loop step.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>This region awaits <code>self._run_agent_loop(...)</code> to start the main agent iteration loop. It passes four named inputs: local <code>initial_prompt</code>, <code>self._chat</code>, <code>self.logs_dir</code>, and local <code>instruction</code>. The shown code does not use any immediate return value from <code>_run_agent_loop</code>; its visible effect is the transfer of control into that coroutine inside a surrounding <code>try</code> block.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, instruction) -&gt; ?</code></p>
+<ul><li>params: <code>instruction</code>: <code>?</code> — original user instruction from <code>Terminus2.run</code></li><li>reads: <code>self._chat</code>, <code>self.logs_dir</code></li><li>returns: The shown region does not return a value; it awaits <code>_run_agent_loop(...)</code> and ignores any immediate result in these lines.</li><li>effects: enters <code>self._run_agent_loop</code>; passes control into the <a href="stage-4.html">stage-4</a> core loop within a <code>try</code> block</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Enter the <code>try</code> block in <code>Terminus2.run</code> and prepare to delegate to the core loop.</li><li>Await <code>self._run_agent_loop</code> using keyword arguments: <code>initial_prompt=initial_prompt</code>, <code>chat=self._chat</code>, <code>logging_dir=self.logs_dir</code>, and <code>original_instruction=instruction</code>.</li><li>Do not capture or use any direct return value from <code>_run_agent_loop</code> in the shown region.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>        try:
+            await self._run_agent_loop(
+                initial_prompt=initial_prompt,
+                chat=self._chat,
+                logging_dir=self.logs_dir,
+                original_instruction=instruction,
+            )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The call uses explicit keyword arguments, not positional arguments. That makes the handoff contract visible at the call site: <code>_run_agent_loop</code> receives four separately named inputs.</li><li>The code passes both local <code>initial_prompt</code> and local <code>instruction</code> as distinct arguments (<code>initial_prompt</code> and <code>original_instruction</code>). The region preserves them as separate channels instead of collapsing them into one value.</li><li>The delegation sits inside a <code>try</code> block. This region shows that exceptions from <code>_run_agent_loop</code> are meant to flow to later handlers in <code>run</code>, rather than being handled at the call expression itself.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Terminus2.run</li><li><strong>Core callees</strong>: Terminus2._run_agent_loop</li><li><strong>Config / state sources</strong>: local <code>initial_prompt</code> from earlier setup in <code>Terminus2.run</code>; <code>self._chat</code>; <code>self.logs_dir</code>; method parameter <code>instruction</code></li><li><strong>Results to</strong>: control transfers into <code>Terminus2._run_agent_loop</code>; exceptions propagate to later <code>try</code> handlers in <code>Terminus2.run</code> that are not shown here</li></ul></div></details><details class="file" id="fn-terminus2_run_agent_loop"><summary><span class="chev"></span><code class="fpath">Terminus2._run_agent_loop</code><a class="fn-range" href="../code/terminus_2.py.html#L1355-L1367" title="terminus_2.py:1355-1367">terminus_2.py:1355–1367 ↗</a></summary><div class="file-body"><p class="fn-sub">Agent message-content selection branch</p>
+<blockquote><p><strong>Stage context</strong>: This region sits inside <code>Terminus2._run_agent_loop</code>'s core iteration logic and prepares the local text payload stored in <code>message_content</code>. It runs after earlier code has produced <code>llm_response</code>, <code>analysis</code>, and <code>plan</code>, and before later code in the same loop can use that local result. Relative to the already translated <code>Terminus2.run</code>, this is one internal branch within the loop that <code>run</code> hands control to.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>This region chooses the local <code>message_content</code> value from two sources. If <code>self._save_raw_content_in_trajectory</code> is true, it copies <code>llm_response.content</code> verbatim. Otherwise, it builds labeled text from truthy <code>analysis</code> and <code>plan</code>, joining present parts with <code>"\n"</code>, or falling back to <code>""</code> when neither value is present.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>region locals: reads </code>self._save_raw_content_in_trajectory<code>, </code>llm_response.content<code>, </code>analysis<code>, </code>plan<code>; writes local </code>message_content<code> (</code>message_parts<code> only in the non-raw branch); no return in this snippet</code></p>
+<ul><li>params: <code>llm_response.content</code>: <code>?</code> — raw LLM text copied directly when <code>self._save_raw_content_in_trajectory</code> is enabled; <code>analysis</code>: <code>?</code> — optional local text included as <code>Analysis: ...</code> in the structured branch when truthy; <code>plan</code>: <code>?</code> — optional local text included as <code>Plan: ...</code> in the structured branch when truthy</li><li>reads: <code>self._save_raw_content_in_trajectory</code></li><li>returns: none; this snippet's product is the local assignment to <code>message_content</code></li><li>effects: writes local <code>message_content</code>; writes local <code>message_parts</code> only when <code>self._save_raw_content_in_trajectory</code> is false</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Check <code>self._save_raw_content_in_trajectory</code> to select raw-versus-structured message construction.</li><li>In the raw branch, assign <code>message_content = llm_response.content</code> with no parsing, relabeling, or fallback handling.</li><li>In the structured branch, create local <code>message_parts = []</code> and append <code>f"Analysis: {analysis}"</code> only if <code>analysis</code> is truthy.</li><li>Still in the structured branch, append <code>f"Plan: {plan}"</code> only if <code>plan</code> is truthy, then assign <code>message_content</code> to <code>"\n".join(message_parts)</code> when any parts exist, else <code>""</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>
+            # Create message content from analysis and plan, or use raw response if raw_content is enabled
+            if self._save_raw_content_in_trajectory:
+                # Use the raw LLM response content for SFT data export
+                message_content = llm_response.content
+            else:
+                # Parse into structured format (analysis + plan)
+                message_parts = []
+                if analysis:
+                    message_parts.append(f"Analysis: {analysis}")
+                if plan:
+                    message_parts.append(f"Plan: {plan}")
+                message_content = "\n".join(message_parts) if message_parts else ""</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The <code>self._save_raw_content_in_trajectory</code> switch preserves <code>llm_response.content</code> exactly in one mode. That avoids any loss or reshaping of the model output that would happen if the code always rebuilt text from <code>analysis</code> and <code>plan</code> labels.</li><li>The structured branch includes <code>analysis</code> and <code>plan</code> only when each value is truthy. That prevents empty labeled lines such as <code>Analysis: </code> or <code>Plan: </code> from appearing when one field is missing.</li><li>The structured branch falls back to <code>""</code> when <code>message_parts</code> stays empty. That makes the absence of both <code>analysis</code> and <code>plan</code> explicit without inventing placeholder text.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>Terminus2._run_agent_loop</code> enclosing iteration body; <code>Terminus2.run</code> indirectly, by awaiting <code>_run_agent_loop</code></li><li><strong>Core callees</strong>: <code>message_parts.append</code>; <code>"\n".join</code></li><li><strong>Config / state sources</strong>: <code>self._save_raw_content_in_trajectory</code></li><li><strong>Results to</strong>: local <code>message_content</code> in the enclosing <code>_run_agent_loop</code> scope; local <code>message_parts</code> in the structured branch</li><li><strong>Related siblings</strong>: <code>Terminus2.run</code>: transfers control into <code>_run_agent_loop</code></li></ul></div></details><details class="file" id="fn-terminus2_record_asciinema_marker"><summary><span class="chev"></span><code class="fpath">Terminus2._record_asciinema_marker</code><a class="fn-range" href="../code/terminus_2.py.html#L1984-L1985" title="terminus_2.py:1984-1985">terminus_2.py:1984–1985 ↗</a></summary><div class="file-body"><p class="fn-sub">No-op asciinema marker hook</p>
+<blockquote><p><strong>Stage context</strong>: This helper sits in stage 4 as the marker-recording hook that <code>_run_agent_loop</code> can call when an iteration reaches a point worth labeling in the terminal recording. In the current code, it does not participate in the loop's state machine and produces no marker output. It relates to its siblings by preserving the call shape that <a href="stage-4.7.html">stage-4.7</a> uses, while leaving the rest of <code>_run_agent_loop</code> unchanged.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_record_asciinema_marker</code> accepts <code>marker_text: str</code> and immediately returns <code>None</code>. It does not inspect <code>marker_text</code>, read any <code>self</code> state, or write any instance or external state. Its visible behavior is therefore a deliberate no-op at the marker insertion points used by <code>_run_agent_loop</code>.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, marker_text: str) -&gt; None</code></p>
+<ul><li>params: <code>marker_text</code>: <code>str</code> — Requested marker label from the caller</li><li>returns: Returns <code>None</code>; it produces no side effect.</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Receive the <code>marker_text</code> argument from the caller.</li><li>Return immediately without using <code>marker_text</code> and without touching any <code>self._*</code> state.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _record_asciinema_marker(self, marker_text: str) -&gt; None:
+        return</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The method keeps a dedicated <code>_record_asciinema_marker(...)</code> hook even though the body is only <code>return</code>. This preserves a stable call site for <code>_run_agent_loop</code> instead of forcing marker-related conditionals into the loop itself.</li><li>The implementation ignores <code>marker_text</code> on purpose. That choice avoids partial or hidden marker behavior; any real recording logic would need to be added explicitly rather than inferred from the method name.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>Terminus2._run_agent_loop</code> at <a href="stage-4.7.html">stage-4.7</a> marker points</li><li><strong>Core callees</strong>: none; the body only executes <code>return</code></li><li><strong>Config / state sources</strong>: none; it reads no <code>self._*</code> attributes; <code>marker_text</code> parameter supplied by the caller</li><li><strong>Results to</strong>: Returns <code>None</code> to the immediate caller; Leaves <a class="reg" href="registers.html#reg-asciinema-markers"><code>reg-asciinema-markers</code></a> unchanged; Leaves the surrounding <code>_run_agent_loop</code> control flow to continue normally</li><li><strong>Related siblings</strong>: <code>Terminus2._run_agent_loop</code> uses this hook inside the main iteration loop; <code>Terminus2.run</code> reaches this helper only indirectly by entering <code>_run_agent_loop</code></li></ul></div></details><details class="file" id="fn-terminus2_dump_trajectory"><summary><span class="chev"></span><code class="fpath">Terminus2._dump_trajectory</code><a class="fn-range" href="../code/terminus_2.py.html#L1979-L1981" title="terminus_2.py:1979-1981">terminus_2.py:1979–1981 ↗</a></summary><div class="file-body"><p class="fn-sub">Trajectory dump wrapper using summarization count</p>
+<blockquote><p><strong>Stage context</strong>: This entry is a thin wrapper around <code>_dump_trajectory_with_continuation_index</code>. In the visible code, its role is only to forward one piece of instance state, <code>self._summarization_count</code>, into that helper and return <code>None</code>.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_dump_trajectory</code> takes only <code>self</code> and performs no work of its own beyond one delegated call. It reads <code>self._summarization_count</code>, passes that value to <code>_dump_trajectory_with_continuation_index(...)</code>, and returns <code>None</code>. Any JSON creation, file output, or other persistence effects happen inside the callee, not in this wrapper.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self) -&gt; None</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — Terminus2 instance providing <code>_summarization_count</code> and the dump helper</li><li>reads: <code>self._summarization_count</code></li><li>returns: Returns <code>None</code>; its visible product is delegating the dump request to <code>_dump_trajectory_with_continuation_index</code>.</li><li>effects: Invokes <code>self._dump_trajectory_with_continuation_index(self._summarization_count)</code>; Has no direct state writes of its own; any external effects are delegated to the callee</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Read the current <code>self._summarization_count</code> value from instance state.</li><li>Call <code>self._dump_trajectory_with_continuation_index(...)</code> and pass <code>self._summarization_count</code> as the single argument.</li><li>Return <code>None</code> without any additional local processing.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _dump_trajectory(self) -&gt; None:
+        """Dump trajectory data to JSON file following ATIF format."""
+        self._dump_trajectory_with_continuation_index(self._summarization_count)</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The wrapper hardcodes <code>self._summarization_count</code> as the argument source instead of accepting a continuation index parameter. The visible effect is that callers of <code>_dump_trajectory</code> cannot supply a different index through this wrapper.</li><li>The function delegates all dump work to <code>_dump_trajectory_with_continuation_index</code> rather than implementing serialization logic inline. In this snippet, <code>_dump_trajectory</code> acts only as a forwarding entry point.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Unspecified callers that want the default continuation-indexed trajectory dump</li><li><strong>Core callees</strong>: Terminus2._dump_trajectory_with_continuation_index</li><li><strong>Config / state sources</strong>: self._summarization_count</li><li><strong>Results to</strong>: _dump_trajectory_with_continuation_index receives the forwarded continuation index; Any persisted trajectory output is produced by the callee, not by this wrapper</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — forwards current count to dump helper</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_dump_trajectory_with_continuation_index"><summary><span class="chev"></span><code class="fpath">Terminus2._dump_trajectory_with_continuation_index</code><a class="fn-range" href="../code/terminus_2.py.html#L1911-L1977" title="terminus_2.py:1911-1977">terminus_2.py:1911–1977 ↗</a></summary><div class="file-body"><p class="fn-sub">trajectory JSON writer with continuation metadata</p>
+<blockquote><p><strong>Stage context</strong>: This helper is the concrete write path behind the stage's trajectory-dump checkpoints. <code>Terminus2._dump_trajectory</code> forwards <code>self._summarization_count</code> into it, while this function handles the actual JSON assembly, filename choice, and disk write. It sits beside the no-op marker recorder and provides the durable artifact for the loop's in-memory trajectory state.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_dump_trajectory_with_continuation_index</code> serializes the current trajectory into a JSON file, using the <code>continuation_index</code> argument plus runtime state from <code>self</code>. It reads token and cost totals from <code>_context</code>, builds <code>Agent</code>, <code>FinalMetrics</code>, and <code>Trajectory</code> models, chooses either <code>trajectory.json</code> or <code>trajectory.cont-&lt;n&gt;.json</code>, and writes the formatted JSON to disk. If <code>_context</code> is falsy, it logs a warning and returns without writing. It does not mutate agent state and returns <code>None</code>.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, continuation_index: int) -&gt; None</code></p>
+<ul><li>params: <code>continuation_index</code>: <code>int</code> — continuation number used in metadata and filename selection</li><li>reads: <code>self._context.n_input_tokens</code>, <code>self._context.n_output_tokens</code>, <code>self._context.n_cache_tokens</code>, <code>self._context.cost_usd</code>, <code>self._parser_name</code>, <code>self._temperature</code>, <code>self._llm_kwargs</code>, <code>self._linear_history</code>, <code>self._summarization_count</code>, <code>self._session_id</code>, <code>self._model_name</code>, <code>self._trajectory_steps</code>, <code>self.logs_dir</code>, <code>self.logger</code></li><li>returns: Returns <code>None</code>; its real product is a trajectory JSON file written to <code>self.logs_dir</code>, or only log output if it skips or fails.</li><li>effects: logs a warning through <code>self.logger.warning(...)</code> and returns early when <code>self._context</code> is falsy; opens the chosen trajectory path with <code>open(trajectory_path, "w")</code>, which overwrites any existing file; writes formatted JSON with <code>f.write(json_str)</code> inside a <code>with open(..., "w") as f</code> block; logs success through <code>self.logger.debug(...)</code> after a successful write; logs failure through <code>self.logger.error(...)</code> if any exception is raised in the write block</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>It first checks <code>if not self._context:</code>. On that branch, it emits <code>self.logger.warning("No context available, skipping trajectory dump")</code> and returns immediately.</li><li>On the write path, it builds <code>FinalMetrics</code> from <code>_context.n_input_tokens</code>, <code>_context.n_output_tokens</code>, <code>_context.n_cache_tokens or 0</code>, and <code>_context.cost_usd if self._context.cost_usd else None</code>.</li><li>It builds <code>agent_extra</code> starting with <code>{"parser": self._parser_name}</code> and then conditionally adds <code>temperature</code>, <code>llm_kwargs</code>, and <code>continuation_index</code> only when <code>self._temperature is not None</code>, <code>self._llm_kwargs</code> is truthy, and <code>self._linear_history and continuation_index &gt; 0</code> respectively.</li><li>It computes <code>continued_trajectory_ref</code> as <code>None</code> by default, then changes it to <code>f"trajectory.cont-{continuation_index + 1}.json"</code> only when <code>self._linear_history</code> is true and <code>continuation_index &lt; self._summarization_count</code>.</li><li>It constructs a <code>Trajectory</code> model from <code>self._session_id</code>, an <code>Agent</code> built from <code>self.name()</code>, <code>self.version() or "unknown"</code>, <code>self._model_name</code>, and <code>agent_extra</code>, plus <code>self._trajectory_steps</code>, the <code>FinalMetrics</code>, and the computed <code>continued_trajectory_ref</code>.</li><li>It chooses the output path: <code>self.logs_dir / f"trajectory.cont-{continuation_index}.json"</code> when <code>self._linear_history and continuation_index &gt; 0</code>, otherwise <code>self.logs_dir / "trajectory.json"</code>.</li><li>Inside <code>try:</code>, it enters <code>with open(trajectory_path, "w") as f:</code>, calls <code>format_trajectory_json(trajectory.to_json_dict())</code> to produce <code>json_str</code>, and then writes that string with <code>f.write(json_str)</code>.</li><li>If the write succeeds, it logs <code>self.logger.debug(f"Trajectory dumped to {trajectory_path}")</code>; if any exception is raised in the <code>try</code> block, it catches it and logs <code>self.logger.error(f"Failed to dump trajectory: {e}")</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _dump_trajectory_with_continuation_index(self, continuation_index: int) -&gt; None:
+        """Dump trajectory data to JSON file with specified continuation index.
+
+        Args:
+            continuation_index: The continuation index to use for filename and metadata.
+                               For the initial trajectory, use 0.
+                               For the first continuation, use 1, etc.
+        """
+        if not self._context:
+            self.logger.warning("No context available, skipping trajectory dump")
+            return
+
+        # Construct the trajectory using Pydantic models for validation
+        final_metrics = FinalMetrics(
+            total_prompt_tokens=self._context.n_input_tokens,
+            total_completion_tokens=self._context.n_output_tokens,
+            total_cached_tokens=self._context.n_cache_tokens or 0,
+            total_cost_usd=self._context.cost_usd if self._context.cost_usd else None,
+        )
+
+        agent_extra: dict[str, Any] = {
+            "parser": self._parser_name,
+        }
+        if self._temperature is not None:
+            agent_extra["temperature"] = self._temperature
+        if self._llm_kwargs:
+            agent_extra["llm_kwargs"] = self._llm_kwargs
+        if self._linear_history and continuation_index &gt; 0:
+            agent_extra["continuation_index"] = continuation_index
+
+        # Determine if this trajectory will be continued
+        # In linear_history mode, when saving during summarization (i.e., continuation_index &lt; _summarization_count),
+        # this trajectory will have a continuation
+        continued_trajectory_ref = None
+        if self._linear_history and continuation_index &lt; self._summarization_count:
+            # This trajectory segment will be continued in the next file
+            next_continuation_index = continuation_index + 1
+            continued_trajectory_ref = f"trajectory.cont-{next_continuation_index}.json"
+
+        trajectory = Trajectory(
+            session_id=self._session_id,
+            agent=Agent(
+                name=self.name(),
+                version=self.version() or "unknown",
+                model_name=self._model_name,
+                extra=agent_extra,
+            ),
+            steps=self._trajectory_steps,
+            final_metrics=final_metrics,
+            continued_trajectory_ref=continued_trajectory_ref,
+        )
+
+        # Determine trajectory filename based on continuation index
+        if self._linear_history and continuation_index &gt; 0:
+            trajectory_path = (
+                self.logs_dir / f"trajectory.cont-{continuation_index}.json"
+            )
+        else:
+            trajectory_path = self.logs_dir / "trajectory.json"
+
+        try:
+            with open(trajectory_path, "w") as f:
+                json_str = format_trajectory_json(trajectory.to_json_dict())
+                f.write(json_str)
+            self.logger.debug(f"Trajectory dumped to {trajectory_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to dump trajectory: {e}")</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The function gates all serialization work on <code>if not self._context:</code>. That branch makes the missing-context case visible through a warning log and prevents any attempt to read <code>_context</code> fields.</li><li>It uses conditional inserts into <code>agent_extra</code> rather than populating every possible key. As written, <code>temperature</code>, <code>llm_kwargs</code>, and <code>continuation_index</code> are absent unless their branch conditions pass.</li><li>It uses two separate continuation-related conditions: one controls whether <code>agent_extra["continuation_index"]</code> appears (<code>_linear_history and continuation_index &gt; 0</code>), and another controls whether <code>continued_trajectory_ref</code> points at the next file (<code>_linear_history and continuation_index &lt; self._summarization_count</code>).</li><li>The file write sits inside a broad <code>except Exception as e:</code> block that only logs the error. In this function, write failures do not propagate to the caller.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>Terminus2._dump_trajectory</code></li><li><strong>Core callees</strong>: <code>FinalMetrics(...)</code>; <code>Agent(...)</code>; <code>Trajectory(...)</code>; <code>self.name()</code>; <code>self.version()</code>; <code>format_trajectory_json(...)</code>; <code>trajectory.to_json_dict()</code>; <code>open(...)</code>; <code>f.write(...)</code></li><li><strong>Config / state sources</strong>: <code>self._parser_name</code>; <code>self._temperature</code>; <code>self._llm_kwargs</code>; <code>self._linear_history</code>; <code>self._model_name</code>; <code>self.logs_dir</code></li><li><strong>Results to</strong>: writes <code>self.logs_dir / "trajectory.json"</code>; writes <code>self.logs_dir / f"trajectory.cont-{continuation_index}.json"</code> when <code>_linear_history</code> and <code>continuation_index &gt; 0</code>; emits debug/warning/error messages through <code>self.logger</code></li><li><strong>Related siblings</strong>: <code>Terminus2._dump_trajectory</code> is the thin wrapper that passes <code>self._summarization_count</code> into this function</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — compares against <code>continuation_index</code> for continuation ref</li><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — serializes current step list into <code>Trajectory</code></li></ul></div>
+</div></details><h2 class="sec">Sub-stages</h2><div class="sub-grid"><a class="sub-card" href="stage-4.1.html"><span class="sub-num">4.1</span><span class="sub-title">Loop Entry Gates</span><span class="sub-count">2 functions</span></a><a class="sub-card" href="stage-4.2.html"><span class="sub-num">4.2</span><span class="sub-title">Proactive Summarize Probe</span><span class="sub-count">2 functions</span></a><a class="sub-card" href="stage-4.3.html"><span class="sub-num">4.3</span><span class="sub-title">LLM Query</span><span class="sub-count">6 functions</span></a><a class="sub-card" href="stage-4.4.html"><span class="sub-num">4.4</span><span class="sub-title">Response Parse</span><span class="sub-count">16 functions</span></a><a class="sub-card" href="stage-4.5.html"><span class="sub-num">4.5</span><span class="sub-title">Pending Handoff Prompt → User Step (or Split)</span><span class="sub-count">2 functions</span></a><a class="sub-card" href="stage-4.6.html"><span class="sub-num">4.6</span><span class="sub-title">Error Branch</span><span class="sub-count">2 functions</span></a><a class="sub-card" href="stage-4.7.html"><span class="sub-num">4.7</span><span class="sub-title">Command Execute → Observation → Trajectory Step</span><span class="sub-count">2 functions</span></a><a class="sub-card" href="stage-4.8.html"><span class="sub-num">4.8</span><span class="sub-title">Completion Gate + Loop Control</span><span class="sub-count">2 functions</span></a><a class="sub-card" href="stage-4.9.html"><span class="sub-num">4.9</span><span class="sub-title">Parser internal helpers</span><span class="sub-count">10 functions</span></a></div><nav class="pn"><a class="pn-prev" href="stage-3.html"><span>← Previous</span><strong>Run Onset</strong></a><a class="pn-next" href="stage-4.1.html"><span>Next →</span><strong>Loop Entry Gates</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

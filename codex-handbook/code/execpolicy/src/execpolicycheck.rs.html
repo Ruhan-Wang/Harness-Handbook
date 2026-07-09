@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>execpolicy/src/execpolicycheck.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">execpolicy/src/execpolicycheck.rs</code>
+<span class="code-meta">95 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=k>use</b> std::fs;</i><i id="L2"><b class=k>use</b> std::path::PathBuf;</i><i id="L3"></i><i id="L4"><b class=k>use</b> anyhow::Context;</i><i id="L5"><b class=k>use</b> anyhow::Result;</i><i id="L6"><b class=k>use</b> clap::Parser;</i><i id="L7"><b class=k>use</b> serde::Serialize;</i><i id="L8"></i><i id="L9"><b class=k>use</b> <b class=k>crate</b>::Decision;</i><i id="L10"><b class=k>use</b> <b class=k>crate</b>::MatchOptions;</i><i id="L11"><b class=k>use</b> <b class=k>crate</b>::Policy;</i><i id="L12"><b class=k>use</b> <b class=k>crate</b>::PolicyParser;</i><i id="L13"><b class=k>use</b> <b class=k>crate</b>::RuleMatch;</i><i id="L14"></i><i id="L15"><b class=c>/// Arguments for evaluating a command against one or more execpolicy files.</b></i><i id="L16"><b class=m>#[derive(Debug, Parser, Clone)]</b></i><i id="L17"><b class=k>pub</b> <b class=k>struct</b> ExecPolicyCheckCommand {</i><i id="L18">    <b class=c>/// Paths to execpolicy rule files to evaluate (repeatable).</b></i><i id="L19">    <b class=m>#[arg(short = 'r', long = "rules", value_name = "PATH", required = true)]</b></i><i id="L20">    <b class=k>pub</b> rules: Vec&lt;PathBuf&gt;,</i><i id="L21"></i><i id="L22">    <b class=c>/// Pretty-print the JSON output.</b></i><i id="L23">    <b class=m>#[arg(long)]</b></i><i id="L24">    <b class=k>pub</b> pretty: bool,</i><i id="L25"></i><i id="L26">    <b class=c>/// Resolve absolute program paths against basename rules, gated by any</b></i><i id="L27">    <b class=c>/// `host_executable()` definitions in the loaded policy files.</b></i><i id="L28">    <b class=m>#[arg(long)]</b></i><i id="L29">    <b class=k>pub</b> resolve_host_executables: bool,</i><i id="L30"></i><i id="L31">    <b class=c>/// Command tokens to check against the policy.</b></i><i id="L32">    <b class=m>#[arg(</b></i><i id="L33">        value_name = <b class=s>"COMMAND"</b>,</i><i id="L34">        required = <b class=k>true</b>,</i><i id="L35">        trailing_var_arg = <b class=k>true</b>,</i><i id="L36">        allow_hyphen_values = <b class=k>true</b></i><i id="L37">    )]</i><i id="L38">    <b class=k>pub</b> command: Vec&lt;String&gt;,</i><i id="L39">}</i><i id="L40"></i><i id="L41"><b class=k>impl</b> ExecPolicyCheckCommand {</i><i id="L42">    <b class=c>/// Load the policies for this command, evaluate the command, and render JSON output.</b></i><i id="L43">    <b class=k>pub</b> <b class=k>fn</b> run(&amp;<b class=k>self</b>) -&gt; Result&lt;()&gt; {</i><i id="L44">        <b class=k>let</b> policy = load_policies(&amp;<b class=k>self</b>.rules)?;</i><i id="L45">        <b class=k>let</b> matched_rules = policy.matches_for_command_with_options(</i><i id="L46">            &amp;<b class=k>self</b>.command,</i><i id="L47">            <b class=c>/*heuristics_fallback*/</b> None,</i><i id="L48">            &amp;MatchOptions {</i><i id="L49">                resolve_host_executables: <b class=k>self</b>.resolve_host_executables,</i><i id="L50">            },</i><i id="L51">        );</i><i id="L52"></i><i id="L53">        <b class=k>let</b> json = format_matches_json(&amp;matched_rules, <b class=k>self</b>.pretty)?;</i><i id="L54">        <b class=m>println!</b>(<b class=s>"{json}"</b>);</i><i id="L55"></i><i id="L56">        Ok(())</i><i id="L57">    }</i><i id="L58">}</i><i id="L59"></i><i id="L60"><b class=k>pub</b> <b class=k>fn</b> format_matches_json(matched_rules: &amp;[RuleMatch], pretty: bool) -&gt; Result&lt;String&gt; {</i><i id="L61">    <b class=k>let</b> output = ExecPolicyCheckOutput {</i><i id="L62">        matched_rules,</i><i id="L63">        decision: matched_rules.iter().map(RuleMatch::decision).max(),</i><i id="L64">    };</i><i id="L65"></i><i id="L66">    <b class=k>if</b> pretty {</i><i id="L67">        serde_json::to_string_pretty(&amp;output).map_err(Into::into)</i><i id="L68">    } <b class=k>else</b> {</i><i id="L69">        serde_json::to_string(&amp;output).map_err(Into::into)</i><i id="L70">    }</i><i id="L71">}</i><i id="L72"></i><i id="L73"><b class=k>pub</b> <b class=k>fn</b> load_policies(policy_paths: &amp;[PathBuf]) -&gt; Result&lt;Policy&gt; {</i><i id="L74">    <b class=k>let</b> <b class=k>mut</b> parser = PolicyParser::new();</i><i id="L75"></i><i id="L76">    <b class=k>for</b> policy_path <b class=k>in</b> policy_paths {</i><i id="L77">        <b class=k>let</b> policy_file_contents = fs::read_to_string(policy_path)</i><i id="L78">            .with_context(|| <b class=m>format!</b>(<b class=s>"failed to read policy at {}"</b>, policy_path.display()))?;</i><i id="L79">        <b class=k>let</b> policy_identifier = policy_path.to_string_lossy().to_string();</i><i id="L80">        parser</i><i id="L81">            .parse(&amp;policy_identifier, &amp;policy_file_contents)</i><i id="L82">            .with_context(|| <b class=m>format!</b>(<b class=s>"failed to parse policy at {}"</b>, policy_path.display()))?;</i><i id="L83">    }</i><i id="L84"></i><i id="L85">    Ok(parser.build())</i><i id="L86">}</i><i id="L87"></i><i id="L88"><b class=m>#[derive(Serialize)]</b></i><i id="L89"><b class=m>#[serde(rename_all = "camelCase")]</b></i><i id="L90"><b class=k>struct</b> ExecPolicyCheckOutput&lt;<b class=m>'a</b>&gt; {</i><i id="L91">    <b class=m>#[serde(rename = "matchedRules")]</b></i><i id="L92">    matched_rules: &amp;<b class=m>'a</b> [RuleMatch],</i><i id="L93">    <b class=m>#[serde(skip_serializing_if = "Option::is_none")]</b></i><i id="L94">    decision: Option&lt;Decision&gt;,</i><i id="L95">}</i></pre></div>
+</main>
+<script src="../../../assets/app.js"></script>
+</body>
+</html>

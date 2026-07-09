@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-4.8 · Completion Gate + Loop Control</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=en"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=en" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>Home</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>State-flow registers</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>Configuration Crystallization</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>Environment Setup</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>Run Onset</a></div><details class="s-node" open><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>Iteration Loop</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>Loop Entry Gates</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>Proactive Summarize Probe</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM Query</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>Response Parse</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>Pending Handoff Prompt → User Step (or Split)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>Error Branch</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>Command Execute → Observation → Trajectory Step</a></div><div class="s-leaf"><a class="s-link cur" href="stage-4.8.html"><span class="s-num">4.8</span>Completion Gate + Loop Control</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>Parser internal helpers</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>Run Teardown</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>Recording Post-process (External)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>Context Summarization</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token &amp; Cost Accounting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>Output Length Limiting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>Logging</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux internal helpers</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">Index</a><span class="sep">›</span><a href="stage-4.html">Iteration Loop</a></nav><div class="stage-head"><h1>Completion Gate + Loop Control</h1><div class="meta"><span class="chip mono">stage-4.8</span><span class="chip">2 functions</span></div></div>
+<h2 class="sec">Opening Explanation</h2>
+<p>This stage exists to stop the agent from ending too early. By the time execution reaches here, the agent has already run a command, seen the result, and may believe the task is done. The problem is that agents often claim success one turn too soon. So this stage acts as a completion gate: it does not trust a single “I’m finished” signal. It asks for a second confirmation on the next turn before it really exits. If the task is not complete, it simply feeds the latest observation back into the loop so the agent can think again. In other words, this stage owns the decision between three paths: continue working, ask for completion confirmation, or finally stop.</p>
+<h2 class="sec">Main Flow</h2>
+
+<ol><li>The stage looks at the result of the just-finished turn.<p>It checks whether the agent currently thinks the task is complete, and whether that same completion claim was already pending from the previous turn.</p></li><li>If this is the first completion claim, it does <strong>not</strong> end the run yet.<p>Instead, it uses <code>_get_completion_confirmation_message()</code> (builds the follow-up prompt that asks the agent to confirm it is truly done) and sends that back into the loop as the next prompt. Why: one completion claim is cheap and often wrong. The extra turn is a safety check.</p></li><li>If the agent says the task is complete <strong>again</strong> on the next turn, the loop returns.<p>This is the real exit. At that point, the system has two consecutive signals that the work is done.</p></li><li>If the task is not complete, the stage takes the normal path.<p>It sets the next prompt to the latest observation, usually terminal output (text from the shell after the command ran), so the next loop iteration can reason over fresh evidence and decide what to do next.</p></li><li><code>Terminus2._run_agent_loop()</code> (the main think-act-observe loop for the agent) owns this control point because this is where the system must choose whether to keep iterating or stop.<p>This logic belongs at the end of the iteration body, after the agent has both acted and seen the result.</p></li></ol>
+<h2 class="sec"> State Flow</h2>
+<ul><li>writes: 无 — this stage is not mapped to any explicit skeleton register in the provided input</li><li>reads: 无 — completion and pending-confirmation signals are used here in code flow, but no explicit register IDs were provided for them</li><li>clears: 无</li><li>triggers downstream: <code>subsys-parser-internal Parser internal helpers</code> — on the normal continue path, when the loop sets the next prompt and starts another iteration</li><li>triggers downstream: <code>subsys-parser-internal Parser internal helpers</code> — on the first completion claim, when the confirmation prompt is injected and the loop continues</li><li>triggers downstream: 无 — on second consecutive completion confirmation, the loop returns and no next stage runs</li></ul>
+<h2 class="sec">Pipeline Hand-Off</h2>
+<p>Upstream, this stage receives the finished turn: the latest observation from command execution, plus the agent’s current judgment about whether the task is done. It produces either a final stop, a confirmation prompt, or the normal next prompt, and that output determines whether the next loop iteration begins and feeds back into parsing and planning.</p><div class="files-bar"><h2 class="sec">Functions<span class="pill">2</span></h2><span class="spacer"></span><button class="tool" data-x="expand">Expand all</button><button class="tool" data-x="collapse">Collapse all</button></div><details class="file" id="fn-terminus2_run_agent_loop"><summary><span class="chev"></span><code class="fpath">Terminus2._run_agent_loop</code><a class="fn-range" href="../code/terminus_2.py.html#L1550-L1561" title="terminus_2.py:1550-1561">terminus_2.py:1550–1561 ↗</a></summary><div class="file-body"><p class="fn-sub">Loop-exit gate and prompt carry-forward</p>
+<blockquote><p><strong>Stage context</strong>: This region runs at the end of one <code>_run_agent_loop</code> iteration. It uses the current iteration results—<code>is_task_complete</code>, <code>was_pending_completion</code>, and <code>observation</code>—to decide whether the loop returns, continues immediately with a confirmation prompt, or falls through with the terminal output as the next <code>prompt</code>. Within stage 4.10, this is the stage's control gate.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>This region first calls <code>_dump_trajectory()</code> to persist the current trajectory state. It then inspects <code>is_task_complete</code> together with <code>was_pending_completion</code> to choose one of three outcomes: early <code>return</code> on a second consecutive completion signal, <code>prompt = observation</code> plus <code>continue</code> on a first completion signal, or <code>prompt = observation</code> on the normal path. Its direct outputs are loop control (<code>return</code> or <code>continue</code>) and reassignment of the local <code>prompt</code> variable.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, prompt: str) -&gt; None</code></p>
+<ul><li>params: <code>self</code>: <code>Terminus2</code> — owning runner instance; supplies <code>_dump_trajectory()</code> and trajectory state; <code>prompt</code>: <code>str</code> — current loop prompt; this region may replace it with <code>observation</code> for the next iteration; <code>is_task_complete</code>: <code>?</code> — local completion flag read by this region; <code>was_pending_completion</code>: <code>?</code> — local snapshot of prior pending-completion state used to confirm completion; <code>observation</code>: <code>?</code> — local observation text forwarded into <code>prompt</code> on both non-return paths</li><li>reads: <code>self._trajectory_steps (indirectly via </code>_dump_trajectory()<code>)</code>, <code>other instance state consumed by </code>self._dump_trajectory()<code> for serialization/output</code></li><li>returns: Returns <code>None</code> only on the confirmed-complete branch; otherwise the real product is loop control (<code>continue</code> or fallthrough) and updated local <code>prompt</code>.</li><li>effects: calls <code>self._dump_trajectory()</code> to write trajectory data to external storage; reassigns local <code>prompt</code> to <code>observation</code> on both non-return paths; issues <code>continue</code> on the first-completion branch; issues early <code>return</code> on the confirmed-complete branch</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Call <code>self._dump_trajectory()</code> before making the loop-control decision.</li><li>If <code>is_task_complete</code> is true and <code>was_pending_completion</code> is also true, treat this as the second consecutive completion signal and <code>return</code> immediately.</li><li>If <code>is_task_complete</code> is true but <code>was_pending_completion</code> is false, set <code>prompt = observation</code> and <code>continue</code> so the next iteration uses that confirmation text.</li><li>If <code>is_task_complete</code> is false, skip the completion gate and set <code>prompt = observation</code> on the normal path.</li><li>The explicit <code>continue</code> in the first-completion branch bypasses the trailing <code>prompt = observation</code>, which is why <code>prompt = observation</code> appears both inside that branch and after the <code>if</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>            self._dump_trajectory()
+
+            if is_task_complete:
+                if was_pending_completion:
+                    # Task is confirmed complete (this is the second time task_complete was True), return
+                    return
+                else:
+                    # First completion attempt - ask for confirmation and continue
+                    prompt = observation
+                    continue
+
+            prompt = observation</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The code uses a two-step completion gate anchored to <code>is_task_complete</code> and <code>was_pending_completion</code>. The inline comments define the first <code>True</code> as a 'First completion attempt' and the second consecutive <code>True</code> as 'Task is confirmed complete'.</li><li>The region persists state with <code>_dump_trajectory()</code> before any <code>return</code> or <code>continue</code>. That ordering ensures the current iteration's trajectory is written even when the loop exits immediately or restarts from the first-completion branch.</li><li>The first-completion path sets <code>prompt = observation</code> inside the branch because the following <code>continue</code> skips the shared trailing assignment. The duplicated assignment keeps both non-return paths feeding <code>observation</code> into the next prompt.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>Terminus2._run_agent_loop</code> iteration tail</li><li><strong>Core callees</strong>: <code>Terminus2._dump_trajectory</code></li><li><strong>Config / state sources</strong>: <code>is_task_complete</code> local result from earlier in <code>_run_agent_loop</code>; <code>was_pending_completion</code> local snapshot from earlier in <code>_run_agent_loop</code>; <code>observation</code> local output from earlier in <code>_run_agent_loop</code>; instance trajectory state read indirectly by <code>_dump_trajectory()</code></li><li><strong>Results to</strong>: local <code>prompt</code> for the next <code>_run_agent_loop</code> iteration; loop control in <code>_run_agent_loop</code> via <code>continue</code>; function exit from <code>_run_agent_loop</code> via early <code>return</code>; persisted trajectory output written by <code>_dump_trajectory()</code></li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-pending-completion"><code>reg-pending-completion</code></a> — uses <code>was_pending_completion</code> to confirm second completion</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_get_completion_confirmation_message"><summary><span class="chev"></span><code class="fpath">Terminus2._get_completion_confirmation_message</code><a class="fn-range" href="../code/terminus_2.py.html#L486-L507" title="terminus_2.py:486-507">terminus_2.py:486–507 ↗</a></summary><div class="file-body"><p class="fn-sub">Build completion reconfirmation prompt for active parser</p>
+<blockquote><p><strong>Stage context</strong>: This helper supports the stage-4.10 completion gate by generating the exact follow-up prompt used on the first completion claim. <code>_run_agent_loop</code> uses its return value when it needs the agent to confirm completion for a second consecutive turn. It complements the sibling loop-control logic by supplying the parser-specific wording that stage-4.10 feeds back as the next <code>prompt</code>.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>The function builds a confirmation message from <code>terminal_output</code> and the current parser mode in <code>self._parser_name</code>. It returns one string that embeds the terminal state and tells the agent which completion token to repeat: JSON uses <code>"task_complete": true</code>, while XML uses <code>&lt;task_complete&gt;true&lt;/task_complete&gt;</code>. It does not mutate instance state or perform I/O. If <code>self._parser_name</code> is neither <code>"json"</code> nor <code>"xml"</code>, it raises <code>ValueError</code>.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, terminal_output: str) -&gt; str</code></p>
+<ul><li>params: <code>terminal_output</code>: <code>str</code> — Current terminal state to embed in the confirmation prompt</li><li>reads: <code>self._parser_name</code></li><li>returns: A parser-specific completion confirmation message string that includes <code>terminal_output</code> and instructs the agent to repeat the completion marker</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Read <code>self._parser_name</code> to choose the response format that the follow-up prompt must target.</li><li>If <code>self._parser_name == "json"</code>, return a message that includes <code>terminal_output</code> and tells the agent to include <code>"task_complete": true</code> again in its JSON response.</li><li>If <code>self._parser_name == "xml"</code>, return a message that includes <code>terminal_output</code> and tells the agent to include <code>&lt;task_complete&gt;true&lt;/task_complete&gt;</code> again in its XML response.</li><li>For any other <code>self._parser_name</code>, raise <code>ValueError</code> with the unsupported name in the message instead of returning a fallback prompt.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _get_completion_confirmation_message(self, terminal_output: str) -&gt; str:
+        """Return the format-specific task completion confirmation message."""
+        if self._parser_name == "json":
+            return (
+                f"Current terminal state:\n{terminal_output}\n\n"
+                "Are you sure you want to mark the task as complete? "
+                "This will trigger your solution to be graded and you won't be able to "
+                'make any further corrections. If so, include "task_complete": true '
+                "in your JSON response again."
+            )
+        elif self._parser_name == "xml":
+            return (
+                f"Current terminal state:\n{terminal_output}\n\n"
+                "Are you sure you want to mark the task as complete? "
+                "This will trigger your solution to be graded and you won't be able to "
+                "make any further corrections. If so, include "
+                "&lt;task_complete&gt;true&lt;/task_complete&gt; again."
+            )
+        else:
+            raise ValueError(
+                f"Unknown parser_name: {self._parser_name}. Use 'json' or 'xml'."
+            )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It branches explicitly on <code>self._parser_name</code> so the confirmation text matches the active output schema exactly. A generic confirmation prompt would risk the agent reconfirming in the wrong format and breaking the parser contract.</li><li>It embeds <code>terminal_output</code> directly into the returned string. That keeps the confirmation tied to the current terminal state the agent is about to finalize against, rather than asking for a blind second confirmation.</li><li>It raises <code>ValueError</code> in the <code>else</code> branch instead of defaulting to one format. That fail-fast choice exposes parser misconfiguration immediately; a silent default would produce a misleading prompt and likely cause a harder-to-debug downstream parse failure.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>Terminus2._run_agent_loop</code> when the first completion signal needs explicit reconfirmation</li><li><strong>Core callees</strong>: none</li><li><strong>Config / state sources</strong>: <code>self._parser_name</code> selects JSON versus XML wording</li><li><strong>Results to</strong>: Returned string becomes the confirmation question fed back into <code>_run_agent_loop</code> as the next <code>prompt</code>; Its text supports the two-step completion gate described by stage-4.10</li><li><strong>Related siblings</strong>: <code>Terminus2._run_agent_loop</code> consumes this helper's string during the stage-4.10 continue path</li></ul></div></details><nav class="pn"><a class="pn-prev" href="stage-4.7.html"><span>← Previous</span><strong>Command Execute → Observation → Trajectory Step</strong></a><a class="pn-next" href="stage-4.9.html"><span>Next →</span><strong>Parser internal helpers</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

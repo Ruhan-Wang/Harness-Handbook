@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ext/skills/src/tools/list.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">ext/skills/src/tools/list.rs</code>
+<span class="code-meta">112 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=k>use</b> codex_extension_api::ToolCall;</i><i id="L2"><b class=k>use</b> codex_extension_api::ToolExecutor;</i><i id="L3"><b class=k>use</b> codex_extension_api::ToolExecutorFuture;</i><i id="L4"><b class=k>use</b> codex_extension_api::ToolName;</i><i id="L5"><b class=k>use</b> codex_extension_api::ToolSpec;</i><i id="L6"><b class=k>use</b> schemars::JsonSchema;</i><i id="L7"><b class=k>use</b> serde::Deserialize;</i><i id="L8"><b class=k>use</b> serde::Serialize;</i><i id="L9"></i><i id="L10"><b class=k>use</b> <b class=k>crate</b>::catalog::SkillCatalogEntry;</i><i id="L11"><b class=k>use</b> <b class=k>crate</b>::render::truncate_utf8_to_bytes;</i><i id="L12"></i><i id="L13"><b class=k>use</b> <b class=k>super</b>::MAX_HANDLE_BYTES;</i><i id="L14"><b class=k>use</b> <b class=k>super</b>::SkillToolAuthority;</i><i id="L15"><b class=k>use</b> <b class=k>super</b>::SkillToolContext;</i><i id="L16"><b class=k>use</b> <b class=k>super</b>::external_json_output;</i><i id="L17"><b class=k>use</b> <b class=k>super</b>::is_bounded_handle;</i><i id="L18"><b class=k>use</b> <b class=k>super</b>::parse_args;</i><i id="L19"><b class=k>use</b> <b class=k>super</b>::skill_function_tool;</i><i id="L20"><b class=k>use</b> <b class=k>super</b>::skill_tool_name;</i><i id="L21"></i><i id="L22"><b class=k>const</b> TOOL_NAME: &amp;str = <b class=s>"list"</b>;</i><i id="L23"><b class=k>const</b> MAX_WARNINGS: usize = <b class=n>4</b>;</i><i id="L24"><b class=k>const</b> MAX_WARNING_BYTES: usize = <b class=n>256</b>;</i><i id="L25"></i><i id="L26"><b class=m>#[derive(Deserialize, JsonSchema)]</b></i><i id="L27"><b class=m>#[serde(deny_unknown_fields)]</b></i><i id="L28"><b class=k>struct</b> ListArgs {</i><i id="L29">    authority: SkillToolAuthority,</i><i id="L30">}</i><i id="L31"></i><i id="L32"><b class=m>#[derive(Debug, Eq, JsonSchema, PartialEq, Serialize)]</b></i><i id="L33"><b class=m>#[schemars(deny_unknown_fields)]</b></i><i id="L34"><b class=k>struct</b> ListedSkill {</i><i id="L35">    authority: SkillToolAuthority,</i><i id="L36">    package: String,</i><i id="L37">    name: String,</i><i id="L38">    description: String,</i><i id="L39">    main_resource: String,</i><i id="L40">}</i><i id="L41"></i><i id="L42"><b class=m>#[derive(Debug, Eq, JsonSchema, PartialEq, Serialize)]</b></i><i id="L43"><b class=m>#[schemars(deny_unknown_fields)]</b></i><i id="L44"><b class=k>struct</b> ListResponse {</i><i id="L45">    skills: Vec&lt;ListedSkill&gt;,</i><i id="L46">    warnings: Vec&lt;String&gt;,</i><i id="L47">}</i><i id="L48"></i><i id="L49"><b class=m>#[derive(Clone)]</b></i><i id="L50"><b class=k>pub</b>(<b class=k>super</b>) <b class=k>struct</b> ListTool {</i><i id="L51">    <b class=k>pub</b>(<b class=k>super</b>) context: SkillToolContext,</i><i id="L52">}</i><i id="L53"></i><i id="L54"><b class=k>impl</b> ToolExecutor&lt;ToolCall&gt; <b class=k>for</b> ListTool {</i><i id="L55">    <b class=k>fn</b> tool_name(&amp;<b class=k>self</b>) -&gt; ToolName {</i><i id="L56">        skill_tool_name(TOOL_NAME)</i><i id="L57">    }</i><i id="L58"></i><i id="L59">    <b class=k>fn</b> spec(&amp;<b class=k>self</b>) -&gt; ToolSpec {</i><i id="L60">        skill_function_tool::&lt;ListArgs, ListResponse&gt;(</i><i id="L61">            TOOL_NAME,</i><i id="L62">            <b class=s>"List enabled skills owned by the requested authority. Only orchestrator-owned skills are currently supported. Returns the opaque package and main-resource handles required by skills.read."</b>,</i><i id="L63">        )</i><i id="L64">    }</i><i id="L65"></i><i id="L66">    <b class=k>fn</b> handle(&amp;<b class=k>self</b>, call: ToolCall) -&gt; ToolExecutorFuture&lt;<b class=m>'_</b>&gt; {</i><i id="L67">        Box::pin(<b class=k>async</b> <b class=k>move</b> {</i><i id="L68">            <b class=k>let</b> args: ListArgs = parse_args(&amp;call)?;</i><i id="L69">            <b class=k>let</b> authority = args.authority.into_authority();</i><i id="L70">            <b class=k>let</b> catalog = <b class=k>self</b>.context.catalog(&amp;call.turn_id, args.authority).<b class=k>await</b>;</i><i id="L71">            <b class=k>let</b> response = ListResponse {</i><i id="L72">                skills: catalog</i><i id="L73">                    .entries</i><i id="L74">                    .into_iter()</i><i id="L75">                    .filter(|entry| entry.enabled &amp;&amp; entry.authority == authority)</i><i id="L76">                    .filter_map(listed_skill)</i><i id="L77">                    .collect(),</i><i id="L78">                warnings: bounded_warnings(catalog.warnings),</i><i id="L79">            };</i><i id="L80"></i><i id="L81">            external_json_output(&amp;response)</i><i id="L82">        })</i><i id="L83">    }</i><i id="L84">}</i><i id="L85"></i><i id="L86"><b class=k>fn</b> listed_skill(entry: SkillCatalogEntry) -&gt; Option&lt;ListedSkill&gt; {</i><i id="L87">    <b class=k>let</b> authority = SkillToolAuthority::from_authority(&amp;entry.authority)?;</i><i id="L88">    <b class=k>if</b> !is_bounded_handle(&amp;entry.id.<b class=n>0</b>, MAX_HANDLE_BYTES)</i><i id="L89">        || !is_bounded_handle(entry.main_prompt.as_str(), MAX_HANDLE_BYTES)</i><i id="L90">    {</i><i id="L91">        <b class=k>return</b> None;</i><i id="L92">    }</i><i id="L93"></i><i id="L94">    Some(ListedSkill {</i><i id="L95">        authority,</i><i id="L96">        package: entry.id.<b class=n>0</b>,</i><i id="L97">        name: entry.name,</i><i id="L98">        description: entry.description,</i><i id="L99">        main_resource: entry.main_prompt.as_str().to_string(),</i><i id="L100">    })</i><i id="L101">}</i><i id="L102"></i><i id="L103"><b class=k>fn</b> bounded_warnings(warnings: Vec&lt;String&gt;) -&gt; Vec&lt;String&gt; {</i><i id="L104">    warnings</i><i id="L105">        .into_iter()</i><i id="L106">        .take(MAX_WARNINGS)</i><i id="L107">        .map(|warning| {</i><i id="L108">            <b class=k>let</b> (warning, _) = truncate_utf8_to_bytes(&amp;warning, MAX_WARNING_BYTES);</i><i id="L109">            warning</i><i id="L110">        })</i><i id="L111">        .collect()</i><i id="L112">}</i></pre></div>
+</main>
+<script src="../../../../../assets/app.js"></script>
+</body>
+</html>

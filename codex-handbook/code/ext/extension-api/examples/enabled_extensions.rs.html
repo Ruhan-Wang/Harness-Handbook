@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ext/extension-api/examples/enabled_extensions.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">ext/extension-api/examples/enabled_extensions.rs</code>
+<span class="code-meta">93 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=m>#[path = "enabled_extensions/shared_state_extension.rs"]</b></i><i id="L2"><b class=k>mod</b> shared_state_extension;</i><i id="L3"></i><i id="L4"><b class=k>use</b> std::future::Future;</i><i id="L5"><b class=k>use</b> std::pin::pin;</i><i id="L6"><b class=k>use</b> std::task::Context;</i><i id="L7"><b class=k>use</b> std::task::Poll;</i><i id="L8"><b class=k>use</b> std::task::Waker;</i><i id="L9"></i><i id="L10"><b class=k>use</b> codex_extension_api::ExtensionData;</i><i id="L11"><b class=k>use</b> codex_extension_api::ExtensionRegistryBuilder;</i><i id="L12"><b class=k>use</b> shared_state_extension::recorded_style_contributions;</i><i id="L13"><b class=k>use</b> shared_state_extension::recorded_usage_contributions;</i><i id="L14"></i><i id="L15"><b class=k>fn</b> main() {</i><i id="L16">    <b class=c>// 1. Install the contributors for the thread-start input type this host exposes.</b></i><i id="L17">    <b class=k>let</b> <b class=k>mut</b> builder = ExtensionRegistryBuilder::&lt;()&gt;::new();</i><i id="L18">    shared_state_extension::install(&amp;<b class=k>mut</b> builder);</i><i id="L19">    <b class=k>let</b> registry = builder.build();</i><i id="L20"></i><i id="L21">    <b class=c>// 2. The host decides which stores are shared.</b></i><i id="L22">    <b class=k>let</b> session_store = ExtensionData::new(<b class=s>"session"</b>);</i><i id="L23">    <b class=k>let</b> first_thread_store = ExtensionData::new(<b class=s>"thread-1"</b>);</i><i id="L24">    <b class=k>let</b> second_thread_store = ExtensionData::new(<b class=s>"thread-2"</b>);</i><i id="L25"></i><i id="L26">    <b class=c>// 3. Reusing the same session store shares session state across threads.</b></i><i id="L27">    <b class=k>let</b> first_thread_fragments = block_on_ready(contribute_prompt(</i><i id="L28">        &amp;registry,</i><i id="L29">        &amp;session_store,</i><i id="L30">        &amp;first_thread_store,</i><i id="L31">    ));</i><i id="L32">    block_on_ready(contribute_prompt(</i><i id="L33">        &amp;registry,</i><i id="L34">        &amp;session_store,</i><i id="L35">        &amp;first_thread_store,</i><i id="L36">    ));</i><i id="L37">    block_on_ready(contribute_prompt(</i><i id="L38">        &amp;registry,</i><i id="L39">        &amp;session_store,</i><i id="L40">        &amp;second_thread_store,</i><i id="L41">    ));</i><i id="L42"></i><i id="L43">    <b class=m>println!</b>(<b class=s>"first prompt fragments: {}"</b>, first_thread_fragments.len());</i><i id="L44">    <b class=m>println!</b>(</i><i id="L45">        <b class=s>"session style contributions: {}"</b>,</i><i id="L46">        recorded_style_contributions(&amp;session_store)</i><i id="L47">    );</i><i id="L48">    <b class=m>println!</b>(</i><i id="L49">        <b class=s>"session usage contributions: {}"</b>,</i><i id="L50">        recorded_usage_contributions(&amp;session_store)</i><i id="L51">    );</i><i id="L52">    <b class=m>println!</b>(</i><i id="L53">        <b class=s>"first thread style contributions: {}"</b>,</i><i id="L54">        recorded_style_contributions(&amp;first_thread_store)</i><i id="L55">    );</i><i id="L56">    <b class=m>println!</b>(</i><i id="L57">        <b class=s>"first thread usage contributions: {}"</b>,</i><i id="L58">        recorded_usage_contributions(&amp;first_thread_store)</i><i id="L59">    );</i><i id="L60">    <b class=m>println!</b>(</i><i id="L61">        <b class=s>"second thread style contributions: {}"</b>,</i><i id="L62">        recorded_style_contributions(&amp;second_thread_store)</i><i id="L63">    );</i><i id="L64">    <b class=m>println!</b>(</i><i id="L65">        <b class=s>"second thread usage contributions: {}"</b>,</i><i id="L66">        recorded_usage_contributions(&amp;second_thread_store)</i><i id="L67">    );</i><i id="L68">}</i><i id="L69"></i><i id="L70"><b class=k>async</b> <b class=k>fn</b> contribute_prompt(</i><i id="L71">    registry: &amp;codex_extension_api::ExtensionRegistry&lt;()&gt;,</i><i id="L72">    session_store: &amp;ExtensionData,</i><i id="L73">    thread_store: &amp;ExtensionData,</i><i id="L74">) -&gt; Vec&lt;codex_extension_api::PromptFragment&gt; {</i><i id="L75">    <b class=k>let</b> <b class=k>mut</b> fragments = Vec::new();</i><i id="L76">    <b class=k>for</b> contributor <b class=k>in</b> registry.context_contributors() {</i><i id="L77">        fragments.extend(contributor.contribute(session_store, thread_store).<b class=k>await</b>);</i><i id="L78">    }</i><i id="L79">    fragments</i><i id="L80">}</i><i id="L81"></i><i id="L82"><b class=k>fn</b> block_on_ready&lt;F&gt;(future: F) -&gt; F::Output</i><i id="L83"><b class=k>where</b></i><i id="L84">    F: Future,</i><i id="L85">{</i><i id="L86">    <b class=k>let</b> waker = Waker::noop();</i><i id="L87">    <b class=k>let</b> <b class=k>mut</b> context = Context::from_waker(waker);</i><i id="L88">    <b class=k>let</b> <b class=k>mut</b> future = <b class=m>pin!</b>(future);</i><i id="L89">    <b class=k>match</b> future.as_mut().poll(&amp;<b class=k>mut</b> context) {</i><i id="L90">        Poll::Ready(output) =&gt; output,</i><i id="L91">        Poll::Pending =&gt; <b class=m>panic!</b>(<b class=s>"example context contributors should complete immediately"</b>),</i><i id="L92">    }</i><i id="L93">}</i></pre></div>
+</main>
+<script src="../../../../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>app-server/src/server_request_error.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">app-server/src/server_request_error.rs</code>
+<span class="code-meta">42 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=k>use</b> codex_app_server_protocol::JSONRPCErrorError;</i><i id="L2"></i><i id="L3"><b class=k>pub</b>(<b class=k>crate</b>) <b class=k>const</b> TURN_TRANSITION_PENDING_REQUEST_ERROR_REASON: &amp;str = <b class=s>"turnTransition"</b>;</i><i id="L4"></i><i id="L5"><b class=k>pub</b>(<b class=k>crate</b>) <b class=k>fn</b> is_turn_transition_server_request_error(error: &amp;JSONRPCErrorError) -&gt; bool {</i><i id="L6">    error</i><i id="L7">        .data</i><i id="L8">        .as_ref()</i><i id="L9">        .and_then(|data| data.get(<b class=s>"reason"</b>))</i><i id="L10">        .and_then(serde_json::Value::as_str)</i><i id="L11">        == Some(TURN_TRANSITION_PENDING_REQUEST_ERROR_REASON)</i><i id="L12">}</i><i id="L13"></i><i id="L14"><b class=m>#[cfg(test)]</b></i><i id="L15"><b class=k>mod</b> tests {</i><i id="L16">    <b class=k>use</b> <b class=k>super</b>::is_turn_transition_server_request_error;</i><i id="L17">    <b class=k>use</b> codex_app_server_protocol::JSONRPCErrorError;</i><i id="L18">    <b class=k>use</b> pretty_assertions::assert_eq;</i><i id="L19">    <b class=k>use</b> serde_json::json;</i><i id="L20"></i><i id="L21">    <b class=m>#[test]</b></i><i id="L22">    <b class=k>fn</b> turn_transition_error_is_detected() {</i><i id="L23">        <b class=k>let</b> error = JSONRPCErrorError {</i><i id="L24">            code: -<b class=n>1</b>,</i><i id="L25">            message: <b class=s>"client request resolved because the turn state was changed"</b>.to_string(),</i><i id="L26">            data: Some(<b class=m>json!</b>({ <b class=s>"reason"</b>: <b class=s>"turnTransition"</b> })),</i><i id="L27">        };</i><i id="L28"></i><i id="L29">        <b class=m>assert_eq!</b>(is_turn_transition_server_request_error(&amp;error), <b class=k>true</b>);</i><i id="L30">    }</i><i id="L31"></i><i id="L32">    <b class=m>#[test]</b></i><i id="L33">    <b class=k>fn</b> unrelated_error_is_not_detected() {</i><i id="L34">        <b class=k>let</b> error = JSONRPCErrorError {</i><i id="L35">            code: -<b class=n>1</b>,</i><i id="L36">            message: <b class=s>"boom"</b>.to_string(),</i><i id="L37">            data: Some(<b class=m>json!</b>({ <b class=s>"reason"</b>: <b class=s>"other"</b> })),</i><i id="L38">        };</i><i id="L39"></i><i id="L40">        <b class=m>assert_eq!</b>(is_turn_transition_server_request_error(&amp;error), <b class=k>false</b>);</i><i id="L41">    }</i><i id="L42">}</i></pre></div>
+</main>
+<script src="../../../assets/app.js"></script>
+</body>
+</html>

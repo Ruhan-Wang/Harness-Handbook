@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>crosscut-X3 · Logging</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=en"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=en" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>Home</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>State-flow registers</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>Configuration Crystallization</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>Environment Setup</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>Run Onset</a></div><details class="s-node"><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>Iteration Loop</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>Loop Entry Gates</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>Proactive Summarize Probe</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM Query</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>Response Parse</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>Pending Handoff Prompt → User Step (or Split)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>Error Branch</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>Command Execute → Observation → Trajectory Step</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>Completion Gate + Loop Control</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>Parser internal helpers</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>Run Teardown</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>Recording Post-process (External)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>Context Summarization</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token &amp; Cost Accounting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>Output Length Limiting</a></div><div class="s-leaf"><a class="s-link cur" href="crosscut-X3.html"><span class="s-num">X3</span>Logging</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux internal helpers</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">Index</a></nav><div class="stage-head"><h1>Logging</h1><div class="meta"><span class="chip mono">crosscut-X3</span><span class="chip">0 functions</span></div></div>
+<h2 class="sec">Opening Explanation</h2>
+<p>Logging exists to make the agent explain itself while it is running and failing. This is not a run-advancing pipeline stage. It is a cross-cutting concern: a side channel used by many real stages to leave clues about what just happened, what is about to happen, and why the agent stopped, retried, or continued. The system needs it because an agent loop has many branches that look silent from the outside: LLM calls fail, terminal sessions die, summaries trigger, subagents report progress, and safety limits warn before they bite. Without logs, those paths are hard to debug. In the handbook structure, this page explains the shared <code>self.logger</code> calls; for actual state-changing logic, look back to the neighboring real stages.</p>
+<h2 class="sec">Main Flow</h2>
+
+<ol><li><strong>Log before risky or important work.</strong> <p>Stages emit <code>self.logger...</code> messages right before actions that may branch. Think: before an LLM call, before a summarize path, or when setup notices something unusual. The job here is simple: leave a breadcrumb so a human can later say, “the agent was trying to do this.”</p></li><li><strong>Log on exception, then choose the branch.</strong> <p>In <code>_query_llm()</code> (ask the language model for the next response), exception handlers log what failed. The log does not fix the failure. It records it, then the real stage decides the outcome: <strong>log then retry</strong>, <strong>log then abort</strong>, or <strong>log then surface an error</strong>.</p></li><li><strong>Log before continue paths.</strong> <p>Some branches are not failures. A proactive summarize trigger logs that the agent is compressing context to stay within limits. Subagent progress markers log that a smaller helper agent is starting or reporting back. These are <strong>log then continue</strong> points.</p></li><li><strong>Log before abort or degraded operation.</strong> <p>If a tmux session (a terminal the agent can drive remotely) dies, a message is logged so the later stop or recovery path is visible. Likewise, construction may log a max-turns warning before the run ever reaches that limit. These are early warnings that explain later behavior.</p></li><li><strong>Produce no pipeline state.</strong> <p>The only output of logging is an external side effect: lines written to logs. That is exactly why this chapter exists separately. It helps readers not confuse “the agent changed state” with “the agent reported what state it was in.”</p></li></ol>
+<h2 class="sec"> State Flow</h2>
+<ul><li>writes: <code>无</code> — no listed state register is written by logging itself; log emission is an external side effect</li><li>reads: <code>无</code> — no listed state register is read by this concern itself, even though surrounding stages may read state and then log about it</li><li>clears: <code>无</code> — logging does not clear any listed state register</li><li>triggers downstream: <code>无</code> — logging does not own transitions; the surrounding real stage decides whether to retry, abort, or continue after emitting a log</li></ul>
+<h2 class="sec">Pipeline Hand-Off</h2>
+<p>Upstream real stages bring the current situation: setup warnings, LLM-call failures, summarize decisions, subagent progress, or terminal-session errors. Logging adds observability, not state; downstream stages consume the same pipeline state as before, while humans consume the log lines to understand why the run retried, continued, or stopped.</p><nav class="pn"><a class="pn-prev" href="crosscut-X2.html"><span>← Previous</span><strong>Output Length Limiting</strong></a><a class="pn-next" href="subsys-tmux-internal.html"><span>Next →</span><strong>Tmux internal helpers</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>app-server/tests/common/config.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">app-server/tests/common/config.rs</code>
+<span class="code-meta">108 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=k>use</b> codex_features::FEATURES;</i><i id="L2"><b class=k>use</b> codex_features::Feature;</i><i id="L3"><b class=k>use</b> std::collections::BTreeMap;</i><i id="L4"><b class=k>use</b> std::path::Path;</i><i id="L5"></i><i id="L6"><b class=k>pub</b> <b class=k>fn</b> write_mock_responses_config_toml(</i><i id="L7">    codex_home: &amp;Path,</i><i id="L8">    server_uri: &amp;str,</i><i id="L9">    feature_flags: &amp;BTreeMap&lt;Feature, bool&gt;,</i><i id="L10">    auto_compact_limit: i64,</i><i id="L11">    requires_openai_auth: Option&lt;bool&gt;,</i><i id="L12">    model_provider_id: &amp;str,</i><i id="L13">    compact_prompt: &amp;str,</i><i id="L14">) -&gt; std::io::Result&lt;()&gt; {</i><i id="L15">    <b class=c>// Phase 1: build the features block for config.toml.</b></i><i id="L16">    <b class=k>let</b> <b class=k>mut</b> features = BTreeMap::new();</i><i id="L17">    <b class=k>for</b> (feature, enabled) <b class=k>in</b> feature_flags {</i><i id="L18">        features.insert(*feature, *enabled);</i><i id="L19">    }</i><i id="L20">    <b class=k>let</b> feature_entries = features</i><i id="L21">        .into_iter()</i><i id="L22">        .map(|(feature, enabled)| {</i><i id="L23">            <b class=k>let</b> key = FEATURES</i><i id="L24">                .iter()</i><i id="L25">                .find(|spec| spec.id == feature)</i><i id="L26">                .map(|spec| spec.key)</i><i id="L27">                .expect(<b class=s>"feature should have a config key"</b>);</i><i id="L28">            <b class=m>format!</b>(<b class=s>"{key} = {enabled}"</b>)</i><i id="L29">        })</i><i id="L30">        .collect::&lt;Vec&lt;_&gt;&gt;()</i><i id="L31">        .join(<b class=s>"\n"</b>);</i><i id="L32">    <b class=c>// Phase 2: build provider-specific config bits.</b></i><i id="L33">    <b class=k>let</b> requires_line = <b class=k>match</b> requires_openai_auth {</i><i id="L34">        Some(<b class=k>true</b>) =&gt; <b class=s>"requires_openai_auth = true\n"</b>.to_string(),</i><i id="L35">        Some(<b class=k>false</b>) | None =&gt; String::new(),</i><i id="L36">    };</i><i id="L37">    <b class=k>let</b> provider_name = <b class=k>if</b> <b class=m>matches!</b>(requires_openai_auth, Some(<b class=k>true</b>)) {</i><i id="L38">        <b class=s>"OpenAI"</b></i><i id="L39">    } <b class=k>else</b> {</i><i id="L40">        <b class=s>"Mock provider for test"</b></i><i id="L41">    };</i><i id="L42">    <b class=k>let</b> provider_block = <b class=m>format!</b>(</i><i id="L43">        r#<b class=s>"</b></i><i id="L44">[model_providers.{model_provider_id}]</i><i id="L45">name = <b class=s>"{provider_name}"</b></i><i id="L46">base_url = <b class=s>"{server_uri}/v1"</b></i><i id="L47">wire_api = <b class=s>"responses"</b></i><i id="L48">request_max_retries = <b class=n>0</b></i><i id="L49">stream_max_retries = <b class=n>0</b></i><i id="L50">supports_websockets = <b class=k>false</b></i><i id="L51">{requires_line}</i><i id="L52"><b class=s>"#</b></i><i id="L53">    );</i><i id="L54">    <b class=k>let</b> openai_base_url_line = <b class=k>if</b> model_provider_id == <b class=s>"openai"</b> {</i><i id="L55">        <b class=m>format!</b>(<b class=s>"openai_base_url = \"{server_uri}/v1\"\n"</b>)</i><i id="L56">    } <b class=k>else</b> {</i><i id="L57">        String::new()</i><i id="L58">    };</i><i id="L59">    <b class=c>// Phase 3: write the final config file.</b></i><i id="L60">    <b class=k>let</b> config_toml = codex_home.join(<b class=s>"config.toml"</b>);</i><i id="L61">    std::fs::write(</i><i id="L62">        config_toml,</i><i id="L63">        <b class=m>format!</b>(</i><i id="L64">            r#<b class=s>"</b></i><i id="L65">model = <b class=s>"mock-model"</b></i><i id="L66">approval_policy = <b class=s>"never"</b></i><i id="L67">sandbox_mode = <b class=s>"read-only"</b></i><i id="L68">compact_prompt = <b class=s>"{compact_prompt}"</b></i><i id="L69">model_auto_compact_token_limit = {auto_compact_limit}</i><i id="L70"></i><i id="L71">model_provider = <b class=s>"{model_provider_id}"</b></i><i id="L72">{openai_base_url_line}</i><i id="L73"></i><i id="L74">[features]</i><i id="L75">{feature_entries}</i><i id="L76">{provider_block}</i><i id="L77"><b class=s>"#</b></i><i id="L78">        ),</i><i id="L79">    )</i><i id="L80">}</i><i id="L81"></i><i id="L82"><b class=k>pub</b> <b class=k>fn</b> write_mock_responses_config_toml_with_chatgpt_base_url(</i><i id="L83">    codex_home: &amp;Path,</i><i id="L84">    server_uri: &amp;str,</i><i id="L85">    chatgpt_base_url: &amp;str,</i><i id="L86">) -&gt; std::io::Result&lt;()&gt; {</i><i id="L87">    <b class=k>let</b> config_toml = codex_home.join(<b class=s>"config.toml"</b>);</i><i id="L88">    std::fs::write(</i><i id="L89">        config_toml,</i><i id="L90">        <b class=m>format!</b>(</i><i id="L91">            r#<b class=s>"</b></i><i id="L92">model = <b class=s>"mock-model"</b></i><i id="L93">approval_policy = <b class=s>"never"</b></i><i id="L94">sandbox_mode = <b class=s>"read-only"</b></i><i id="L95">chatgpt_base_url = <b class=s>"{chatgpt_base_url}"</b></i><i id="L96"></i><i id="L97">model_provider = <b class=s>"mock_provider"</b></i><i id="L98"></i><i id="L99">[model_providers.mock_provider]</i><i id="L100">name = <b class=s>"Mock provider for test"</b></i><i id="L101">base_url = <b class=s>"{server_uri}/v1"</b></i><i id="L102">wire_api = <b class=s>"responses"</b></i><i id="L103">request_max_retries = <b class=n>0</b></i><i id="L104">stream_max_retries = <b class=n>0</b></i><i id="L105"><b class=s>"#</b></i><i id="L106">        ),</i><i id="L107">    )</i><i id="L108">}</i></pre></div>
+</main>
+<script src="../../../../assets/app.js"></script>
+</body>
+</html>

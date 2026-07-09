@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core/src/shell.rs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../../../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../../../index.html"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Codex&nbsp;Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../../../index.html" class="topbar__link topbar__link--icon" id="back-btn"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5.5"/><path d="m11 5.5-6.5 6.5 6.5 6.5"/></svg><span>Back · 返回</span></a>
+<span class="topbar__link code-langtag">Rust</span>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<main class="codepage">
+<div class="code-head">
+<code class="fpath">core/src/shell.rs</code>
+<span class="code-meta">104 lines</span>
+</div>
+<div class="codebox"><pre id="codepre"><i id="L1"><b class=k>use</b> codex_exec_server::ShellInfo;</i><i id="L2"><b class=k>use</b> codex_shell_command::shell_detect::DetectedShell;</i><i id="L3"><b class=k>use</b> serde::Deserialize;</i><i id="L4"><b class=k>use</b> serde::Serialize;</i><i id="L5"><b class=k>use</b> std::path::PathBuf;</i><i id="L6"></i><i id="L7"><b class=k>pub</b> <b class=k>use</b> codex_shell_command::shell_detect::ShellType;</i><i id="L8"></i><i id="L9"><b class=m>#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]</b></i><i id="L10"><b class=k>pub</b> <b class=k>struct</b> Shell {</i><i id="L11">    <b class=k>pub</b>(<b class=k>crate</b>) shell_type: ShellType,</i><i id="L12">    <b class=k>pub</b>(<b class=k>crate</b>) shell_path: PathBuf,</i><i id="L13">}</i><i id="L14"></i><i id="L15"><b class=k>impl</b> Shell {</i><i id="L16">    <b class=k>pub</b> <b class=k>fn</b> name(&amp;<b class=k>self</b>) -&gt; &amp;<b class=m>'static</b> str {</i><i id="L17">        <b class=k>self</b>.shell_type.name()</i><i id="L18">    }</i><i id="L19"></i><i id="L20">    <b class=c>/// Takes a string of shell and returns the full list of command args to</b></i><i id="L21">    <b class=c>/// use with `exec()` to run the shell command.</b></i><i id="L22">    <b class=k>pub</b> <b class=k>fn</b> derive_exec_args(&amp;<b class=k>self</b>, command: &amp;str, use_login_shell: bool) -&gt; Vec&lt;String&gt; {</i><i id="L23">        <b class=k>match</b> <b class=k>self</b>.shell_type {</i><i id="L24">            ShellType::Zsh | ShellType::Bash | ShellType::Sh =&gt; {</i><i id="L25">                <b class=k>let</b> arg = <b class=k>if</b> use_login_shell { <b class=s>"-lc"</b> } <b class=k>else</b> { <b class=s>"-c"</b> };</i><i id="L26">                <b class=m>vec!</b>[</i><i id="L27">                    <b class=k>self</b>.shell_path.to_string_lossy().to_string(),</i><i id="L28">                    arg.to_string(),</i><i id="L29">                    command.to_string(),</i><i id="L30">                ]</i><i id="L31">            }</i><i id="L32">            ShellType::PowerShell =&gt; {</i><i id="L33">                <b class=k>let</b> <b class=k>mut</b> args = <b class=m>vec!</b>[<b class=k>self</b>.shell_path.to_string_lossy().to_string()];</i><i id="L34">                <b class=k>if</b> !use_login_shell {</i><i id="L35">                    args.push(<b class=s>"-NoProfile"</b>.to_string());</i><i id="L36">                }</i><i id="L37"></i><i id="L38">                args.push(<b class=s>"-Command"</b>.to_string());</i><i id="L39">                args.push(command.to_string());</i><i id="L40">                args</i><i id="L41">            }</i><i id="L42">            ShellType::Cmd =&gt; {</i><i id="L43">                <b class=k>let</b> <b class=k>mut</b> args = <b class=m>vec!</b>[<b class=k>self</b>.shell_path.to_string_lossy().to_string()];</i><i id="L44">                args.push(<b class=s>"/c"</b>.to_string());</i><i id="L45">                args.push(command.to_string());</i><i id="L46">                args</i><i id="L47">            }</i><i id="L48">        }</i><i id="L49">    }</i><i id="L50">}</i><i id="L51"></i><i id="L52"><b class=k>impl</b> From&lt;DetectedShell&gt; <b class=k>for</b> Shell {</i><i id="L53">    <b class=k>fn</b> from(detected: DetectedShell) -&gt; <b class=k>Self</b> {</i><i id="L54">        <b class=k>Self</b> {</i><i id="L55">            shell_type: detected.shell_type,</i><i id="L56">            shell_path: detected.shell_path,</i><i id="L57">        }</i><i id="L58">    }</i><i id="L59">}</i><i id="L60"></i><i id="L61"><b class=k>impl</b> Shell {</i><i id="L62">    <b class=k>pub</b>(<b class=k>crate</b>) <b class=k>fn</b> from_environment_shell_info(shell_info: ShellInfo) -&gt; anyhow::Result&lt;<b class=k>Self</b>&gt; {</i><i id="L63">        <b class=k>let</b> shell_type = <b class=k>match</b> shell_info.name.as_str() {</i><i id="L64">            <b class=s>"zsh"</b> =&gt; ShellType::Zsh,</i><i id="L65">            <b class=s>"bash"</b> =&gt; ShellType::Bash,</i><i id="L66">            <b class=s>"powershell"</b> =&gt; ShellType::PowerShell,</i><i id="L67">            <b class=s>"sh"</b> =&gt; ShellType::Sh,</i><i id="L68">            <b class=s>"cmd"</b> =&gt; ShellType::Cmd,</i><i id="L69">            name =&gt; anyhow::<b class=m>bail!</b>(<b class=s>"unknown environment shell `{name}`"</b>),</i><i id="L70">        };</i><i id="L71"></i><i id="L72">        Ok(<b class=k>Self</b> {</i><i id="L73">            shell_type,</i><i id="L74">            shell_path: PathBuf::from(shell_info.path),</i><i id="L75">        })</i><i id="L76">    }</i><i id="L77">}</i><i id="L78"></i><i id="L79"><b class=m>#[cfg(all(test, unix))]</b></i><i id="L80"><b class=k>fn</b> ultimate_fallback_shell() -&gt; Shell {</i><i id="L81">    codex_shell_command::shell_detect::ultimate_fallback_shell().into()</i><i id="L82">}</i><i id="L83"></i><i id="L84"><b class=k>pub</b> <b class=k>fn</b> get_shell_by_model_provided_path(shell_path: &amp;PathBuf) -&gt; Shell {</i><i id="L85">    codex_shell_command::shell_detect::get_shell_by_model_provided_path(shell_path).into()</i><i id="L86">}</i><i id="L87"></i><i id="L88"><b class=k>pub</b> <b class=k>fn</b> get_shell(shell_type: ShellType, path: Option&lt;&amp;PathBuf&gt;) -&gt; Option&lt;Shell&gt; {</i><i id="L89">    codex_shell_command::shell_detect::get_shell(shell_type, path).map(Into::into)</i><i id="L90">}</i><i id="L91"></i><i id="L92"><b class=k>pub</b> <b class=k>fn</b> default_user_shell() -&gt; Shell {</i><i id="L93">    codex_shell_command::shell_detect::default_user_shell().into()</i><i id="L94">}</i><i id="L95"></i><i id="L96"><b class=m>#[cfg(all(test, target_os = "macos"))]</b></i><i id="L97"><b class=k>fn</b> default_user_shell_from_path(user_shell_path: Option&lt;PathBuf&gt;) -&gt; Shell {</i><i id="L98">    codex_shell_command::shell_detect::default_user_shell_from_path(user_shell_path).into()</i><i id="L99">}</i><i id="L100"></i><i id="L101"><b class=m>#[cfg(test)]</b></i><i id="L102"><b class=m>#[cfg(unix)]</b></i><i id="L103"><b class=m>#[path = "shell_tests.rs"]</b></i><i id="L104"><b class=k>mod</b> tests;</i></pre></div>
+</main>
+<script src="../../../assets/app.js"></script>
+</body>
+</html>

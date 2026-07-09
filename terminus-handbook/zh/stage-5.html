@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-5 · 运行收尾</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=zh"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 手册</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=zh" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>返回主页</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>状态流寄存器</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>配置固化</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>环境搭建</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>运行起点</a></div><details class="s-node"><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>迭代主循环</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>循环入口门控</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>主动摘要探测</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM 调用</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>响应解析</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>待交接提示 → 用户步骤(或切分)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>错误分支</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>命令执行 → 观察 → 轨迹步骤</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>完成门控与循环控制</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>解析器内部辅助</a></div></div></details><div class="s-leaf"><a class="s-link cur" href="stage-5.html"><span class="s-num">5</span>运行收尾</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>录制后处理(外部)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>上下文摘要</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token 与成本核算</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>输出长度限制</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>日志</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux 内部辅助</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">索引</a></nav><div class="stage-head"><h1>运行收尾</h1><div class="meta"><span class="chip mono">stage-5</span><span class="chip">Run Teardown</span><span class="chip">4 个函数</span></div></div><p>Run Teardown 这个 Stage 在解决“收尾和对账”问题：不管这次运行是正常结束、提前中断，还是报错退出，都要把本轮 Agent 真正做过的事完整落盘，并把分散在各处的统计数汇总到 <code>context</code>。它放在主循环之后的 <code>finally</code> 里，就是为了保证前面怎么结束都不影响最后这一步。</p>
+<ol><li>先把本轮的“总结果”补齐。 <p>运行过程中，主 Agent 和 subagent（被主 Agent 调用的小 Agent）会分别记自己的 rollout 和 token 统计。这个 Stage 会把两边的数据合到一起，写回 <code>context.rollout_details</code>、<code>context.n_input_tokens</code>、<code>context.n_output_tokens</code>、<code>context.n_cache_tokens</code> 和 <code>context.cost_usd</code>。 这样做的原因很直接：前面为了让主流程统计更干净，subagent 的账是单独记的；结束时如果不统一折回 trial 级别（整次运行级别）的总账，外面看到的成本和 token 就是不完整的。</p></li><li>再把“这次运行到底经历了什么”整理成元数据。 <p><code>Terminus2.run()</code>（整个 Agent 的主入口）在这里把 episode 次数、每次 LLM 请求耗时、summarization 次数塞进 <code>context.metadata</code>。 这一步的意义不是让主循环继续跑，而是给外部记录、分析、评估用。比如你之后想看这轮为什么慢、是否频繁触发总结，都要靠这里留下的汇总信息。</p></li><li>按需带上完整消息。 <p>如果开启了 <code>_store_all_messages</code>，这里还会把 <code>all_messages</code> 放进 metadata。 这属于“调试增强项”：不是每次都必须要，但一旦你想复盘模型到底看了什么、说了什么，这份完整消息会很有用。</p></li><li>最后强制再落一次轨迹。 <p><code>Terminus2._dump_trajectory()</code>（把当前轨迹写到磁盘）会在这里再调用一次，确保磁盘上的 trajectory（本次试验的步骤记录）反映的是“最终状态”。 为什么前面明明也可能写过，还要再写一次？因为最后结束的原因、最后补齐的统计、最后一个状态变化，可能都发生在临退出前。如果没有这次兜底写盘，磁盘里的记录就可能停在“差最后一步”的状态。</p></li><li>底层如果终端会话要停，也是在这个收尾语境里理解。 <p><code>TmuxSession.stop()</code>（关闭 tmux，会话型终端控制器）代表运行结束后终端资源不再继续占着。 这不是这个 Stage 的主角，但它说明一个设计点：Teardown 不只是“记账”，也是“把现场收干净”。</p></li></ol>
+<ul><li>写: <a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — 通过 <code>_dump_trajectory()</code> 在结束时再次写盘，保证最后一步状态也进入磁盘记录</li><li>读: <a class="reg" href="registers.html#reg-subagent-metrics"><code>reg-subagent-metrics</code></a> — 在 run 的 finally 里读取并并入 trial 总 token / cost，因为 subagent 的账前面是分开记的</li><li>读: <a class="reg" href="registers.html#reg-n-episodes"><code>reg-n-episodes</code></a> — 结束时读出并写进 <code>context.metadata</code>，表示这轮一共跑了多少个 episode</li><li>读: <a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — 结束时读出并写进 <code>context.metadata</code>，说明中途触发过多少次总结</li><li>读: <a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — 结束时读出并写进 <code>context.metadata</code>，给性能分析和复盘使用</li><li>触发下游: <code>stage-6 Recording Post-process (External)</code> — 本 Stage 把最终 <code>context</code> 和最终轨迹落稳后，外部录制/后处理阶段才能基于完整结果继续</li></ul>
+<p>上游主循环已经把步骤、调用耗时、总结次数、subagent 账本都分别积累好了；这个 Stage 不再做决策，只负责把这些零散结果汇总成“最终版本”。下游的 Recording Post-process 会直接消费这里产出的完整 <code>context</code> 和最终 trajectory，用来做外部保存、分析或展示。</p><div class="files-bar"><h2 class="sec">函数细节<span class="pill">4</span></h2><span class="spacer"></span><button class="tool" data-x="expand">全部展开</button><button class="tool" data-x="collapse">全部折叠</button></div><details class="file" id="fn-terminus2_run"><summary><span class="chev"></span><code class="fpath">Terminus2.run</code><a class="fn-range" href="../code/terminus_2.py.html#L1637-L1665" title="terminus_2.py:1637-1665">terminus_2.py:1637–1665 ↗</a></summary><div class="file-body"><p class="fn-sub">运行收尾的上下文汇总与落盘段</p>
+<blockquote><p><strong>stage 上下文</strong>: 该片段位于 <code>Terminus2.run</code> 的 <a href="stage-5.html">stage-5</a>，对外部 <code>context</code> 进行集中回填，并在末尾调用 <code>_dump_trajectory()</code>。代码可见的职责是汇总主 chat 与 subagent 的 rollout/token/cost 信息，重建 <code>context.metadata</code>，并按条件附带完整消息列表。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>本段先把 <code>self._chat.rollout_details</code> 与 <code>self._subagent_rollout_details</code> 拼接后写入 <code>context.rollout_details</code>。随后将主 chat 的 token/cost 统计与 <code>self._subagent_metrics</code> 中的对应统计求和，写回 <code>context.n_input_tokens</code>、<code>context.n_output_tokens</code>、<code>context.n_cache_tokens</code> 与 <code>context.cost_usd</code>，其中总 cost 不大于 0 时显式写成 <code>None</code>。接着以新的字典覆盖 <code>context.metadata</code>，写入 <code>n_episodes</code>、<code>api_request_times_msec</code>、<code>summarization_count</code>，并在 <code>self._store_all_messages</code> 为真时额外放入 <code>all_messages</code>。最后调用 <code>_dump_trajectory()</code> 触发轨迹导出。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, context) -&gt; None</code></p>
+<ul><li>参数: <code>self</code>: <code>Terminus2</code> — 提供主 chat、subagent 汇总指标、运行计数与轨迹导出能力; <code>context</code>: <code>具有可写属性 rollout_details、n_input_tokens、n_output_tokens、n_cache_tokens、cost_usd、metadata 的对象</code> — 接收本次运行的对外汇总结果</li><li>读状态: <code>self._chat.rollout_details</code>, <code>self._subagent_rollout_details</code>, <code>self._chat.total_input_tokens</code>, <code>self._subagent_metrics.total_prompt_tokens</code>, <code>self._chat.total_output_tokens</code>, <code>self._subagent_metrics.total_completion_tokens</code>, <code>self._chat.total_cache_tokens</code>, <code>self._subagent_metrics.total_cached_tokens</code>, <code>self._chat.total_cost</code>, <code>self._subagent_metrics.total_cost_usd</code>, <code>self._n_episodes</code>, <code>self._api_request_times</code>, <code>self._summarization_count</code>, <code>self._store_all_messages</code>, <code>self._chat.messages</code></li><li>返回: 此代码片段中未出现 <code>return</code> 语句。</li><li>副作用: 覆盖写入 <code>context.rollout_details</code>; 覆盖写入 <code>context.n_input_tokens</code>; 覆盖写入 <code>context.n_output_tokens</code>; 覆盖写入 <code>context.n_cache_tokens</code>; 覆盖写入 <code>context.cost_usd</code>; 以新字典覆盖 <code>context.metadata</code>; 在条件满足时写入 <code>context.metadata["all_messages"]</code>; 调用 <code>self._dump_trajectory()</code> 导出轨迹</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>将 <code>self._chat.rollout_details</code> 与 <code>self._subagent_rollout_details</code> 连接后赋给 <code>context.rollout_details</code>，把主对话与 subagent 的 rollout 明细汇总到同一出口字段。</li><li>分别把主 chat 的输入、输出、缓存 token 总数与 <code>self._subagent_metrics</code> 中对应总数相加，写入 <code>context.n_input_tokens</code>、<code>context.n_output_tokens</code>、<code>context.n_cache_tokens</code>。</li><li>计算 <code>total_cost = self._chat.total_cost + self._subagent_metrics.total_cost_usd</code>，若结果大于 0 则写入 <code>context.cost_usd</code>，否则写入 <code>None</code>。</li><li>构造一个新的 <code>context.metadata</code> 字典，包含 <code>"n_episodes": self._n_episodes</code>、<code>"api_request_times_msec": self._api_request_times</code>、<code>"summarization_count": self._summarization_count</code>。</li><li>若 <code>self._store_all_messages</code> 为真，则把 <code>self._chat.messages</code> 直接放入 <code>context.metadata["all_messages"]</code>。</li><li>调用 <code>self._dump_trajectory()</code>，执行轨迹导出。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>            context.rollout_details = (
+                self._chat.rollout_details + self._subagent_rollout_details
+            )
+
+            # Include subagent metrics in context totals
+            context.n_input_tokens = (
+                self._chat.total_input_tokens
+                + self._subagent_metrics.total_prompt_tokens
+            )
+            context.n_output_tokens = (
+                self._chat.total_output_tokens
+                + self._subagent_metrics.total_completion_tokens
+            )
+            context.n_cache_tokens = (
+                self._chat.total_cache_tokens
+                + self._subagent_metrics.total_cached_tokens
+            )
+            total_cost = self._chat.total_cost + self._subagent_metrics.total_cost_usd
+            context.cost_usd = total_cost if total_cost &gt; 0 else None
+            context.metadata = {
+                "n_episodes": self._n_episodes,
+                "api_request_times_msec": self._api_request_times,
+                "summarization_count": self._summarization_count,
+            }
+            if self._store_all_messages:
+                context.metadata["all_messages"] = self._chat.messages
+
+            # Dump trajectory to JSON
+            self._dump_trajectory()</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>cost 字段采用 <code>total_cost if total_cost &gt; 0 else None</code>，把零或负值统一折叠为缺省态，而不是保留 <code>0</code> 或负数；这是代码中显式存在的表示决策。</li><li><code>context.metadata</code> 不是增量更新，而是直接用一个新字典整体替换；这意味着先前若已有其他 metadata 键，按该片段可见行为会被丢弃，只保留这里列出的键及条件性的 <code>all_messages</code>。</li><li><code>api_request_times_msec</code> 直接引用 <code>self._api_request_times</code>，条件分支中的 <code>all_messages</code> 直接引用 <code>self._chat.messages</code>；片段中未显示复制操作，因此后续若底层对象继续变动，<code>context.metadata</code> 中看到的也可能随之变化。</li><li>完整消息历史仅在 <code>self._store_all_messages</code> 为真时附加，默认 metadata 保持为较小的固定集合，避免无条件暴露或携带整段消息列表。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2.run</li><li><strong>核心被调用</strong>: self._dump_trajectory</li><li><strong>配置/状态来源</strong>: self._chat; self._subagent_rollout_details; self._subagent_metrics; self._n_episodes; self._api_request_times; self._summarization_count; self._store_all_messages</li><li><strong>结果去向</strong>: context.rollout_details; context.n_input_tokens; context.n_output_tokens; context.n_cache_tokens; context.cost_usd; context.metadata; 轨迹导出目标（经由 <code>_dump_trajectory()</code>）</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-n-episodes"><code>reg-n-episodes</code></a> — 读取 <code>_n_episodes</code> 写入 metadata</li><li><a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — 读取汇总次数写入 metadata</li><li><a class="reg" href="registers.html#reg-subagent-metrics"><code>reg-subagent-metrics</code></a> — 读取 subagent token/cost 汇总</li><li><a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — 直接挂入 metadata 引用</li><li><a class="reg" href="registers.html#reg-chat-messages"><code>reg-chat-messages</code></a> — 仅在 <code>_store_all_messages</code> 时读取</li><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — 经 <code>_dump_trajectory()</code> 导出累计轨迹</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_dump_trajectory"><summary><span class="chev"></span><code class="fpath">Terminus2._dump_trajectory</code><a class="fn-range" href="../code/terminus_2.py.html#L1979-L1981" title="terminus_2.py:1979-1981">terminus_2.py:1979–1981 ↗</a></summary><div class="file-body"><p class="fn-sub">轨迹导出的薄封装方法</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数本身只有一层转调：把实例状态中的 <code>self._summarization_count</code> 取出后，传给 <code>_dump_trajectory_with_continuation_index(...)</code>。相较于同 stage 中负责汇总 metadata 与 token 统计的 <code>run()</code> 收尾逻辑，这里不直接组装数据，只负责发起一次带固定参数来源的委托调用。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>此函数不接收除 <code>self</code> 外的任何输入，也不直接写入实例状态。它读取 <code>self._summarization_count</code>，并将该值作为唯一实参传给 <code>self._dump_trajectory_with_continuation_index(...)</code>。函数返回 <code>None</code>；若存在 JSON 生成或落盘副作用，也只会发生在被调函数内部而非这里。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self) -&gt; None</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — 提供 <code>_summarization_count</code> 状态与 <code>_dump_trajectory_with_continuation_index</code> 绑定方法的实例</li><li>读状态: <code>self._summarization_count</code>, <code>self._dump_trajectory_with_continuation_index</code></li><li>返回: 返回 None；直接可见的产出仅是一次对 <code>_dump_trajectory_with_continuation_index(...)</code> 的调用</li><li>副作用: 间接触发 <code>self._dump_trajectory_with_continuation_index(self._summarization_count)</code> 的执行</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>读取实例属性 <code>self._summarization_count</code> 作为本次调用的唯一参数来源。</li><li>调用 <code>self._dump_trajectory_with_continuation_index(self._summarization_count)</code>，将实际处理委托给下层 helper。</li><li>函数体结束后隐式返回 <code>None</code>。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _dump_trajectory(self) -&gt; None:
+        """Dump trajectory data to JSON file following ATIF format."""
+        self._dump_trajectory_with_continuation_index(self._summarization_count)</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>该方法将实参来源硬编码为实例内的 <code>self._summarization_count</code>，而不是把 continuation index 暴露为调用参数；这是源码中唯一可见的封装取舍。</li><li>函数体没有分支、循环、异常处理或额外状态改写；可见设计是保持为单纯转调包装层，把具体工作留给 <code>_dump_trajectory_with_continuation_index(...)</code>。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: 未在给定源码片段中展示；外部若需按当前 <code>self._summarization_count</code> 发起轨迹导出，可调用本方法</li><li><strong>核心被调用</strong>: Terminus2._dump_trajectory_with_continuation_index</li><li><strong>配置/状态来源</strong>: self._summarization_count</li><li><strong>结果去向</strong>: _dump_trajectory_with_continuation_index(...) 的形参位置; 本函数的直接返回值为 None</li><li><strong>同类 sibling</strong>: Terminus2.run：兄弟收尾逻辑先汇总 <code>context</code> 中的 rollout、token 与 metadata，再调用轨迹导出；本函数自身只承担转调，不做这些汇总</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — 读取当前 <code>_summarization_count</code> 作为转调实参</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_dump_trajectory_with_continuation_index"><summary><span class="chev"></span><code class="fpath">Terminus2._dump_trajectory_with_continuation_index</code><a class="fn-range" href="../code/terminus_2.py.html#L1911-L1977" title="terminus_2.py:1911-1977">terminus_2.py:1911–1977 ↗</a></summary><div class="file-body"><p class="fn-sub">轨迹 JSON 落盘与续段元数据组装点</p>
+<blockquote><p><strong>stage 上下文</strong>: 该函数位于 run 收尾阶段所依赖的轨迹导出链路中，负责把当前内存中的 trajectory 组装成可落盘 JSON。与同 stage 的兄弟函数 <code>_dump_trajectory</code> 相比，后者只转发一个 continuation index；本函数才实际读取 <code>self._context</code>、拼装 <code>Trajectory</code>/<code>Agent</code>/<code>FinalMetrics</code>，并决定输出文件名。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>函数接收 <code>continuation_index</code>，读取 <code>self._context</code>、<code>self._trajectory_steps</code>、<code>self._linear_history</code>、<code>self._summarization_count</code>、agent/model 配置与 <code>self.logs_dir</code>，构造一个 <code>Trajectory</code> 对象并序列化到磁盘。若 <code>self._context</code> 不存在，则仅记录 warning 并直接返回。其真正产出不是返回值，而是写出 <code>trajectory.json</code> 或在 <code>self._linear_history</code> 为真且 <code>continuation_index &gt; 0</code> 时写出 <code>trajectory.cont-&lt;n&gt;.json</code>，同时可能在 JSON 中写入 <code>continuation_index</code> 与 <code>continued_trajectory_ref</code>。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self, continuation_index: int) -&gt; None</code></p>
+<ul><li>参数: <code>continuation_index</code>: <code>int</code> — 当前轨迹段的续写编号；参与 agent.extra 与输出文件名选择，并与 <code>self._summarization_count</code> 一起决定是否生成 <code>continued_trajectory_ref</code></li><li>读状态: <code>self._context</code>, <code>self._context.n_input_tokens</code>, <code>self._context.n_output_tokens</code>, <code>self._context.n_cache_tokens</code>, <code>self._context.cost_usd</code>, <code>self._parser_name</code>, <code>self._temperature</code>, <code>self._llm_kwargs</code>, <code>self._linear_history</code>, <code>self._summarization_count</code>, <code>self._session_id</code>, <code>self._trajectory_steps</code>, <code>self._model_name</code>, <code>self.logs_dir</code>, <code>self.logger</code>, <code>self.name()</code>, <code>self.version()</code></li><li>返回: 返回 <code>None</code>；真正结果是向 <code>self.logs_dir</code> 下写入轨迹 JSON 文件，或在缺少 <code>self._context</code> / 写文件异常时仅记录日志。</li><li>副作用: 当 <code>self._context</code> 为空时调用 <code>self.logger.warning(...)</code>; 向 <code>self.logs_dir / "trajectory.json"</code> 写文件，或在 <code>self._linear_history</code> 为真且 <code>continuation_index &gt; 0</code> 时向 <code>self.logs_dir / f"trajectory.cont-{continuation_index}.json"</code> 写文件; 成功写入后调用 <code>self.logger.debug(...)</code>; 写入失败时调用 <code>self.logger.error(...)</code></li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先检查 <code>self._context</code>；若其为假值，则记录 <code>No context available, skipping trajectory dump</code> 并直接返回，不再尝试构造或写入任何轨迹文件。</li><li>基于 <code>self._context.n_input_tokens</code>、<code>self._context.n_output_tokens</code>、<code>self._context.n_cache_tokens or 0</code>、<code>self._context.cost_usd if self._context.cost_usd else None</code> 组装 <code>FinalMetrics</code>。</li><li>构造 <code>agent_extra</code>：固定写入 <code>parser=self._parser_name</code>，在 <code>self._temperature is not None</code> 时补入 <code>temperature</code>，在 <code>self._llm_kwargs</code> 为真时补入 <code>llm_kwargs</code>，并且仅当 <code>self._linear_history</code> 为真且 <code>continuation_index &gt; 0</code> 时写入 <code>continuation_index</code>。</li><li>计算是否生成续段引用：先令 <code>continued_trajectory_ref = None</code>，随后仅当 <code>self._linear_history</code> 为真且 <code>continuation_index &lt; self._summarization_count</code> 时，将其设为 <code>trajectory.cont-&lt;continuation_index + 1&gt;.json</code>。</li><li>以 <code>self._session_id</code>、<code>self.name()</code>、<code>self.version() or "unknown"</code>、<code>self._model_name</code>、上一步生成的 <code>agent_extra</code>、<code>self._trajectory_steps</code>、<code>final_metrics</code> 与 <code>continued_trajectory_ref</code> 构造 <code>Trajectory</code>。</li><li>根据文件名规则选择输出路径：若 <code>self._linear_history</code> 为真且 <code>continuation_index &gt; 0</code>，使用 <code>trajectory.cont-&lt;n&gt;.json</code>；否则一律使用 <code>trajectory.json</code>。随后在 <code>try</code> 中调用 <code>format_trajectory_json(trajectory.to_json_dict())</code> 生成字符串并写入文件；成功时记 debug，异常时捕获并记 error。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>    def _dump_trajectory_with_continuation_index(self, continuation_index: int) -&gt; None:
+        """Dump trajectory data to JSON file with specified continuation index.
+
+        Args:
+            continuation_index: The continuation index to use for filename and metadata.
+                               For the initial trajectory, use 0.
+                               For the first continuation, use 1, etc.
+        """
+        if not self._context:
+            self.logger.warning("No context available, skipping trajectory dump")
+            return
+
+        # Construct the trajectory using Pydantic models for validation
+        final_metrics = FinalMetrics(
+            total_prompt_tokens=self._context.n_input_tokens,
+            total_completion_tokens=self._context.n_output_tokens,
+            total_cached_tokens=self._context.n_cache_tokens or 0,
+            total_cost_usd=self._context.cost_usd if self._context.cost_usd else None,
+        )
+
+        agent_extra: dict[str, Any] = {
+            "parser": self._parser_name,
+        }
+        if self._temperature is not None:
+            agent_extra["temperature"] = self._temperature
+        if self._llm_kwargs:
+            agent_extra["llm_kwargs"] = self._llm_kwargs
+        if self._linear_history and continuation_index &gt; 0:
+            agent_extra["continuation_index"] = continuation_index
+
+        # Determine if this trajectory will be continued
+        # In linear_history mode, when saving during summarization (i.e., continuation_index &lt; _summarization_count),
+        # this trajectory will have a continuation
+        continued_trajectory_ref = None
+        if self._linear_history and continuation_index &lt; self._summarization_count:
+            # This trajectory segment will be continued in the next file
+            next_continuation_index = continuation_index + 1
+            continued_trajectory_ref = f"trajectory.cont-{next_continuation_index}.json"
+
+        trajectory = Trajectory(
+            session_id=self._session_id,
+            agent=Agent(
+                name=self.name(),
+                version=self.version() or "unknown",
+                model_name=self._model_name,
+                extra=agent_extra,
+            ),
+            steps=self._trajectory_steps,
+            final_metrics=final_metrics,
+            continued_trajectory_ref=continued_trajectory_ref,
+        )
+
+        # Determine trajectory filename based on continuation index
+        if self._linear_history and continuation_index &gt; 0:
+            trajectory_path = (
+                self.logs_dir / f"trajectory.cont-{continuation_index}.json"
+            )
+        else:
+            trajectory_path = self.logs_dir / "trajectory.json"
+
+        try:
+            with open(trajectory_path, "w") as f:
+                json_str = format_trajectory_json(trajectory.to_json_dict())
+                f.write(json_str)
+            self.logger.debug(f"Trajectory dumped to {trajectory_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to dump trajectory: {e}")</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>函数把 <code>self._context</code> 的存在性作为整个导出的前置条件；若缺失则仅告警并返回，而不是抛异常中断调用方，这一容错分支在开头的显式检查中直接体现。</li><li><code>FinalMetrics.total_cached_tokens</code> 对 <code>self._context.n_cache_tokens</code> 采用 <code>or 0</code>，而 <code>FinalMetrics.total_cost_usd</code> 对 <code>self._context.cost_usd</code> 采用“假值即 <code>None</code>”的写法，因此缓存 token 缺省会落成数值 0，而 cost 的假值会在 JSON 模型里表现为 <code>None</code>。</li><li>线性历史相关元数据被拆成两层条件：<code>agent_extra["continuation_index"]</code> 与续段文件名都要求 <code>self._linear_history and continuation_index &gt; 0</code>，但 <code>continued_trajectory_ref</code> 还额外要求 <code>continuation_index &lt; self._summarization_count</code>；也就是说，是否写成 continuation 文件与是否声明“后面还有下一段”是两个独立判定。</li><li>文件写入被包在宽泛的 <code>try/except Exception</code> 中；异常不会向外传播，调用方只能通过 error 日志得知导出失败。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: Terminus2._dump_trajectory（已知兄弟源码显示其将一个 continuation index 转发到本函数）</li><li><strong>核心被调用</strong>: FinalMetrics(...); Agent(...); Trajectory(...); trajectory.to_json_dict(); format_trajectory_json(...); open(...); self.logger.warning(...); self.logger.debug(...); self.logger.error(...); self.name(); self.version()</li><li><strong>配置/状态来源</strong>: self._context.n_input_tokens; self._context.n_output_tokens; self._context.n_cache_tokens; self._context.cost_usd; self._parser_name; self._temperature; self._llm_kwargs; self._linear_history; self._summarization_count; self._session_id; self._trajectory_steps; self._model_name; self.logs_dir</li><li><strong>结果去向</strong>: Trajectory.final_metrics; Trajectory.agent.extra; Trajectory.continued_trajectory_ref; self.logs_dir / "trajectory.json"; self.logs_dir / f"trajectory.cont-{continuation_index}.json"; 日志输出（warning/debug/error）</li><li><strong>同类 sibling</strong>: Terminus2._dump_trajectory：兄弟函数只负责把 continuation index 传入本函数，本函数才完成实际组装与落盘</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">寄存器交互</span><ul><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — 读取当前步骤序列写入 Trajectory.steps</li><li><a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — 比较 continuation_index 以决定是否写续段引用</li></ul></div>
+</div></details><details class="file" id="fn-tmuxsession_stop"><summary><span class="chev"></span><code class="fpath">TmuxSession.stop</code><a class="fn-range" href="../code/tmux_session.py.html#L473-L493" title="tmux_session.py:473-493">tmux_session.py:473–493 ↗</a></summary><div class="file-body"><p class="fn-sub">会话收尾中的录屏停止与回收段</p>
+<blockquote><p><strong>stage 上下文</strong>: 该段属于 <a href="stage-5.html">stage-5</a> 的 teardown 收尾路径，在运行循环无论以何种方式结束后执行。它不处理 trial 级统计汇总，而是聚焦 <code>TmuxSession.stop</code> 内部的录屏关闭与 cast 文件回收。相较同 stage 中 <code>Terminus2.run</code> 负责把指标写回 <code>context</code>、<code>_dump_trajectory</code> 负责最终轨迹落盘，这里负责让 asciinema 录制会话有机会正常结束，并把远端产物取回本地。</p></blockquote>
+<p><strong>这段代码在干什么</strong></p>
+<p>本段仅在 <code>self._remote_asciinema_recording_path</code> 存在时启动录屏收尾流程：先记录一条 debug 日志，再向会话发送 <code>Ctrl-D</code> 以结束录制，并短暂等待写盘完成。若同时配置了 <code>self._local_asciinema_recording_path</code>，则确保本地目标目录存在，并调用 <code>self.environment.download_file(...)</code> 将远端 cast 文件下载到本地。函数本身不返回业务值，实际产出是远端录制停止以及本地录屏文件可用。</p>
+<p><strong>接口 · 参数 / IO</strong></p>
+<p><code>(self) -&gt; None</code></p>
+<ul><li>参数: <code>self</code>: <code>?</code> — TmuxSession 实例；提供录屏路径、发送按键能力、日志器与环境对象</li><li>读状态: <code>self._remote_asciinema_recording_path</code>, <code>self._logger</code>, <code>self._local_asciinema_recording_path</code>, <code>self.environment</code></li><li>返回: 返回 None；真正产出是结束远端 asciinema 录制，并在配置了本地路径时把录制文件下载到本地。</li><li>副作用: 调用 <code>self._logger.debug(...)</code> 写出停止录制日志; 调用 <code>self.send_keys(keys=['C-d'], min_timeout_sec=0.1)</code> 向会话发送结束录制按键; 等待约 0.5 秒以给远端录制文件写盘留出时间; 在本地创建 <code>self._local_asciinema_recording_path.parent</code> 目录; 调用 <code>self.environment.download_file(...)</code> 从远端下载录制文件到本地</li></ul>
+<p><strong>执行流</strong></p>
+<ol><li>先检查 <code>self._remote_asciinema_recording_path</code>；只有存在远端录制目标时，才进入后续关闭与回收流程，否则该段无动作结束。</li><li>进入流程后，先通过 <code>self._logger.debug("Stopping recording.")</code> 记录调试信息，然后调用 <code>await self.send_keys(keys=['C-d'], min_timeout_sec=0.1)</code> 向录制所在会话发送 <code>Ctrl-D</code>，请求结束录制。</li><li>随后局部导入 <code>asyncio</code> 并执行 <code>await asyncio.sleep(0.5)</code>，显式留出一个很短的等待窗口，让远端录制文件完成最终写入。</li><li>如果 <code>self._local_asciinema_recording_path</code> 也存在，则先对其父目录执行 <code>mkdir(parents=True, exist_ok=True)</code>，确保本地落点可写。</li><li>在本地路径存在的前提下，调用 <code>await self.environment.download_file(source_path=str(self._remote_asciinema_recording_path), target_path=self._local_asciinema_recording_path)</code>，把远端录制文件下载到本地，以便后续使用本地 cast 文件。</li></ol>
+<p><strong>源码</strong></p>
+<pre><code>        if self._remote_asciinema_recording_path:
+            self._logger.debug("Stopping recording.")
+            await self.send_keys(
+                keys=["C-d"],
+                min_timeout_sec=0.1,
+            )
+
+            # Wait a moment for the recording to finish writing
+            import asyncio
+
+            await asyncio.sleep(0.5)
+
+            if self._local_asciinema_recording_path:
+                self._local_asciinema_recording_path.parent.mkdir(
+                    parents=True, exist_ok=True
+                )
+                # Ensure recording exists locally before merging markers
+                await self.environment.download_file(
+                    source_path=str(self._remote_asciinema_recording_path),
+                    target_path=self._local_asciinema_recording_path,
+                )</code></pre>
+<p><strong>Non-obvious 设计决策</strong></p>
+<ul><li>该段以 <code>self._remote_asciinema_recording_path</code> 作为总开关，意味着只有确实启用了远端录制时才尝试停止与下载，避免对未录制的会话做无意义的终止动作。</li><li>结束录制后没有立即下载，而是固定等待 <code>0.5</code> 秒；这是对异步写盘时序的显式容忍，避免在录制进程刚收到 <code>Ctrl-D</code> 时就读取到尚未完全落盘的文件。</li><li>本地回收被设计成可选：<code>self._local_asciinema_recording_path</code> 不存在时不会报错也不会创建默认路径，而是仅完成远端录制停止。这体现了“停止录制”和“本地保存副本”两个目标的解耦。</li><li>下载前显式创建父目录并使用 <code>parents=True, exist_ok=True</code>，选择的是幂等式目录准备策略；这样调用方无需预先保证目录结构存在，减少 teardown 末尾因路径缺失导致的失败面。</li></ul>
+<p><strong>上下游关系</strong></p>
+<ul><li><strong>调用方</strong>: TmuxSession.stop; <a href="stage-5.html">stage-5</a> teardown 路径中的会话关闭流程; 框架在试验收尾时触发的 tmux/asciinema 停止逻辑</li><li><strong>核心被调用</strong>: self._logger.debug; self.send_keys; asyncio.sleep; Path.mkdir; self.environment.download_file</li><li><strong>配置/状态来源</strong>: self._remote_asciinema_recording_path; self._local_asciinema_recording_path; self.environment</li><li><strong>结果去向</strong>: 远端 asciinema 录制进程; 本地录制文件路径 <code>self._local_asciinema_recording_path</code>; 后续需要使用本地 cast 文件的 marker 合并流程; 日志输出通道</li><li><strong>同类 sibling</strong>: Terminus2.run：同属 <a href="stage-5.html">stage-5</a> 收尾，但其职责是把 rollout/token/cost/metadata 汇总写回 <code>context</code>。; Terminus2._dump_trajectory：同一收尾阶段中的另一条落盘路径，负责轨迹 JSON 导出，而本段负责录屏 cast 文件回收。</li></ul></div></details><nav class="pn"><a class="pn-prev" href="stage-4.9.html"><span>← 上一阶段</span><strong>解析器内部辅助</strong></a><a class="pn-next" href="stage-6.html"><span>下一阶段 →</span><strong>录制后处理(外部)</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

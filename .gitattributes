@@ -1,0 +1,6 @@
+# Git LFS — the Handbook Studio demo bundles a few payloads that exceed
+# HuggingFace's 10MB non-LFS file limit (Codex call graph / function cards /
+# artifacts). Track them with LFS so `git push` to the Space succeeds.
+studio/demo-data/hb/*/graph.json     filter=lfs diff=lfs merge=lfs -text
+studio/demo-data/hb/*/functions.json filter=lfs diff=lfs merge=lfs -text
+studio/demo-data/hb/*/artifacts.json filter=lfs diff=lfs merge=lfs -text

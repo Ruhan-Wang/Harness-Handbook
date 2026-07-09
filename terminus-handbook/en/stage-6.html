@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>stage-6 · Recording Post-process (External)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=en"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=en" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>Home</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>State-flow registers</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>Configuration Crystallization</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>Environment Setup</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>Run Onset</a></div><details class="s-node"><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>Iteration Loop</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>Loop Entry Gates</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>Proactive Summarize Probe</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM Query</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>Response Parse</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>Pending Handoff Prompt → User Step (or Split)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>Error Branch</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>Command Execute → Observation → Trajectory Step</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>Completion Gate + Loop Control</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>Parser internal helpers</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>Run Teardown</a></div><div class="s-leaf"><a class="s-link cur" href="stage-6.html"><span class="s-num">6</span>Recording Post-process (External)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>Context Summarization</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token &amp; Cost Accounting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>Output Length Limiting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>Logging</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux internal helpers</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">Index</a></nav><div class="stage-head"><h1>Recording Post-process (External)</h1><div class="meta"><span class="chip mono">stage-6</span><span class="chip">7 functions</span></div></div>
+<h2 class="sec">Opening Explanation</h2>
+<p>This stage exists to turn a raw terminal recording into a finished recording with the agent’s markers embedded at the right times. During the run, Terminus 2 can note important moments as marker data, but it does not rewrite the asciinema cast file live. That would make recording more fragile and would mix “capture the session” with “edit the finished file.” So this work is deferred to session stop. Concretely, this is the recording-finalization substep inside terminal/session shutdown, not part of the agent’s main <code>run()</code> loop. Its job is narrow: take the completed <code>.cast</code> file, merge in the saved markers, and leave behind a final recording artifact that external tools can read.</p>
+<h2 class="sec">Main Flow</h2>
+
+<ol><li><code>TmuxSession.stop()</code> (shuts down the remotely driven terminal session) is the point where this stage begins. That matters because the recording file is now complete enough to safely finalize.</li><li>There is an early branch: if no marker data was collected, there is nothing to merge. In that case, stop/finalize leaves the cast file unchanged and returns.</li><li>If markers do exist, <code>AsciinemaHandler.merge_markers()</code> (finalizes the recording by inserting marker events) reads the existing cast file and the saved marker list.</li><li>The merge keeps the cast header, then walks the recording frame by frame. <code>AsciinemaHandler._process_recording_line()</code> (handles one recording line at a time) inserts any marker whose timestamp should appear before that frame. This is the core responsibility of the stage: place markers in time order without disturbing the original terminal output.</li><li>If some markers fall after the last frame, <code>AsciinemaHandler._write_remaining_markers()</code> appends them at the end so they are not lost.</li><li>The result is a rewritten, finalized <code>.cast</code> artifact. The point of the stage is not to change agent behavior. It is to make the recording understandable after the fact.</li></ol>
+<h2 class="sec"> State Flow</h2>
+<ul><li>writes: none — this stage does not write any Terminus 2 register; it updates the recording artifact instead</li><li>reads: <a class="reg" href="registers.html#reg-asciinema-markers"><code>reg-asciinema-markers</code></a> — reads the accumulated <code>(timestamp, label)</code> marker tuples to decide whether a merge is needed and, if so, where marker events should be inserted</li><li>clears: none proven — no register clear is evidenced here</li><li>triggers downstream: <code>side-S1 Context Summarization</code> — sequencing only; once terminal/session stop finishes, the broader pipeline may continue, but this stage does not hand off a new register</li></ul>
+<p>Additional artifact flow for this stage:</p>
+<ul><li>reads: existing <code>.cast</code> recording artifact — the already-recorded asciinema file is read as the base material for finalization</li><li>writes: finalized <code>.cast</code> recording artifact — if markers exist, the cast is rewritten with embedded marker events; if no markers exist, the cast is left unchanged</li></ul>
+<h2 class="sec">Pipeline Hand-Off</h2>
+<p>Upstream leaves behind two things: a finished raw <code>.cast</code> recording and, if any were collected, marker entries in <a class="reg" href="registers.html#reg-asciinema-markers"><code>reg-asciinema-markers</code></a>. This stage turns those into a finalized recording artifact; downstream sequencing happens after finalization, but no new Terminus 2 register is produced here.</p><div class="files-bar"><h2 class="sec">Functions<span class="pill">7</span></h2><span class="spacer"></span><button class="tool" data-x="expand">Expand all</button><button class="tool" data-x="collapse">Collapse all</button></div><details class="file" id="fn-tmuxsession_stop"><summary><span class="chev"></span><code class="fpath">TmuxSession.stop</code><a class="fn-range" href="../code/tmux_session.py.html#L496-L508" title="tmux_session.py:496-508">tmux_session.py:496–508 ↗</a></summary><div class="file-body"><p class="fn-sub">Stop-time asciinema marker merge gate</p>
+<blockquote><p><strong>Stage context</strong>: This region performs the <a href="stage-6.html">stage-6</a> handoff from in-memory marker collection to cast-file post-processing. The Harbor framework reaches it through <code>TmuxSession.stop()</code> after the agent run has already finished, so it runs outside the main <code>run()</code> path. In this stage, its job is narrow: decide whether merge work is possible from <code>_markers</code> and <code>_local_asciinema_recording_path</code>, then delegate the actual file rewrite to <code>AsciinemaHandler.merge_markers()</code>.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>This region checks whether <code>self._markers</code> contains any recorded markers and whether <code>self._local_asciinema_recording_path</code> points to a local cast file. When both are present, it logs the merge, builds an <code>AsciinemaHandler</code> from those two inputs, and asks that handler to fold the markers into the recording. Otherwise it only emits a debug message and leaves the recording unchanged.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self) -&gt; None</code></p>
+<ul><li>params: <code>self</code>: <code>TmuxSession</code> — session object that holds collected markers, recording path, and logger</li><li>reads: <code>self._markers</code>, <code>self._local_asciinema_recording_path</code>, <code>self._logger</code></li><li>returns: None; the real product is a possible on-disk update to the local asciinema recording file and debug log output.</li><li>effects: writes debug messages through <code>self._logger.debug(...)</code>; instantiates <code>AsciinemaHandler(self._markers, self._local_asciinema_recording_path)</code>; may rewrite the cast file at <code>self._local_asciinema_recording_path</code> via <code>handler.merge_markers()</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Check the merge preconditions by reading <code>self._markers</code> and <code>self._local_asciinema_recording_path</code> in the same branch guard.</li><li>If both values are truthy, log how many markers will be merged with <code>len(self._markers)</code>.</li><li>Create <code>AsciinemaHandler</code> with the current marker list and the local recording path, then call <code>merge_markers()</code> to perform the post-process rewrite.</li><li>After a successful call, log that the merge completed for <code>self._local_asciinema_recording_path</code>.</li><li>If either precondition fails, skip handler creation entirely and log <code>"No markers to merge"</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>            if self._markers and self._local_asciinema_recording_path:
+                self._logger.debug(
+                    f"Merging {len(self._markers)} markers into recording"
+                )
+                handler = AsciinemaHandler(
+                    self._markers, self._local_asciinema_recording_path
+                )
+                handler.merge_markers()
+                self._logger.debug(
+                    f"Successfully merged markers into {self._local_asciinema_recording_path}"
+                )
+            else:
+                self._logger.debug("No markers to merge")</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It gates on both <code>_markers</code> and <code>_local_asciinema_recording_path</code> before constructing <code>AsciinemaHandler</code>. That avoids invoking file post-processing when the session never recorded markers or never obtained a local cast path; a looser check would push missing-input handling into the handler.</li><li>It delegates all merge mechanics to <code>AsciinemaHandler.merge_markers()</code> instead of touching the cast file here. That keeps <code>TmuxSession.stop()</code> focused on stop-time orchestration, while the specialized handler owns the recording-format logic described for <a href="stage-6.html">stage-6</a>.</li><li>It treats the no-work case as a debug-only branch (<code>"No markers to merge"</code>) rather than as an error. The branch condition shows that missing markers or path are acceptable outcomes at shutdown, not exceptional failures.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>TmuxSession.stop</code> surrounding shutdown flow; Harbor framework post-run session teardown; <a href="stage-6.html">stage-6</a> external post-process entrypoint after agent return</li><li><strong>Core callees</strong>: <code>AsciinemaHandler</code>; <code>AsciinemaHandler.merge_markers</code>; <code>self._logger.debug</code></li><li><strong>Config / state sources</strong>: <code>self._markers</code>; <code>self._local_asciinema_recording_path</code>; <code>self._logger</code></li><li><strong>Results to</strong>: local cast file at <code>self._local_asciinema_recording_path</code>; debug logging output; <a href="stage-6.html">stage-6</a> recording artifact with markers merged</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-asciinema-markers"><code>reg-asciinema-markers</code></a> — consumes accumulated markers during stop-time merge</li></ul></div>
+</div></details><details class="file" id="fn-asciinemahandler_init"><summary><span class="chev"></span><code class="fpath">AsciinemaHandler.__init__</code><a class="fn-range" href="../code/asciinema_handler.py.html#L11-L20" title="asciinema_handler.py:11-20">asciinema_handler.py:11–20 ↗</a></summary><div class="file-body"><p class="fn-sub">Constructor storing ordered markers and recording path</p>
+<blockquote><p><strong>Stage context</strong>: This entry covers only <code>AsciinemaHandler.__init__</code> itself. Within the owning stage, it prepares an <code>AsciinemaHandler</code> instance by putting constructor inputs onto instance state in normalized form.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>AsciinemaHandler.__init__</code> takes <code>markers</code> and <code>recording_path</code> and stores them on the instance. It writes <code>self._markers</code> as either a new list sorted by each tuple's timestamp element (<code>x[0]</code>) or <code>[]</code> when <code>markers</code> is falsy. It also writes <code>self._recording_path</code> with the provided <code>Path</code>. The constructor returns no value; its product is initialized instance state.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, markers: list[tuple[float, str]], recording_path: Path)</code></p>
+<ul><li>params: <code>markers</code>: <code>list[tuple[float, str]]</code> — marker pairs to store on the instance; <code>recording_path</code>: <code>Path</code> — recording file path to store on the instance</li><li>returns: None; it initializes <code>self._markers</code> and <code>self._recording_path</code>.</li><li>effects: writes <code>self._markers</code>; writes <code>self._recording_path</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>It evaluates <code>markers</code> for truthiness. If <code>markers</code> is truthy, it builds a new list with <code>sorted(markers, key=lambda x: x[0])</code> and assigns that list to <code>self._markers</code>.</li><li>If <code>markers</code> is falsy, it assigns an empty list <code>[]</code> to <code>self._markers</code> instead.</li><li>It assigns the incoming <code>recording_path</code> directly to <code>self._recording_path</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def __init__(self, markers: list[tuple[float, str]], recording_path: Path):
+        """
+        Initialize the AsciinemaHandler.
+
+        Args:
+            markers: List of tuples containing (timestamp, label) for each marker
+            recording_path: Path to the asciinema recording file
+        """
+        self._markers = sorted(markers, key=lambda x: x[0]) if markers else []
+        self._recording_path = recording_path</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The constructor sorts <code>markers</code> eagerly with <code>sorted(..., key=lambda x: x[0])</code> instead of storing the input list as-is. That choice makes <code>self._markers</code> ordered by the first tuple element at construction time, and because <code>sorted()</code> returns a new list, it does not reuse the caller's original list object.</li><li>The <code>if markers else []</code> expression collapses any falsy <code>markers</code> input to a concrete empty list. That gives the instance a list in both branches rather than preserving the original falsy value.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: code that instantiates <code>AsciinemaHandler</code></li><li><strong>Core callees</strong>: <code>sorted</code></li><li><strong>Config / state sources</strong>: constructor argument <code>markers</code>; constructor argument <code>recording_path</code></li><li><strong>Results to</strong>: <code>self._markers</code>; <code>self._recording_path</code>; the initialized <code>AsciinemaHandler</code> instance</li></ul></div></details><details class="file" id="fn-asciinemahandler_merge_markers"><summary><span class="chev"></span><code class="fpath">AsciinemaHandler.merge_markers</code><a class="fn-range" href="../code/asciinema_handler.py.html#L22-L39" title="asciinema_handler.py:22-39">asciinema_handler.py:22–39 ↗</a></summary><div class="file-body"><p class="fn-sub">Guarded cast-file marker merge entrypoint</p>
+<blockquote><p><strong>Stage context</strong>: This method is the public entrypoint on <code>AsciinemaHandler</code> for applying queued marker data to a cast file. Within this class, it sits above <code>_write_merged_recording</code>, which does the actual merged-file generation, and it limits itself to the guard, temporary-path setup, and final replacement step.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>merge_markers</code> checks two prerequisites from instance state: <code>self._markers</code> must be truthy and <code>self._recording_path</code> must already exist. If either check fails, it returns <code>None</code> immediately and leaves the filesystem unchanged. Otherwise it asks <code>_write_merged_recording</code> to write a merged copy to a temporary path derived from <code>self._recording_path</code>, then replaces the original recording with that temporary file.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self) -&gt; None</code></p>
+<ul><li>params: <code>self</code>: <code>?</code> — handler instance with <code>_markers</code>, <code>_recording_path</code>, and <code>_write_merged_recording</code></li><li>reads: <code>self._markers</code>, <code>self._recording_path</code></li><li>returns: Returns <code>None</code>; may make no filesystem changes when <code>self._markers</code> is falsy or <code>self._recording_path</code> does not exist.</li><li>effects: writes a merged recording to a temporary path via <code>self._write_merged_recording(temp_path)</code>; replaces <code>self._recording_path</code> on disk with <code>temp_path.replace(self._recording_path)</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Evaluate the single guard <code>if not self._markers or not self._recording_path.exists(): return</code> and stop immediately when there are no markers or no existing recording file.</li><li>Build <code>temp_path</code> from <code>self._recording_path.with_suffix(".tmp")</code>.</li><li>Delegate merged-file creation to <code>self._write_merged_recording(temp_path)</code>.</li><li>Promote the temporary file to the target path with <code>temp_path.replace(self._recording_path)</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def merge_markers(self) -&gt; None:
+        """
+        Merge asciinema markers into a recording.
+
+        Inserts marker events into an asciinema recording file at specified timestamps.
+        Markers are added as special events with type 'm' in the recording format.
+        The original recording is preserved until the merge is successful.
+
+        In the future Asciinema might support adding markers via RCP:
+        https://discourse.asciinema.org/t/add-markers-with-title-from-cli/861
+        """
+        if not self._markers or not self._recording_path.exists():
+            return
+
+        # Create a temporary file in the same directory as the recording
+        temp_path = self._recording_path.with_suffix(".tmp")
+        self._write_merged_recording(temp_path)
+        temp_path.replace(self._recording_path)</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It uses an early-return guard on both <code>self._markers</code> and <code>self._recording_path.exists()</code> to skip all file work when a merge cannot or should not happen.</li><li>It writes to <code>temp_path</code> first and only then calls <code>replace(...)</code>, which keeps the original recording in place until the merged output has been produced.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: external caller of <code>AsciinemaHandler.merge_markers</code></li><li><strong>Core callees</strong>: <code>self._recording_path.exists</code>; <code>self._recording_path.with_suffix</code>; <code>self._write_merged_recording</code>; <code>temp_path.replace</code></li><li><strong>Config / state sources</strong>: <code>self._markers</code>; <code>self._recording_path</code></li><li><strong>Results to</strong>: merged cast file at <code>self._recording_path</code>; filesystem state at the recording path</li><li><strong>Related siblings</strong>: <code>AsciinemaHandler.__init__</code> initializes <code>self._markers</code> and <code>self._recording_path</code> used here</li></ul></div></details><details class="file" id="fn-asciinemahandler_write_merged_recording"><summary><span class="chev"></span><code class="fpath">AsciinemaHandler._write_merged_recording</code><a class="fn-range" href="../code/asciinema_handler.py.html#L41-L60" title="asciinema_handler.py:41-60">asciinema_handler.py:41–60 ↗</a></summary><div class="file-body"><p class="fn-sub">Write merged cast file with inserted markers</p>
+<blockquote><p><strong>Stage context</strong>: This helper performs the file-writing part of <a href="stage-6.html">stage-6</a>'s recording post-process. It sits under <code>AsciinemaHandler.merge_markers</code>, which decides whether to run the merge and later swaps the temporary output into place; this method only reads the source recording and writes the merged copy.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_write_merged_recording</code> rewrites the recording at <code>self._recording_path</code> into <code>output_path</code> while delegating marker insertion to helper methods. It copies the first input line unchanged, then feeds each remaining line plus the current <code>marker_index</code> into <code>_process_recording_line</code>, and finally asks <code>_write_remaining_markers</code> to emit any unconsumed tail from <code>self._markers[marker_index:]</code>. It returns <code>None</code>; its product is the newly written output file.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, output_path: Path) -&gt; None</code></p>
+<ul><li>params: <code>output_path</code>: <code>Path</code> — destination path for the rewritten recording file</li><li>reads: <code>self._recording_path</code>, <code>self._markers</code></li><li>returns: Returns <code>None</code>; the observable result is content written to <code>output_path</code>.</li><li>effects: opens <code>self._recording_path</code> for reading; creates or overwrites <code>output_path</code> and writes merged recording content to it</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>It initializes a local <code>marker_index = 0</code> to track how much of the marker list downstream helpers have consumed.</li><li>It opens <code>self._recording_path</code> as <code>input_file</code> and <code>output_path</code> as <code>output_file</code> inside one <code>with</code> block.</li><li>It reads the first line from <code>input_file</code> with <code>input_file.readline()</code> and writes that line directly to <code>output_file</code>.</li><li>For each remaining <code>line</code> in <code>input_file</code>, it calls <code>self._process_recording_line(line, output_file, marker_index)</code> and replaces <code>marker_index</code> with that call's return value.</li><li>After the loop, it slices <code>self._markers[marker_index:]</code> and passes that remainder to <code>self._write_remaining_markers(output_file, ...)</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _write_merged_recording(self, output_path: Path) -&gt; None:
+        """
+        Write a new recording file with markers merged in at the correct timestamps.
+        """
+        marker_index = 0
+
+        with (
+            open(self._recording_path) as input_file,
+            open(output_path, "w") as output_file,
+        ):
+            # Preserve header
+            output_file.write(input_file.readline())
+
+            for line in input_file:
+                marker_index = self._process_recording_line(
+                    line, output_file, marker_index
+                )
+
+            # Add any remaining markers at the end
+            self._write_remaining_markers(output_file, self._markers[marker_index:])</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It copies the first line separately with <code>input_file.readline()</code> before the main loop. That visible split preserves one line verbatim without sending it through <code>_process_recording_line</code>.</li><li>It tracks progress with a local <code>marker_index</code> returned from <code>_process_recording_line</code> instead of mutating <code>self._markers</code>. That keeps instance state read-only in this method and makes the final remainder explicit as <code>self._markers[marker_index:]</code>.</li><li>It delegates line-level merging and tail emission to <code>_process_recording_line</code> and <code>_write_remaining_markers</code> rather than embedding both policies here. This keeps <code>_write_merged_recording</code> focused on file streaming and output assembly.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: AsciinemaHandler.merge_markers</li><li><strong>Core callees</strong>: self._process_recording_line; self._write_remaining_markers; open</li><li><strong>Config / state sources</strong>: self._recording_path; self._markers</li><li><strong>Results to</strong>: writes merged recording data to <code>output_path</code>; produces the temporary file later used by <code>AsciinemaHandler.merge_markers</code></li><li><strong>Related siblings</strong>: AsciinemaHandler.merge_markers decides whether to call this helper and later replaces the original file with the output it writes.; AsciinemaHandler.__init__ stores the <code>markers</code> and <code>recording_path</code> values that this method reads.</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-asciinema-markers"><code>reg-asciinema-markers</code></a> — reads marker list for per-line and trailing writes</li></ul></div>
+</div></details><details class="file" id="fn-asciinemahandler_process_recording_line"><summary><span class="chev"></span><code class="fpath">AsciinemaHandler._process_recording_line</code><a class="fn-range" href="../code/asciinema_handler.py.html#L62-L90" title="asciinema_handler.py:62-90">asciinema_handler.py:62–90 ↗</a></summary><div class="file-body"><p class="fn-sub">Per-line cast merger with marker insertion</p>
+<blockquote><p><strong>Stage context</strong>: This helper does the line-by-line work inside <a href="stage-6.html">stage-6</a>'s cast rewrite. <code>AsciinemaHandler._write_merged_recording</code> calls it for each recording line after the header, and <code>merge_markers</code> later swaps the merged temp file into place. It complements <code>_write_remaining_markers</code>, which handles any markers left after all input lines are consumed.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>AsciinemaHandler._process_recording_line</code> examines one cast-file line, tries to read an event timestamp from JSON array lines, and inserts any queued markers from <code>self._markers</code> whose timestamps are less than or equal to that event time. It always writes the original <code>line</code> to <code>output_file</code>, even when parsing fails or the line does not look like an event record. The function returns the next <code>marker_index</code> to continue the merge pass; it does not modify instance attributes.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, line: str, output_file: TextIO, marker_index: int) -&gt; int</code></p>
+<ul><li>params: <code>line</code>: <code>str</code> — One input line from the asciinema recording being merged; <code>output_file</code>: <code>TextIO</code> — Destination stream for marker events and the preserved recording line; <code>marker_index</code>: <code>int</code> — Current position in <code>self._markers</code> for the next marker to consider</li><li>reads: <code>self._markers</code></li><li>returns: An updated <code>marker_index</code> after consuming any markers written before this line's timestamp</li><li>effects: Writes zero or more marker lines to <code>output_file</code> via <code>self._write_marker</code>; Writes the original <code>line</code> to <code>output_file</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>If <code>line</code> does not start with <code>"["</code>, treat it as a non-event line, write it unchanged to <code>output_file</code>, and return the incoming <code>marker_index</code>.</li><li>Otherwise, try to parse <code>line</code> with <code>json.loads(line)</code> and read the event time as <code>float(data[0])</code>.</li><li>While <code>marker_index</code> still points inside <code>self._markers</code> and that marker's timestamp <code>self._markers[marker_index][0]</code> is less than or equal to the parsed <code>timestamp</code>, call <code>_write_marker(output_file, self._markers[marker_index])</code> and advance <code>marker_index</code>.</li><li>If JSON parsing or timestamp extraction raises <code>json.JSONDecodeError</code>, <code>ValueError</code>, or <code>IndexError</code>, suppress the error and keep the line unchanged.</li><li>Write the original <code>line</code> to <code>output_file</code> and return the final <code>marker_index</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _process_recording_line(
+        self,
+        line: str,
+        output_file: TextIO,
+        marker_index: int,
+    ) -&gt; int:
+        """Process a single line from the recording, inserting markers as needed."""
+        if not line.startswith("["):
+            output_file.write(line)
+            return marker_index
+
+        try:
+            data = json.loads(line)
+            timestamp = float(data[0])
+
+            # Insert any markers that should appear before this timestamp
+            while (
+                marker_index &lt; len(self._markers)
+                and self._markers[marker_index][0] &lt;= timestamp
+            ):
+                self._write_marker(output_file, self._markers[marker_index])
+                marker_index += 1
+
+        except (json.JSONDecodeError, ValueError, IndexError):
+            # If we can't parse the line, preserve it as-is
+            pass
+
+        output_file.write(line)
+        return marker_index</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It gates JSON parsing behind <code>line.startswith("[")</code>. That cheap shape check avoids trying to decode obvious non-event lines, while still preserving them verbatim.</li><li>The <code>except (json.JSONDecodeError, ValueError, IndexError): pass</code> branch chooses lossless preservation over strict validation. If a cast line is malformed or not an array with a numeric first element, the merge keeps the original content instead of failing the whole post-process.</li><li>The marker loop uses <code>&lt;= timestamp</code> against <code>self._markers[marker_index][0]</code>. That places markers at the first frame whose time is at or after the marker time, which matches the stage's merge policy described in <code>merge_markers</code> and <code>_write_merged_recording</code>.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: AsciinemaHandler._write_merged_recording</li><li><strong>Core callees</strong>: json.loads; float; AsciinemaHandler._write_marker; output_file.write</li><li><strong>Config / state sources</strong>: self._markers from AsciinemaHandler.__init__; <code>marker_index</code> threaded through AsciinemaHandler._write_merged_recording; input <code>line</code> read from the cast file by AsciinemaHandler._write_merged_recording</li><li><strong>Results to</strong>: Updated <code>marker_index</code> back to AsciinemaHandler._write_merged_recording; Merged output stream later finalized by AsciinemaHandler._write_merged_recording; Remaining marker handling in AsciinemaHandler._write_remaining_markers after line processing completes</li><li><strong>Related siblings</strong>: AsciinemaHandler._write_merged_recording drives this helper across the file; AsciinemaHandler.merge_markers decides whether the merge runs at all; AsciinemaHandler.__init__ pre-sorts <code>self._markers</code>, which this function consumes in order; TmuxSession.stop triggers the stage by constructing AsciinemaHandler and calling <code>merge_markers</code></li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-asciinema-markers"><code>reg-asciinema-markers</code></a> — consumes sorted marker tuples during merge</li></ul></div>
+</div></details><details class="file" id="fn-asciinemahandler_write_remaining_markers"><summary><span class="chev"></span><code class="fpath">AsciinemaHandler._write_remaining_markers</code><a class="fn-range" href="../code/asciinema_handler.py.html#L98-L103" title="asciinema_handler.py:98-103">asciinema_handler.py:98–103 ↗</a></summary><div class="file-body"><p class="fn-sub">Write trailing markers through delegated marker serializer</p>
+<blockquote><p><strong>Stage context</strong>: This helper is a minimal writer in the <a href="stage-6.html">stage-6</a> cast post-processing code. Among the translated siblings, <code>AsciinemaHandler._write_merged_recording</code> invokes it after processing the main recording stream, and this function only handles the marker list it is given by delegating each item to <code>AsciinemaHandler._write_marker</code>.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>AsciinemaHandler._write_remaining_markers</code> walks the supplied <code>markers</code> list in its existing order and writes each marker to <code>output_file</code> by calling <code>self._write_marker(output_file, marker)</code>. It takes no direct input from instance attributes and returns <code>None</code>. Its observable effect is whatever output <code>self._write_marker</code> produces on <code>output_file</code> for each tuple.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, output_file: TextIO, markers: list[tuple[float, str]]) -&gt; None</code></p>
+<ul><li>params: <code>self</code>: <code>AsciinemaHandler</code> — method receiver used only to reach <code>self._write_marker</code>; <code>output_file</code>: <code>TextIO</code> — text stream passed through to <code>_write_marker</code> for each marker; <code>markers</code>: <code>list[tuple[float, str]]</code> — caller-supplied marker tuples to emit in list order</li><li>returns: Returns <code>None</code>; the real product is delegated marker writes to <code>output_file</code>.</li><li>effects: Calls <code>self._write_marker(output_file, marker)</code> once per item in <code>markers</code>; May write to the external <code>output_file</code> stream via <code>_write_marker</code>; Does not catch exceptions raised by <code>_write_marker</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Iterate over <code>markers</code> with <code>for marker in markers</code>, preserving the caller-provided sequence.</li><li>For each <code>marker</code>, call <code>self._write_marker(output_file, marker)</code> and do no other transformation, filtering, or accumulation.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _write_remaining_markers(
+        self, output_file: TextIO, markers: list[tuple[float, str]]
+    ) -&gt; None:
+        """Write any remaining markers that come after all recorded events."""
+        for marker in markers:
+            self._write_marker(output_file, marker)</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The helper delegates all per-marker formatting and output to <code>self._write_marker</code> instead of duplicating that logic here. This keeps this function to ordered iteration only; any exception from <code>_write_marker</code> therefore propagates unchanged.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>AsciinemaHandler._write_merged_recording</code></li><li><strong>Core callees</strong>: <code>AsciinemaHandler._write_marker</code></li><li><strong>Config / state sources</strong>: <code>markers</code> parameter; <code>output_file</code> parameter</li><li><strong>Results to</strong>: <code>output_file</code> text stream; caller-visible completion or propagated exception from <code>_write_marker</code></li><li><strong>Related siblings</strong>: <code>AsciinemaHandler._write_merged_recording</code> supplies the <code>markers</code> slice this helper emits; <code>AsciinemaHandler._process_recording_line</code> handles marker insertion during line-by-line processing; this helper only emits the leftover list</li></ul></div></details><details class="file" id="fn-asciinemahandler_write_marker"><summary><span class="chev"></span><code class="fpath">AsciinemaHandler._write_marker</code><a class="fn-range" href="../code/asciinema_handler.py.html#L92-L96" title="asciinema_handler.py:92-96">asciinema_handler.py:92–96 ↗</a></summary><div class="file-body"><p class="fn-sub">Emit one asciinema marker event line</p>
+<blockquote><p><strong>Stage context</strong>: This helper handles the smallest write unit in <a href="stage-6.html">stage-6</a>: one marker record in asciinema cast format. <code>AsciinemaHandler._process_recording_line</code> and <code>AsciinemaHandler._write_remaining_markers</code> call it while <code>AsciinemaHandler._write_merged_recording</code> rewrites the final <code>.cast</code> file. It runs only during the external post-processing merge triggered after the agent finishes.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>AsciinemaHandler._write_marker</code> takes an <code>output_file</code> stream and one <code>marker</code> tuple of <code>(timestamp, label)</code>, converts that tuple into the asciinema marker event shape, and writes it as one JSON line. It returns <code>None</code>. Its only observable effect is appending a newline-terminated record to <code>output_file</code>.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, output_file: TextIO, marker: tuple[float, str]) -&gt; None</code></p>
+<ul><li>params: <code>self</code>: <code>AsciinemaHandler</code> — handler instance; not consulted by this method; <code>output_file</code>: <code>TextIO</code> — destination stream that receives the marker event line; <code>marker</code>: <code>tuple[float, str]</code> — marker payload as <code>(timestamp, label)</code> supplied by merge helpers</li><li>returns: None; the real product is one marker JSON record written to <code>output_file</code></li><li>effects: writes a newline-terminated JSON string to <code>output_file</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Unpack <code>marker</code> into <code>marker_time</code> and <code>marker_label</code>.</li><li>Build <code>marker_data</code> as <code>[marker_time, "m", marker_label]</code>, using the literal event-type code <code>"m"</code>.</li><li>Serialize <code>marker_data</code> with <code>json.dumps(...)</code>, append <code>"\n"</code>, and write the resulting line to <code>output_file</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _write_marker(self, output_file: TextIO, marker: tuple[float, str]) -&gt; None:
+        """Write a single marker event to the output file."""
+        marker_time, marker_label = marker
+        marker_data = [marker_time, "m", marker_label]
+        output_file.write(json.dumps(marker_data) + "\n")</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The function emits the exact three-element array <code>[time, "m", label]</code> instead of passing through the input tuple. That hard-codes the asciinema marker protocol in one place, so sibling helpers can work with simple <code>(timestamp, label)</code> tuples and avoid repeating format knowledge.</li><li>It writes one complete JSON line with a trailing newline in a single <code>output_file.write(...)</code> call. That matches the line-oriented cast-file format used by <code>_write_merged_recording</code> and avoids forcing callers to manage record termination separately.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: AsciinemaHandler._process_recording_line; AsciinemaHandler._write_remaining_markers</li><li><strong>Core callees</strong>: json.dumps; output_file.write</li><li><strong>Config / state sources</strong>: <code>marker[0]</code> supplies the event timestamp; <code>marker[1]</code> supplies the marker label; the literal <code>"m"</code> selects the asciinema marker event type</li><li><strong>Results to</strong>: <code>output_file</code>, which is the merged cast being produced by <code>AsciinemaHandler._write_merged_recording</code>; the final recording file later installed by <code>AsciinemaHandler.merge_markers</code></li><li><strong>Related siblings</strong>: AsciinemaHandler._write_remaining_markers loops over marker tuples and delegates each one here.; AsciinemaHandler._process_recording_line uses this helper when a queued marker timestamp is due before the current recording event.; AsciinemaHandler._write_merged_recording provides the output stream that receives these emitted marker lines.</li></ul></div></details><nav class="pn"><a class="pn-prev" href="stage-5.html"><span>← Previous</span><strong>Run Teardown</strong></a><a class="pn-next" href="side-S1.html"><span>Next →</span><strong>Context Summarization</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>side-S1 · Context Summarization</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=en"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=en" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>Home</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>State-flow registers</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>Configuration Crystallization</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>Environment Setup</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>Run Onset</a></div><details class="s-node"><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>Iteration Loop</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>Loop Entry Gates</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>Proactive Summarize Probe</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM Query</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>Response Parse</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>Pending Handoff Prompt → User Step (or Split)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>Error Branch</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>Command Execute → Observation → Trajectory Step</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>Completion Gate + Loop Control</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>Parser internal helpers</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>Run Teardown</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>Recording Post-process (External)</a></div><div class="s-leaf"><a class="s-link cur" href="side-S1.html"><span class="s-num">S1</span>Context Summarization</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X1.html"><span class="s-num">X1</span>Token &amp; Cost Accounting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>Output Length Limiting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>Logging</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux internal helpers</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">Index</a></nav><div class="stage-head"><h1>Context Summarization</h1><div class="meta"><span class="chip mono">side-S1</span><span class="chip">7 functions</span></div></div>
+<h2 class="sec">Opening Explanation</h2>
+<p>This stage exists to shrink the agent’s conversation when the prompt is getting too full to continue safely. Terminus 2 keeps a growing chat history, but the model has a context limit: once too much history is packed in, the next LLM call can become expensive, fragile, or impossible. Context Summarization owns that pressure-release job. It turns a long working history into a compact handoff the agent can keep using. It can run in two places: proactively when free context is running low, or reactively after a context-length failure. Its job is not to finish the task. Its job is to preserve the important parts of the task so the main loop can keep going without losing the plot.</p>
+<h2 class="sec">Main Flow</h2>
+
+<ol><li>The stage starts only when context pressure is high. <p>There are two entry paths. A proactive check runs before things get too tight. A reactive path runs after an LLM call failed because the context was too long. In both cases, the system decides that the current conversation needs to be compressed.</p></li><li><code>_summarize()</code> (runs the context-compression ritual) builds a handoff from the old history. <p>The point is not “make a short summary” in the abstract. The point is “preserve enough working memory that the agent can continue the same task in a smaller prompt.”</p></li><li>It does that with three subagents, because one summary alone is often too lossy. <p>First, one subagent writes a detailed narrative of what happened so far. Second, another subagent looks at that narrative plus the original task and the current terminal screen (the live shell view the agent can inspect remotely) and asks clarifying questions about what is still missing. Third, a final subagent answers those questions from the old chat history. This design exists to recover details a one-pass summary would miss, especially current state, unresolved problems, and important facts that only become obviously relevant when someone asks follow-up questions.</p></li><li>The stage also records evidence for those subagent runs. <p><code>_run_subagent()</code> (launches one helper agent run and captures its result) is used for each of the three passes. Those runs get their own trajectory records so later inspection can show how the summary handoff was produced. That matters for debugging and audit, but it is not the main purpose of the stage.</p></li><li>Before leaving, this stage prepares a fresh, smaller main chat state. <p>The old long conversation is replaced inside this stage with a minimal three-message conversation built around the question set. This is important: the reset of the main chat happens here, not later. The actual answers become the handoff prompt that will let the main agent continue from compressed context.</p></li><li>Finally, the stage emits pending artifacts for later pipeline stages. <p>It does not itself attach the handoff into the visible trajectory or consume the subagent references. Instead, it leaves behind two pending outputs: the handoff prompt and the subagent trajectory references. Later stages record and consume those artifacts.</p></li></ol>
+<h2 class="sec"> State Flow</h2>
+<ul><li>writes: <a class="reg" href="registers.html#reg-pending-handoff-prompt"><code>reg-pending-handoff-prompt</code></a> — written when summarization finishes; holds the compressed handoff text that later stages will attach/consume so the main agent can continue with less context</li><li>writes: <a class="reg" href="registers.html#reg-pending-subagent-refs"><code>reg-pending-subagent-refs</code></a> — written when the three summarization subagents finish; stores references to their saved trajectories so later stages can record that evidence</li><li>writes: <a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — incremented each time <code>_summarize</code> runs; used as bookkeeping for how often context compression happened</li><li>triggers downstream: <a href="stage-4.5.html">[stage-4.5</a>](<a href="stage-4.5.html">stage-4.5</a>.html) — after this stage has created pending summarization artifacts, the next recording step can pick up the subagent refs</li></ul>
+<h2 class="sec">Pipeline Hand-Off</h2>
+<p>Upstream, this stage receives a live agent state whose chat history has become too large, either detected early or after a context-length failure. It produces two pending artifacts—a compressed handoff prompt and subagent trajectory references—plus a reset smaller main chat; downstream stages then record those artifacts and use the handoff to continue the run without the old full history.</p><div class="files-bar"><h2 class="sec">Functions<span class="pill">7</span></h2><span class="spacer"></span><button class="tool" data-x="expand">Expand all</button><button class="tool" data-x="collapse">Collapse all</button></div><details class="file" id="fn-terminus2_summarize"><summary><span class="chev"></span><code class="fpath">Terminus2._summarize</code><a class="fn-range" href="../code/terminus_2.py.html#L740-L954" title="terminus_2.py:740-954">terminus_2.py:740–954 ↗</a></summary><div class="file-body"><p class="fn-sub">Three-subagent chat-to-handoff summarizer</p>
+<blockquote><p><strong>Stage context</strong>: This function is the stage's core summarization routine. It takes the current <code>Chat</code> state and rewrites that state into a compact handoff conversation while also producing a separate handoff prompt for the next agent turn. Within this stage, it is the only entry shown here and it delegates the three actual model calls to <code>_run_subagent</code>.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>The function turns <code>chat.messages</code>, <code>original_instruction</code>, and the current tmux screen into a resumable handoff package. If <code>chat.messages</code> is empty, it returns <code>(original_instruction, None)</code> without changing state. Otherwise it increments <code>self._summarization_count</code>, runs three subagents in sequence, replaces <code>chat._messages</code> with <code>[system, question_prompt, model_questions]</code>, resets the chat response chain, and returns a handoff prompt plus three <code>SubagentTrajectoryRef</code> values.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, chat: Chat, original_instruction: str, session: TmuxSession) -&gt; tuple[str, list[SubagentTrajectoryRef] | None]</code></p>
+<ul><li>params: <code>chat</code>: <code>Chat</code> — Live conversation history to summarize and then rewrite; <code>original_instruction</code>: <code>str</code> — Original task text embedded into all summarization prompts; <code>session</code>: <code>TmuxSession</code> — Terminal session used to capture the current pane for question generation</li><li>reads: <code>self._session_id</code>, <code>self._summarization_count</code>, <code>self._model_name</code></li><li>returns: A tuple <code>(handoff_prompt, subagent_trajectory_refs)</code>. On the empty-chat branch it returns <code>(original_instruction, None)</code>. On the summarization path it returns a handoff prompt built from <code>answers_response.content</code> and a three-item list of <code>SubagentTrajectoryRef</code> objects from the summary, questions, and answers subagents.</li><li>effects: Increments <code>self._summarization_count</code>; Reads and then replaces <code>chat._messages</code> with <code>[chat.messages[0], {"role": "user", "content": question_prompt}, {"role": "assistant", "content": model_questions}]</code>; Calls <code>chat.reset_response_chain()</code> after replacing the message list; Captures the current tmux pane with <code>session.capture_pane(capture_entire=False)</code>; Builds copied trajectory steps via <code>_prepare_copied_trajectory_steps(...)</code> for the summary and answers subagents; Appends two synthetic copied <code>Step</code> records to <code>answers_steps</code>: one user step for <code>summary_prompt</code>, and one agent step for <code>summary_response.content</code> carrying <code>reasoning_content=summary_response.reasoning_content</code>, <code>model_name=summary_response.model_name or self._model_name</code>, <code>is_copied_context=True</code>, and an <code>extra</code> note that metrics were already recorded</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>If <code>len(chat.messages) == 0</code>, return <code>original_instruction</code> and <code>None</code> immediately; otherwise increment <code>self._summarization_count</code> and start collecting <code>subagent_trajectory_refs</code>.</li><li>Build the summary subagent context from the current unwound <code>chat.messages</code>: compute <code>steps_to_include = 1 + (len(chat.messages) - 1) // 2</code>, copy that many trajectory steps with <code>_prepare_copied_trajectory_steps(...)</code>, compose <code>summary_prompt</code> from <code>original_instruction</code>, and call <code>_run_subagent(...)</code> with <code>message_history=chat.messages</code>.</li><li>Capture the live terminal with <code>session.capture_pane(capture_entire=False)</code>, compose <code>question_prompt</code> from <code>original_instruction</code>, <code>summary_response.content</code>, and the captured screen, then call <code>_run_subagent(...)</code> with <code>message_history=[]</code> to get <code>model_questions</code>.</li><li>Prepare the answers subagent from the same copied base trajectory, then append two extra copied <code>Step</code> objects that mirror the summary exchange: a copied user <code>summary_prompt</code> step and a copied agent <code>summary_response</code> step with <code>model_name</code> fallback to <code>self._model_name</code>, propagated <code>reasoning_content</code>, <code>is_copied_context=True</code>, and an <code>extra</code> note.</li><li>Build <code>answer_request_prompt</code> from <code>model_questions</code>, build <code>answers_message_history</code> as <code>chat.messages</code> plus the summary prompt/response pair, and call <code>_run_subagent(...)</code> to obtain detailed answers.</li><li>Replace <code>chat._messages</code> with the original system message, the synthesized <code>question_prompt</code>, and the model's questions only; reset the response chain; then return a <code>handoff_prompt</code> that embeds <code>answers_response.content</code> and tells the next agent to continue without asking more questions.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    async def _summarize(
+        self, chat: Chat, original_instruction: str, session: TmuxSession
+    ) -&gt; tuple[str, list[SubagentTrajectoryRef] | None]:
+        """Create a summary of the agent's work to pass to a new agent instance.
+
+        This method implements a three-step context summarization process using separate
+        subagents to compress conversation history while preserving critical information:
+
+        **Step 1: Summary Generation (SUBAGENT 1)**
+        - Message history: Unwound chat.messages (limited context after token freeing)
+        - Prompt: Generate comprehensive summary of all work completed so far
+        - Response: summary_response.content (detailed narrative of progress)
+
+        **Step 2: Question Asking (SUBAGENT 2)**
+        - Message history: [] (fresh start, no conversation context)
+        - Prompt: Given the original task, summary from Step 1, and current terminal screen,
+        generate questions about information missing from the summary.
+        - Response: model_questions (list of clarifying questions)
+
+        **Step 3: Answer Providing (SUBAGENT 3)**
+        - Message history: chat.messages + [summary_prompt, summary_response] (extended context)
+        - Prompt: Given the questions from Step 2, answer the questions based on full conversation history.
+        - Response: answers_response.content (detailed answers)
+
+        **Final handoff:**
+        - Chat history replaced with: [system, question_prompt (which includes summary from step 1), model_questions]
+        - Result: Compressed context that preserves critical task-specific information, allowing
+        the main agent to continue working on the task without losing context.
+
+        **Why three steps?** This question-answer approach ensures the summarization doesn't
+        lose important details - the questions subagent identifies gaps, and the answers
+        subagent (with full context) fills them in.
+
+        Args:
+            chat: Chat object containing conversation history (may be unwound)
+            original_instruction: The original task instruction from user
+            session: TmuxSession for capturing current terminal state
+
+        Returns:
+            tuple: (handoff_prompt, subagent_trajectory_refs)
+                - handoff_prompt: The prompt to continue with (includes answers + instructions)
+                - subagent_trajectory_refs: List of 3 SubagentTrajectoryRef objects, or None if summarization failed
+        """
+        if len(chat.messages) == 0:
+            return original_instruction, None
+
+        # Increment summarization count
+        self._summarization_count += 1
+        subagent_trajectory_refs = []
+
+        # ===== SUBAGENT 1: Summary Generation =====
+        summary_session_id = (
+            f"{self._session_id}-summarization-{self._summarization_count}-summary"
+        )
+
+        # Trajectory needs to reflect what is sent to LLM: essentially the previous chat
+        # history, minus the messages that were removed to free up tokens.
+        # Calculate how many trajectory steps to include based on remaining chat messages:
+        # - Chat has: [system, agent1, user1, agent2, user2, ...]
+        # - Trajectory has: [step1_system, step2_agent, step3_agent, ...]
+        # - Formula: steps_to_include = 1 + (num_messages - 1) // 2
+        steps_to_include = 1 + (len(chat.messages) - 1) // 2
+        summary_steps, step_id_counter = self._prepare_copied_trajectory_steps(
+            steps_to_include
+        )
+
+        summary_prompt = f"""You are about to hand off your work to another AI agent.
+            Please provide a comprehensive summary of what you have
+            accomplished so far on this task:
+
+Original Task: {original_instruction}
+
+Based on the conversation history, please provide a detailed summary covering:
+1. **Major Actions Completed** - List each significant command you executed
+            and what you learned from it.
+2. **Important Information Learned** - A summary of crucial findings, file
+            locations, configurations, error messages, or system state discovered.
+3. **Challenging Problems Addressed** - Any significant issues you
+            encountered and how you resolved them.
+4. **Current Status** - Exactly where you are in the task completion process.
+
+
+Be comprehensive and detailed. The next agent needs to understand everything
+            that has happened so far in order to continue."""
+
+        summary_response, summary_trajectory_ref = await self._run_subagent(
+            prompt=summary_prompt,
+            message_history=chat.messages,
+            steps=summary_steps,
+            session_id=summary_session_id,
+            agent_name="terminus-2-summarization-summary",
+            filename_suffix="summary",
+            summary_text=f"Context summarization {self._summarization_count}: Step 1 - Summary generation",
+            subagent_name_for_logging="summary generation LLM call",
+        )
+        subagent_trajectory_refs.append(summary_trajectory_ref)
+
+        # ===== SUBAGENT 2: Question Asking =====
+        current_screen = await session.capture_pane(capture_entire=False)
+        questions_session_id = (
+            f"{self._session_id}-summarization-{self._summarization_count}-questions"
+        )
+        questions_steps = []
+
+        question_prompt = f"""You are picking up work from a previous AI agent on this task:
+
+**Original Task:** {original_instruction}
+
+**Summary from Previous Agent:**
+{summary_response.content}
+
+**Current Terminal Screen:**
+{current_screen}
+
+Please begin by asking several questions (at least five, more if necessary)
+about the current state of the solution that are not answered in the summary
+from the prior agent. After you ask these questions you will be on your own,
+so ask everything you need to know."""
+
+        questions_response, questions_trajectory_ref = await self._run_subagent(
+            prompt=question_prompt,
+            message_history=[],
+            steps=questions_steps,
+            session_id=questions_session_id,
+            agent_name="terminus-2-summarization-questions",
+            filename_suffix="questions",
+            summary_text=f"Context summarization {self._summarization_count}: Step 2 - Question asking",
+            subagent_name_for_logging="questions subagent",
+        )
+        model_questions = questions_response.content
+        subagent_trajectory_refs.append(questions_trajectory_ref)
+
+        # ===== SUBAGENT 3: Answer Providing =====
+        answers_session_id = (
+            f"{self._session_id}-summarization-{self._summarization_count}-answers"
+        )
+
+        # Reuse the actual trajectory steps (same as summary subagent)
+        # At this point, chat.messages has the same unwound history as in summary subagent
+        answers_steps, step_id_counter = self._prepare_copied_trajectory_steps(
+            steps_to_include
+        )
+
+        # Add the summary prompt and response steps that are part of the message history
+        # Mark these as copied context since they were already part of the summary subagent trajectory
+        answers_steps.append(
+            Step(
+                step_id=step_id_counter,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                source="user",
+                message=summary_prompt,
+                is_copied_context=True,
+            )
+        )
+        step_id_counter += 1
+
+        answers_steps.append(
+            Step(
+                step_id=step_id_counter,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                source="agent",
+                model_name=summary_response.model_name or self._model_name,
+                message=summary_response.content,
+                reasoning_content=summary_response.reasoning_content,
+                is_copied_context=True,
+                extra={
+                    "note": "Copied from summary subagent - metrics already recorded there"
+                },
+            )
+        )
+        step_id_counter += 1
+
+        answer_request_prompt = (
+            "The next agent has a few questions for you, please answer each of them one by one in detail:\n\n"
+            + model_questions
+        )
+
+        # The answer subagent should see: unwound chat history + summary prompt + summary response
+        answers_message_history = chat.messages + [
+            {"role": "user", "content": summary_prompt},
+            {"role": "assistant", "content": summary_response.content},
+        ]
+
+        answers_response, answers_trajectory_ref = await self._run_subagent(
+            prompt=answer_request_prompt,
+            message_history=answers_message_history,
+            steps=answers_steps,
+            session_id=answers_session_id,
+            agent_name="terminus-2-summarization-answers",
+            filename_suffix="answers",
+            summary_text=f"Context summarization {self._summarization_count}: Step 3 - Answer providing",
+            subagent_name_for_logging="answers subagent",
+        )
+        subagent_trajectory_refs.append(answers_trajectory_ref)
+
+        # Update chat history with the handoff context
+        # Note: We only include questions, not answers. The answers will be provided
+        # via the handoff_prompt to the next agent iteration.
+        chat._messages = [
+            chat.messages[0],
+            {"role": "user", "content": question_prompt},
+            {"role": "assistant", "content": model_questions},
+        ]
+        chat.reset_response_chain()
+
+        handoff_prompt = (
+            "Here are the answers the other agent provided.\n\n"
+            + answers_response.content
+            + "\n\n"
+            + "Continue working on this task from where the previous agent left off."
+            " You can no longer ask questions. Please follow the spec to interact with "
+            "the terminal."
+        )
+
+        return handoff_prompt, subagent_trajectory_refs</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It uses three separate subagents instead of one direct summary because the code explicitly inserts a gap-finding phase: the questions subagent sees only <code>original_instruction</code>, <code>summary_response.content</code>, and <code>current_screen</code>, while the answers subagent gets the broader <code>answers_message_history</code>. This splits compression from verification so missing details can surface before handoff.</li><li>It computes <code>steps_to_include</code> from <code>len(chat.messages)</code> and recreates copied steps with <code>_prepare_copied_trajectory_steps(...)</code> rather than reusing all prior trajectory records. That keeps each subagent's recorded context aligned with the unwound message history actually sent to the model.</li><li>The questions subagent runs with <code>message_history=[]</code> even though other inputs are rich. That choice forces its questions to come from the summary and current screen, which makes it probe for omissions in the handoff package instead of leaning on hidden conversation context.</li><li>The final rewritten chat stores only <code>[system, question_prompt, model_questions]</code> and omits <code>answers_response.content</code> from <code>chat._messages</code>. The code instead places the answers in the returned <code>handoff_prompt</code>, separating persistent compressed context from the one-shot continuation instruction.</li><li>The synthetic copied summary-response <code>Step</code> in <code>answers_steps</code> preserves <code>summary_response.reasoning_content</code> and uses <code>summary_response.model_name or self._model_name</code> while marking the step with <code>is_copied_context=True</code> and an <code>extra</code> note. This keeps the answers subagent's trajectory faithful to the context it saw without implying that this function should count that prior summary call's metrics twice.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Internal Terminus2 code paths that need to compress <code>Chat</code> history before continuing</li><li><strong>Core callees</strong>: Terminus2._prepare_copied_trajectory_steps; Terminus2._run_subagent; TmuxSession.capture_pane; Chat.reset_response_chain</li><li><strong>Config / state sources</strong>: <code>self._session_id</code> for per-subagent session ids; <code>self._summarization_count</code> for naming and summary labels; <code>self._model_name</code> as fallback for the copied summary-response step; <code>chat.messages</code> as the source conversation and system message</li><li><strong>Results to</strong>: Returned <code>handoff_prompt</code> for downstream continuation logic; Returned <code>list[SubagentTrajectoryRef]</code> for downstream trajectory linking; Mutated <code>chat._messages</code> as the new compressed conversation state; Updated <code>self._summarization_count</code> for later metadata/reporting</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-chat-messages"><code>reg-chat-messages</code></a> — uses current chat history as summarization source</li><li><a class="reg" href="registers.html#reg-chat-messages"><code>reg-chat-messages</code></a> — stores [system, question_prompt, model_questions], not answers</li><li><a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — increments once per summarization invocation</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_prepare_copied_trajectory_steps"><summary><span class="chev"></span><code class="fpath">Terminus2._prepare_copied_trajectory_steps</code><a class="fn-range" href="../code/terminus_2.py.html#L1689-L1703" title="terminus_2.py:1689-1703">terminus_2.py:1689–1703 ↗</a></summary><div class="file-body"><p class="fn-sub">Clone trajectory prefix for subagent handoff context</p>
+<blockquote><p><strong>Stage context</strong>: This helper supports the context-summarization stage by packaging part of the main run's trajectory for reuse by summarization subagents. <code>_summarize</code> calls it when it needs a safe snapshot of prior <code>Step</code> records to attach to subagent work. Unlike <code>_summarize</code>, it does not alter chat state or counters; it only prepares copied history and the next local step number.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>The function takes <code>steps_to_include</code> and returns a copied prefix of <code>self._trajectory_steps</code> plus the next step id for that copied list. It deep-copies only the first <code>steps_to_include</code> steps, then sanitizes the copy by calling <code>_remove_metrics_from_copied_steps</code>. It does not mutate instance state or the original trajectory.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, steps_to_include: int) -&gt; tuple[list[Step], int]</code></p>
+<ul><li>params: <code>steps_to_include</code>: <code>int</code> — Number of leading entries to take from <code>self._trajectory_steps</code></li><li>reads: <code>self._trajectory_steps</code></li><li>returns: A tuple <code>(copied_steps, next_step_id)</code>, where <code>copied_steps</code> is a sanitized deep copy of <code>self._trajectory_steps[:steps_to_include]</code> and <code>next_step_id</code> is <code>len(copied_steps) + 1</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Slice <code>self._trajectory_steps</code> to the first <code>steps_to_include</code> entries and deep-copy that prefix into <code>copied_steps</code>.</li><li>Pass <code>copied_steps</code> to <code>_remove_metrics_from_copied_steps</code> so the copied <code>Step</code> records no longer carry metric fields.</li><li>Compute <code>next_step_id</code> from the copied list length as <code>len(copied_steps) + 1</code>.</li><li>Return the sanitized <code>copied_steps</code> together with <code>next_step_id</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _prepare_copied_trajectory_steps(
+        self, steps_to_include: int
+    ) -&gt; tuple[list[Step], int]:
+        """Prepare trajectory steps for subagent by copying and removing metrics.
+
+        Args:
+            steps_to_include: Number of steps to include from main trajectory
+
+        Returns:
+            Tuple of (copied_steps, next_step_id)
+        """
+        copied_steps = copy.deepcopy(self._trajectory_steps[:steps_to_include])
+        self._remove_metrics_from_copied_steps(copied_steps)
+        next_step_id = len(copied_steps) + 1
+        return copied_steps, next_step_id</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It uses <code>copy.deepcopy(...)</code> on <code>self._trajectory_steps[:steps_to_include]</code> so later edits to subagent history cannot leak back into the main trajectory. Reusing the original objects would make the subagent snapshot fragile.</li><li>It strips metrics through <code>_remove_metrics_from_copied_steps</code> before returning the copy, which keeps reused history focused on narrative state instead of token or cost accounting noise. Leaving metrics in place would mix bookkeeping from the main run into subagent-specific artifacts.</li><li>It derives <code>next_step_id</code> from <code>len(copied_steps) + 1</code> after sanitization, so callers can continue numbering within the copied snapshot without inspecting the original trajectory.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Terminus2._summarize</li><li><strong>Core callees</strong>: copy.deepcopy; Terminus2._remove_metrics_from_copied_steps</li><li><strong>Config / state sources</strong>: self._trajectory_steps; reg-trajectory-steps</li><li><strong>Results to</strong>: Terminus2._summarize subagent trajectory setup; Subagent-local copied <code>Step</code> history; Caller-managed next step numbering for copied trajectory context</li><li><strong>Related siblings</strong>: Terminus2._summarize</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-trajectory-steps"><code>reg-trajectory-steps</code></a> — copies a prefix of main trajectory</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_remove_metrics_from_copied_steps"><summary><span class="chev"></span><code class="fpath">Terminus2._remove_metrics_from_copied_steps</code><a class="fn-range" href="../code/terminus_2.py.html#L1670-L1687" title="terminus_2.py:1670-1687">terminus_2.py:1670–1687 ↗</a></summary><div class="file-body"><p class="fn-sub">Sanitize copied trajectory steps for subagent context</p>
+<blockquote><p><strong>Stage context</strong>: This helper supports the summarization side flow by cleaning copied trajectory history before subagents see it. <code>_prepare_copied_trajectory_steps</code> calls it after deep-copying a prefix of <code>self._trajectory_steps</code>, so the copied context keeps its structure but drops any embedded metrics. It complements <code>_prepare_copied_trajectory_steps</code> by doing the in-place sanitization step that <code>_summarize</code> ultimately relies on when building subagent inputs.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>The function takes <code>steps: list[Step]</code> and mutates each <code>Step</code> in place. For every copied step, it sets <code>step.is_copied_context = True</code>; if <code>step.metrics</code> is present, it clears that field and adds <code>step.extra["note"]</code> explaining that the metrics were intentionally omitted. It returns <code>None</code>; its real product is a sanitized copied step list that preserves trajectory context without carrying duplicated accounting data.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(steps: list[Step]) -&gt; None</code></p>
+<ul><li>params: <code>steps</code>: <code>list[Step]</code> — Copied trajectory steps to sanitize in place</li><li>returns: Returns <code>None</code>; produces in-place updates to each <code>Step</code> in <code>steps</code>.</li><li>effects: Sets <code>step.is_copied_context</code> on every element of <code>steps</code>; Clears <code>step.metrics</code> when that field is truthy; Initializes <code>step.extra</code> to <code>{}</code> when needed before writing a note; Writes <code>step.extra["note"]</code> when metrics were removed</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Iterate over each <code>step</code> in the <code>steps</code> argument and mark it as copied context by setting <code>step.is_copied_context = True</code>.</li><li>Check <code>step.metrics</code>; when it is present, clear it by assigning <code>None</code> so the copied record no longer carries metric data.</li><li>If metrics were removed and <code>step.extra</code> is currently <code>None</code>, replace it with an empty dict so the function has a place to store provenance metadata.</li><li>Record an explanatory <code>step.extra["note"]</code> that says the metrics were omitted because they are already recorded in the parent trajectory.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _remove_metrics_from_copied_steps(steps: list[Step]) -&gt; None:
+        """Remove metrics from copied trajectory steps and mark as copied context.
+
+        Args:
+            steps: List of trajectory steps to modify in-place
+        """
+        for step in steps:
+            # Mark all copied steps with is_copied_context=True
+            step.is_copied_context = True
+
+            # Remove metrics to avoid duplication
+            if step.metrics:
+                step.metrics = None
+                if step.extra is None:
+                    step.extra = {}
+                step.extra["note"] = (
+                    "Metrics omitted to avoid duplication - already recorded in parent trajectory"
+                )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It marks every copied step with <code>step.is_copied_context = True</code>, even when a step had no <code>metrics</code>. That separate flag preserves provenance for the whole copied prefix instead of using missing metrics as an implicit signal.</li><li>It removes <code>step.metrics</code> only when <code>step.metrics</code> is truthy. That avoids manufacturing note metadata for steps that never had metrics, so the copied record distinguishes "metrics intentionally stripped" from "no metrics were present."</li><li>It writes an explicit <code>step.extra["note"]</code> after clearing metrics. This keeps downstream readers from mistaking <code>metrics = None</code> for lost data or incomplete logging; the note ties the omission to duplication avoidance in the parent trajectory.</li><li>It mutates the copied <code>Step</code> objects in place instead of returning a new list. That matches <code>_prepare_copied_trajectory_steps</code>, which already deep-copies the source steps and then hands this helper a list meant only for sanitization.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: <code>Terminus2._prepare_copied_trajectory_steps</code></li><li><strong>Core callees</strong>: none</li><li><strong>Config / state sources</strong>: <code>steps</code> argument; <code>step.metrics</code>; <code>step.extra</code></li><li><strong>Results to</strong>: Sanitized copied-step list returned by <code>Terminus2._prepare_copied_trajectory_steps</code>; Subagent trajectory context assembled for the summarization flow; <code>Terminus2._summarize</code> indirectly, through copied history prepared for subagents</li><li><strong>Related siblings</strong>: <code>Terminus2._prepare_copied_trajectory_steps</code> deep-copies the prefix, then delegates sanitization here; <code>Terminus2._summarize</code> consumes subagent context whose copied trajectory steps have been cleaned by this helper</li></ul></div></details><details class="file" id="fn-terminus2_run_subagent"><summary><span class="chev"></span><code class="fpath">Terminus2._run_subagent</code><a class="fn-range" href="../code/terminus_2.py.html#L661-L738" title="terminus_2.py:661-738">terminus_2.py:661–738 ↗</a></summary><div class="file-body"><p class="fn-sub">Execute one summarization subagent exchange</p>
+<blockquote><p><strong>Stage context</strong>: This helper is the shared execution path for each of <code>_summarize</code>'s three subagents: summary generation, question asking, and answer providing. <code>_summarize</code> invokes it once per subagent so each run gets the same prompt/response trajectory shape, timing capture, metrics accounting, and saved trajectory artifact. It complements <code>_summarize</code> by handling one subagent exchange, while siblings like <code>_prepare_copied_trajectory_steps</code> and <code>_remove_metrics_from_copied_steps</code> prepare sanitized context for those subagent trajectories.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>The function runs one subagent LLM call from prompt to persisted trajectory reference. It takes a <code>prompt</code>, prior <code>message_history</code>, and mutable <code>steps</code>, appends prompt and response <code>Step</code> entries, calls <code>self._llm</code>, records request timing and usage through helper methods, saves the subagent trajectory, and returns both the <code>LLMResponse</code> and a <code>SubagentTrajectoryRef</code>. Its main side effects are mutating <code>steps</code>, updating shared subagent accounting through helper methods, and writing a trajectory artifact.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, prompt: str, message_history: list[dict], steps: list[Step], session_id: str, agent_name: str, filename_suffix: str, summary_text: str, subagent_name_for_logging: str = "subagent") -&gt; tuple[LLMResponse, SubagentTrajectoryRef]</code></p>
+<ul><li>params: <code>prompt</code>: <code>str</code> — Prompt text sent as the subagent's user message; <code>message_history</code>: <code>list[dict]</code> — Prior chat context passed into <code>self._llm.call</code>; <code>steps</code>: <code>list[Step]</code> — Mutable subagent trajectory step list to extend with prompt and response; <code>session_id</code>: <code>str</code> — Session identifier forwarded to <code>_save_subagent_trajectory</code>; <code>agent_name</code>: <code>str</code> — Subagent identity stored with the saved trajectory; <code>filename_suffix</code>: <code>str</code> — Per-subagent suffix for the trajectory filename; <code>summary_text</code>: <code>str</code> — Human-readable description recorded in the returned trajectory reference; <code>subagent_name_for_logging</code>: <code>str</code> — Label forwarded when appending the response step</li><li>reads: <code>self._llm</code>, <code>self._llm_call_kwargs</code></li><li>returns: A tuple <code>(response, trajectory_ref)</code> where <code>response</code> is the <code>LLMResponse</code> from <code>self._llm.call</code> and <code>trajectory_ref</code> is the <code>SubagentTrajectoryRef</code> returned by <code>_save_subagent_trajectory</code>.</li><li>effects: Mutates the passed-in <code>steps</code> list by appending a prompt <code>Step</code>; Mutates the passed-in <code>steps</code> list again through <code>_append_subagent_response_step</code>; Updates subagent timing/accounting through <code>_track_api_request_time</code>; Updates <code>self</code>'s subagent metrics through <code>_update_subagent_metrics</code>; Records rollout detail through <code>_collect_subagent_rollout_detail</code>; Persists a subagent trajectory through <code>_save_subagent_trajectory</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>It assigns the next two step ids from <code>len(steps) + 1</code>, appends a new user-sourced <code>Step</code> containing <code>prompt</code>, and reserves the following id for the model response.</li><li>It records <code>start_time</code>, calls <code>self._llm.call(prompt=prompt, message_history=message_history, **self._llm_call_kwargs)</code>, and stores the resulting <code>LLMResponse</code> in <code>response</code>.</li><li>After the call returns, it feeds <code>start_time</code> into <code>_track_api_request_time</code> and extracts <code>usage_info = response.usage</code> for downstream accounting.</li><li>It passes <code>usage_info</code> to <code>_update_subagent_metrics</code>, then appends the model reply to <code>steps</code> by calling <code>_append_subagent_response_step(steps, response_step_id, response, usage_info, subagent_name_for_logging)</code>.</li><li>It forwards the full <code>response</code> to <code>_collect_subagent_rollout_detail</code>, then saves the subagent run with <code>_save_subagent_trajectory(session_id=session_id, agent_name=agent_name, steps=steps, usage_info=usage_info, filename_suffix=filename_suffix, summary_text=summary_text)</code>.</li><li>It returns the raw <code>response</code> together with the saved <code>trajectory_ref</code> so <code>_summarize</code> can use the text output and keep a stable reference to the persisted subagent artifact.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    async def _run_subagent(
+        self,
+        prompt: str,
+        message_history: list[dict],
+        steps: list[Step],
+        session_id: str,
+        agent_name: str,
+        filename_suffix: str,
+        summary_text: str,
+        subagent_name_for_logging: str = "subagent",
+    ) -&gt; tuple[LLMResponse, SubagentTrajectoryRef]:
+        """Run a subagent and return its response and trajectory reference.
+
+        This helper encapsulates the common pattern of:
+        1. Appending the prompt step to the trajectory
+        2. Calling the LLM with the prompt and message history
+        3. Tracking API request time
+        4. Updating subagent metrics
+        5. Appending the response step to the trajectory
+        6. Collecting rollout details
+        7. Saving the subagent trajectory
+
+        Args:
+            prompt: The prompt to send to the LLM
+            message_history: The message history to provide context
+            steps: The trajectory steps (will be modified to include prompt and response steps)
+            session_id: Session ID for the subagent
+            agent_name: Name of the subagent (e.g., "terminus-2-summarization-summary")
+            filename_suffix: Suffix for trajectory filename (e.g., "summary", "questions", "answers")
+            summary_text: Human-readable summary for the trajectory ref
+            subagent_name_for_logging: Name used in logging messages
+
+        Returns:
+            tuple: (LLM response, SubagentTrajectoryRef)
+        """
+        # Append the prompt step
+        prompt_step_id = len(steps) + 1
+        steps.append(
+            Step(
+                step_id=prompt_step_id,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                source="user",
+                message=prompt,
+            )
+        )
+        response_step_id = prompt_step_id + 1
+
+        start_time = time.time()
+        response: LLMResponse = await self._llm.call(
+            prompt=prompt,
+            message_history=message_history,
+            **self._llm_call_kwargs,
+        )
+        self._track_api_request_time(start_time)
+
+        usage_info = response.usage
+        self._update_subagent_metrics(usage_info)
+
+        self._append_subagent_response_step(
+            steps,
+            response_step_id,
+            response,
+            usage_info,
+            subagent_name_for_logging,
+        )
+
+        self._collect_subagent_rollout_detail(response)
+
+        trajectory_ref = self._save_subagent_trajectory(
+            session_id=session_id,
+            agent_name=agent_name,
+            steps=steps,
+            usage_info=usage_info,
+            filename_suffix=filename_suffix,
+            summary_text=summary_text,
+        )
+
+        return response, trajectory_ref</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The helper centralizes the prompt-call-account-save sequence so all three <code>_summarize</code> subagents produce the same trajectory structure and accounting. Duplicating this logic in <code>_summarize</code> would make step numbering, usage capture, and saved references easier to drift apart across subagents.</li><li>It accepts <code>steps</code> as a mutable list instead of creating a local copy. That lets the caller control exactly which prior context appears in the saved subagent trajectory, but it also means the caller must intentionally manage list reuse and preparation.</li><li>It updates request timing and subagent metrics immediately after <code>self._llm.call</code> and before saving the trajectory. This keeps the saved artifact aligned with the call that actually produced <code>response</code>; delaying those updates would make partial failures or later mutations harder to account for consistently.</li><li>It returns both <code>LLMResponse</code> and <code>SubagentTrajectoryRef</code> instead of only the model text. <code>_summarize</code> needs the response content to build the next subagent prompt and also needs the trajectory reference for later bookkeeping, so this helper preserves both products in one call.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Terminus2._summarize</li><li><strong>Core callees</strong>: self._llm.call; Terminus2._track_api_request_time; Terminus2._update_subagent_metrics; Terminus2._append_subagent_response_step; Terminus2._collect_subagent_rollout_detail; Terminus2._save_subagent_trajectory</li><li><strong>Config / state sources</strong>: self._llm; self._llm_call_kwargs</li><li><strong>Results to</strong>: Returned <code>LLMResponse</code> feeds the next <code>_summarize</code> subagent prompt; Returned <code>SubagentTrajectoryRef</code> is accumulated by <code>_summarize</code> for later stage bookkeeping; Saved trajectory artifact becomes the persisted record for this subagent run; Updated subagent metrics contribute to <a href="stage-5.html">stage-5</a> aggregated metadata via <a class="reg" href="registers.html#reg-subagent-metrics"><code>reg-subagent-metrics</code></a></li><li><strong>Related siblings</strong>: Terminus2._summarize uses this helper three times to implement the full summarization ritual; Terminus2._prepare_copied_trajectory_steps can prepare copied trajectory context before subagent trajectories are built; Terminus2._remove_metrics_from_copied_steps sanitizes copied steps so subagent context does not duplicate accounting data</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-subagent-metrics"><code>reg-subagent-metrics</code></a> — updates usage totals for this subagent call</li><li><a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — records elapsed time after LLM returns</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_collect_subagent_rollout_detail"><summary><span class="chev"></span><code class="fpath">Terminus2._collect_subagent_rollout_detail</code><a class="fn-range" href="../code/terminus_2.py.html#L594-L616" title="terminus_2.py:594-616">terminus_2.py:594–616 ↗</a></summary><div class="file-body"><p class="fn-sub">Capture subagent rollout metadata for later persistence</p>
+<blockquote><p><strong>Stage context</strong>: This helper sits inside the context-summarization subagent path, where <code>_run_subagent</code> records extra diagnostics from each subagent LLM call. <code>_summarize</code> drives the three-subagent ritual, <code>_run_subagent</code> handles each call and trajectory artifact, and this function adds optional rollout payloads from the returned <code>LLMResponse</code> into the subagent-specific detail store.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>The function inspects one <code>LLMResponse</code> and extracts any available rollout fields from <code>response.prompt_token_ids</code>, <code>response.completion_token_ids</code>, <code>response.logprobs</code>, and <code>response.extra</code>. If <code>self._collect_rollout_details</code> is false, it does nothing. Otherwise, when at least one of those fields is present, it appends a normalized <code>RolloutDetail</code> record to <code>self._subagent_rollout_details</code>; its real output is that in-memory append.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, response: LLMResponse) -&gt; None</code></p>
+<ul><li>params: <code>response</code>: <code>LLMResponse</code> — Subagent LLM result object that may carry token IDs, logprobs, and provider-specific extras</li><li>reads: <code>self._collect_rollout_details</code>, <code>self._subagent_rollout_details</code></li><li>returns: Returns <code>None</code>; when collection is enabled and any rollout fields exist, the real product is one appended <code>RolloutDetail</code> entry in <code>self._subagent_rollout_details</code>.</li><li>effects: Appends a <code>RolloutDetail</code> dict to <code>self._subagent_rollout_details</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Check <code>self._collect_rollout_details</code>; if the flag is false, exit immediately without inspecting <code>response</code> further.</li><li>Start an empty <code>rollout_detail</code> dict and copy in <code>response.prompt_token_ids</code>, <code>response.completion_token_ids</code>, and <code>response.logprobs</code> only when each field is <code>is not None</code>.</li><li>If <code>response.extra</code> is present, rebuild it as <code>{"key": [value]}</code> pairs so each extra value also fits the rollout-list schema.</li><li>Append <code>rollout_detail</code> to <code>self._subagent_rollout_details</code> only when the dict is non-empty, so blank responses do not create empty detail records.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _collect_subagent_rollout_detail(self, response: LLMResponse) -&gt; None:
+        """Collect rollout details from a subagent LLM response.
+
+        Args:
+            response: The LLM response containing token IDs and logprobs
+        """
+        if not self._collect_rollout_details:
+            return
+
+        rollout_detail: RolloutDetail = {}
+        if response.prompt_token_ids is not None:
+            rollout_detail["prompt_token_ids"] = [response.prompt_token_ids]
+        if response.completion_token_ids is not None:
+            rollout_detail["completion_token_ids"] = [response.completion_token_ids]
+        if response.logprobs is not None:
+            rollout_detail["logprobs"] = [response.logprobs]
+        if response.extra is not None:
+            rollout_detail["extra"] = {
+                key: [value] for key, value in response.extra.items()
+            }
+
+        if rollout_detail:
+            self._subagent_rollout_details.append(rollout_detail)</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The early return on <code>self._collect_rollout_details</code> keeps rollout capture fully optional. That avoids growing <code>_subagent_rollout_details</code> or touching response payloads when the caller has not enabled this diagnostics path.</li><li>The code uses explicit <code>is not None</code> checks for every response field, instead of truthiness checks. That preserves empty-but-valid payloads such as empty token lists or empty extra mappings, which would be lost if the code treated falsy values as absent.</li><li>The function wraps every captured payload in a single-element list, including each <code>response.extra</code> value. That keeps subagent data aligned with a rollout-oriented schema that expects per-response sequences, even though this helper handles only one <code>LLMResponse</code> at a time.</li><li>The final <code>if rollout_detail:</code> gate skips empty records. Without that guard, enabled collection would accumulate placeholder entries for responses that expose none of the tracked rollout fields.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Terminus2._run_subagent</li><li><strong>Core callees</strong>: list.append on <code>self._subagent_rollout_details</code></li><li><strong>Config / state sources</strong>: <code>self._collect_rollout_details</code> enables or disables capture; <code>response.prompt_token_ids</code>; <code>response.completion_token_ids</code>; <code>response.logprobs</code>; <code>response.extra</code></li><li><strong>Results to</strong>: <code>self._subagent_rollout_details</code> for later rollout-detail consumption; Subagent bookkeeping performed alongside <code>_run_subagent</code> trajectory capture; Context-summarization subagent diagnostics initiated by <code>_summarize</code></li><li><strong>Related siblings</strong>: Terminus2._run_subagent; Terminus2._summarize</li></ul></div></details><details class="file" id="fn-terminus2_save_subagent_trajectory"><summary><span class="chev"></span><code class="fpath">Terminus2._save_subagent_trajectory</code><a class="fn-range" href="../code/terminus_2.py.html#L1757-L1822" title="terminus_2.py:1757-1822">terminus_2.py:1757–1822 ↗</a></summary><div class="file-body"><p class="fn-sub">Persist one summarization subagent trajectory</p>
+<blockquote><p><strong>Stage context</strong>: This helper turns one summarization subagent run into a saved trajectory artifact and a lightweight reference that the parent run can keep. <code>_run_subagent</code> calls it after recording the subagent's prompt/response steps and usage data. In this stage, it supplies the per-subagent artifacts that <code>_summarize</code> later returns alongside the handoff prompt.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>The function takes a subagent <code>session_id</code>, <code>agent_name</code>, recorded <code>steps</code>, raw <code>usage_info</code>, a <code>filename_suffix</code>, and a human-readable <code>summary_text</code>, then packages them into a <code>Trajectory</code>. It reads model and run metadata from <code>self._model_name</code>, <code>self._session_id</code>, <code>self._summarization_count</code>, <code>self.logs_dir</code>, <code>self.version()</code>, and <code>_extract_usage_metrics()</code>, writes a JSON trajectory file under <code>self.logs_dir</code>, and returns a <code>SubagentTrajectoryRef</code> pointing to that filename. If the file write fails, it logs the error but still returns the reference object.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, session_id: str, agent_name: str, steps: list[Step], usage_info, filename_suffix: str, summary_text: str) -&gt; SubagentTrajectoryRef</code></p>
+<ul><li>params: <code>session_id</code>: <code>str</code> — Session id to store in the subagent trajectory and returned reference; <code>agent_name</code>: <code>str</code> — Agent name for the <code>Trajectory.agent.name</code> field; <code>steps</code>: <code>list[Step]</code> — Recorded subagent trajectory steps to embed in the saved artifact; <code>usage_info</code>: <code>?</code> — Raw LLM usage payload passed to <code>_extract_usage_metrics()</code>; <code>filename_suffix</code>: <code>str</code> — Suffix used in the output filename and log messages; <code>summary_text</code>: <code>str</code> — Human-readable label stored in <code>SubagentTrajectoryRef.extra["summary"]</code></li><li>reads: <code>self._model_name</code>, <code>self._session_id</code>, <code>self._summarization_count</code>, <code>self.logs_dir</code>, <code>self.logger</code>, <code>self.version</code>, <code>self._extract_usage_metrics</code></li><li>returns: A <code>SubagentTrajectoryRef</code> with the subagent <code>session_id</code>, the output filename in <code>trajectory_path</code>, and <code>extra={"summary": summary_text}</code></li><li>effects: Writes a trajectory JSON file to <code>self.logs_dir / f"trajectory.summarization-{self._summarization_count}-{filename_suffix}.json"</code>; Emits a debug log on successful save; Emits an error log if the save raises an exception</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>It calls <code>self._extract_usage_metrics(usage_info)</code> and unpacks <code>total_prompt</code>, <code>total_completion</code>, <code>total_cached</code>, and <code>total_cost</code> for the subagent run.</li><li>It builds a <code>Trajectory</code> object that carries the passed <code>session_id</code>, <code>agent_name</code>, and <code>steps</code>, plus an <code>Agent</code> block populated from <code>self.version() or "unknown"</code>, <code>self._model_name</code>, and <code>extra={"parent_session_id": self._session_id, "summarization_index": self._summarization_count}</code>.</li><li>It builds <code>FinalMetrics</code> from the extracted usage values and stores <code>total_cost_usd</code> only when <code>total_cost &gt; 0</code>; otherwise it stores <code>None</code>.</li><li>It derives <code>trajectory_path</code> under <code>self.logs_dir</code> using the current <code>self._summarization_count</code> and the provided <code>filename_suffix</code>.</li><li>Inside a <code>try</code> block, it serializes the trajectory with <code>format_trajectory_json(trajectory.to_json_dict())</code>, writes that JSON to <code>trajectory_path</code>, and logs a debug message naming the saved file.</li><li>If the write fails, it catches <code>Exception</code>, logs an error with <code>save_error</code>, and then still returns a <code>SubagentTrajectoryRef</code> that points to the intended filename and carries <code>summary_text</code> in <code>extra</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _save_subagent_trajectory(
+        self,
+        session_id: str,
+        agent_name: str,
+        steps: list[Step],
+        usage_info,
+        filename_suffix: str,
+        summary_text: str,
+    ) -&gt; SubagentTrajectoryRef:
+        """Save a subagent trajectory to disk and return its reference.
+
+        Args:
+            session_id: Session ID for the subagent
+            agent_name: Name of the subagent (e.g., "terminus-2-summarization-summary")
+            steps: List of trajectory steps
+            usage_info: Usage information from LLM response
+            filename_suffix: Suffix for trajectory filename (e.g., "summary", "questions", "answers")
+            summary_text: Human-readable summary for the trajectory ref extra field
+
+        Returns:
+            SubagentTrajectoryRef for inclusion in parent trajectory
+        """
+        total_prompt, total_completion, total_cached, total_cost = (
+            self._extract_usage_metrics(usage_info)
+        )
+
+        trajectory = Trajectory(
+            session_id=session_id,
+            agent=Agent(
+                name=agent_name,
+                version=self.version() or "unknown",
+                model_name=self._model_name,
+                extra={
+                    "parent_session_id": self._session_id,
+                    "summarization_index": self._summarization_count,
+                },
+            ),
+            steps=steps,
+            final_metrics=FinalMetrics(
+                total_prompt_tokens=total_prompt,
+                total_completion_tokens=total_completion,
+                total_cached_tokens=total_cached,
+                total_cost_usd=total_cost if total_cost &gt; 0 else None,
+            ),
+        )
+
+        trajectory_path = (
+            self.logs_dir
+            / f"trajectory.summarization-{self._summarization_count}-{filename_suffix}.json"
+        )
+        try:
+            with open(trajectory_path, "w") as f:
+                f.write(format_trajectory_json(trajectory.to_json_dict()))
+            self.logger.debug(
+                f"{filename_suffix.capitalize()} subagent trajectory saved to {trajectory_path}"
+            )
+        except Exception as save_error:
+            self.logger.error(
+                f"Failed to save {filename_suffix} subagent trajectory: {save_error}"
+            )
+
+        return SubagentTrajectoryRef(
+            session_id=session_id,
+            trajectory_path=str(trajectory_path.name),
+            extra={"summary": summary_text},
+        )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It embeds <code>parent_session_id</code> and <code>summarization_index</code> in <code>Agent.extra</code> so each subagent artifact stays linked to the parent run and the specific summarization pass. Without that extra metadata, later inspection would have to infer lineage from filenames alone.</li><li>It converts <code>self.version()</code> to <code>self.version() or "unknown"</code> so the saved artifact always has a usable version string. The alternative would preserve <code>None</code>, but that would make downstream readers handle a missing version field.</li><li>It stores <code>total_cost_usd</code> only when <code>total_cost &gt; 0</code>. That avoids writing a misleading zero-cost value when usage extraction did not produce a meaningful cost.</li><li>It catches save errors and still returns <code>SubagentTrajectoryRef</code> instead of failing the summarization flow. That choice favors keeping the parent summarization ritual alive, even if one artifact file could not be written; propagating the exception here would make <code>_run_subagent</code> fail after already producing a model response.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Terminus2._run_subagent</li><li><strong>Core callees</strong>: Terminus2._extract_usage_metrics; Terminus2.version; Trajectory; Agent; FinalMetrics; format_trajectory_json; SubagentTrajectoryRef</li><li><strong>Config / state sources</strong>: self._model_name; self._session_id; self._summarization_count; self.logs_dir</li><li><strong>Results to</strong>: returns <code>SubagentTrajectoryRef</code> to <code>Terminus2._run_subagent</code>; saved JSON artifact under <code>self.logs_dir</code>; <code>Terminus2._summarize</code>, via <code>_run_subagent</code>, includes these refs in its return tuple; parent trajectory linkage later consumes the subagent refs recorded by the summarization flow</li><li><strong>Related siblings</strong>: Terminus2._run_subagent records the subagent steps and calls this saver; Terminus2._summarize orchestrates the three subagent runs whose artifacts this function persists</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-summarization-count"><code>reg-summarization-count</code></a> — name file and tag summarization pass</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_convert_chat_messages_to_steps"><summary><span class="chev"></span><code class="fpath">Terminus2._convert_chat_messages_to_steps</code><a class="fn-range" href="../code/terminus_2.py.html#L1824-L1882" title="terminus_2.py:1824-1882">terminus_2.py:1824–1882 ↗</a></summary><div class="file-body"><p class="fn-sub">Convert chat dicts into trajectory steps</p>
+<blockquote><p><strong>Stage context</strong>: This helper reshapes chat-style message records into <code>Step</code> objects. Within the summarization side flow, it serves as an adapter from <code>chat_messages</code> plus an optional handoff prompt to the trajectory format used elsewhere.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p>The function takes <code>chat_messages</code>, an optional <code>additional_user_message</code>, and a <code>mark_as_copied</code> flag, then returns a new <code>list[Step]</code>. It reads each message with direct <code>msg["role"]</code> and <code>msg["content"]</code> indexing, maps <code>"assistant"</code> messages to <code>Step(source="agent")</code>, and uses <code>self._last_response_model_name or self._model_name</code> for those assistant-derived steps. If <code>mark_as_copied</code> is true, it marks each converted step with <code>is_copied_context=True</code>. If <code>additional_user_message</code> is truthy, it appends one final <code>user</code> step and intentionally leaves that appended step unmarked as copied.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, chat_messages: list[dict], additional_user_message: str | None = None, mark_as_copied: bool = False) -&gt; list[Step]</code></p>
+<ul><li>params: <code>chat_messages</code>: <code>list[dict]</code> — input chat records; each item is read via <code>msg["role"]</code> and <code>msg["content"]</code>; <code>additional_user_message</code>: <code>str | None</code> — optional final user message appended only when this value is truthy; <code>mark_as_copied</code>: <code>bool</code> — flag that marks each converted chat-derived step as copied context</li><li>reads: <code>self._last_response_model_name</code>, <code>self._model_name</code></li><li>returns: A newly built <code>list[Step]</code> representing the converted chat history, plus one appended final user step when <code>additional_user_message</code> is truthy.</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Initialize an empty <code>steps</code> list and start <code>step_id</code> at <code>1</code>.</li><li>Iterate through <code>chat_messages</code>, read each entry with <code>msg["role"]</code> and <code>msg["content"]</code>, and build one <code>Step</code> per message.</li><li>For <code>role == "assistant"</code>, create <code>Step(source="agent", message=content, model_name=self._last_response_model_name or self._model_name)</code>; for every other role, keep <code>source=role</code> and omit <code>model_name</code>.</li><li>If <code>mark_as_copied</code> is true, set <code>step.is_copied_context = True</code> on each converted chat-derived step, then append the step and increment <code>step_id</code>.</li><li>After all chat messages, if <code>additional_user_message</code> is truthy, append one more <code>Step</code> with the current <code>step_id</code>, <code>source="user"</code>, and <code>message=additional_user_message</code>.</li><li>Return the assembled <code>steps</code> list.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _convert_chat_messages_to_steps(
+        self,
+        chat_messages: list[dict],
+        additional_user_message: str | None = None,
+        mark_as_copied: bool = False,
+    ) -&gt; list[Step]:
+        """Convert chat messages to trajectory steps.
+
+        Args:
+            chat_messages: List of chat messages with 'role' and 'content' fields
+            additional_user_message: Optional additional user message to append as final step
+            mark_as_copied: If True, mark all steps with is_copied_context=True (for continuation trajectories)
+
+        Returns:
+            List of Step objects representing the chat history
+        """
+        steps = []
+        step_id = 1
+
+        for msg in chat_messages:
+            role = msg["role"]
+            content = msg["content"]
+
+            # Map chat role to trajectory source
+            if role == "assistant":
+                source = "agent"
+                step = Step(
+                    step_id=step_id,
+                    source=source,
+                    message=content,
+                    model_name=self._last_response_model_name or self._model_name,
+                )
+            else:
+                source = role
+                step = Step(
+                    step_id=step_id,
+                    source=source,
+                    message=content,
+                )
+
+            # Mark as copied context if this is for a continuation trajectory
+            if mark_as_copied:
+                step.is_copied_context = True
+
+            steps.append(step)
+            step_id += 1
+
+        # Add the additional user message if provided
+        # Note: The additional user message is NOT marked as copied since it's the new handoff prompt
+        if additional_user_message:
+            steps.append(
+                Step(
+                    step_id=step_id,
+                    source="user",
+                    message=additional_user_message,
+                )
+            )
+
+        return steps</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The code remaps chat <code>role == "assistant"</code> to trajectory <code>source="agent"</code> instead of preserving the original label. That choice is explicit in the branch and keeps assistant-originated steps distinct from raw chat-role naming.</li><li>Assistant-derived steps use <code>self._last_response_model_name or self._model_name</code>, so the function prefers the most recent response model name but falls back when that value is absent or falsey. The code applies this only to assistant messages; other roles never get a <code>model_name</code> here.</li><li>The appended handoff step is gated by <code>if additional_user_message:</code>, not an <code>is not None</code> check. Empty strings therefore do not create a trailing user step.</li><li>When <code>mark_as_copied</code> is true, the function marks only the steps created from <code>chat_messages</code>. The comment and code both exclude the optional appended user step from copied-context marking.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: unknown from this excerpt</li><li><strong>Core callees</strong>: <code>Step(...)</code> constructor</li><li><strong>Config / state sources</strong>: <code>self._last_response_model_name</code>; <code>self._model_name</code></li><li><strong>Results to</strong>: returns a <code>list[Step]</code> to its caller; returned steps can feed trajectory-building code; returned copied-context flags reflect the <code>mark_as_copied</code> argument; returned final user step reflects <code>additional_user_message</code> when truthy</li><li><strong>Related siblings</strong>: <code>Terminus2._prepare_copied_trajectory_steps</code> also works with copied-context trajectory material; <code>Terminus2._remove_metrics_from_copied_steps</code> mutates copied <code>Step</code> objects after they exist</li></ul></div></details><nav class="pn"><a class="pn-prev" href="stage-6.html"><span>← Previous</span><strong>Recording Post-process (External)</strong></a><a class="pn-next" href="crosscut-X1.html"><span>Next →</span><strong>Token &amp; Cost Accounting</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>

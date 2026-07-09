@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>crosscut-X1 · Token &amp; Cost Accounting</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,500;0,8..60,600;0,8..60,700;1,8..60,400&amp;family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;family=Noto+Serif+SC:wght@400;500;600;700&amp;family=Noto+Sans+SC:wght@400;500;700&amp;display=swap" rel="stylesheet">
+<link rel="stylesheet" href="../assets/style.css">
+<script>try{var t=localStorage.getItem('hh-theme');if(t==='dark'||(!t&&matchMedia('(prefers-color-scheme: dark)').matches))document.documentElement.classList.add('dark');}catch(e){}</script>
+
+</head>
+<body>
+<div class="progress-bar" id="progress-bar" aria-hidden="true"></div>
+<header class="topbar">
+<div class="topbar__inner">
+<a class="topbar__brand" href="../index.html?lang=en"><span class="brand-mark" aria-hidden="true">
+<svg viewBox="0 0 32 32" width="22" height="22" fill="none">
+<rect x="4" y="3" width="17" height="26" rx="3" class="bm-cover"/>
+<rect x="8" y="3" width="17" height="26" rx="3" class="bm-page"/>
+<line x1="12" y1="10" x2="21" y2="10" class="bm-line"/>
+<line x1="12" y1="15" x2="21" y2="15" class="bm-line"/>
+<line x1="12" y1="20" x2="18" y2="20" class="bm-line"/>
+</svg>
+</span><span>Terminus 2 Handbook</span></a>
+<nav class="topbar__nav">
+<a href="../index.html?lang=en" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11.4 12 4.2l9 7.2"/><path d="M5.8 9.8V19.8h12.4V9.8"/></svg><span>Home</span></a>
+<a href="registers.html" class="topbar__link topbar__link--icon"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 3 7.8l9 4.8 9-4.8z"/><path d="m3 12.2 9 4.8 9-4.8"/><path d="m3 16.4 9 4.8 9-4.8"/></svg><span>State-flow registers</span></a>
+<button id="theme-toggle" class="icon-btn" aria-label="Toggle dark mode" title="Toggle theme">
+<svg class="icon-sun" viewBox="0 0 24 24" width="17" height="17"><circle cx="12" cy="12" r="4.5"/><g><line x1="12" y1="1.5" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22.5"/><line x1="1.5" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22.5" y2="12"/><line x1="4.2" y1="4.2" x2="6" y2="6"/><line x1="18" y1="18" x2="19.8" y2="19.8"/><line x1="19.8" y1="4.2" x2="18" y2="6"/><line x1="6" y1="18" x2="4.2" y2="19.8"/></g></svg>
+<svg class="icon-moon" viewBox="0 0 24 24" width="17" height="17"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z"/></svg>
+</button>
+</nav>
+</div>
+</header>
+<div class="layout">
+<aside class="sidebar"><div class="side-inner"><nav class="side-tree"><div class="s-leaf"><a class="s-link " href="stage-1.html"><span class="s-num">1</span>Configuration Crystallization</a></div><div class="s-leaf"><a class="s-link " href="stage-2.html"><span class="s-num">2</span>Environment Setup</a></div><div class="s-leaf"><a class="s-link " href="stage-3.html"><span class="s-num">3</span>Run Onset</a></div><details class="s-node"><summary><span class="chev"></span><a class="s-link " href="stage-4.html"><span class="s-num">4</span>Iteration Loop</a></summary><div class="s-kids"><div class="s-leaf"><a class="s-link " href="stage-4.1.html"><span class="s-num">4.1</span>Loop Entry Gates</a></div><div class="s-leaf"><a class="s-link " href="stage-4.2.html"><span class="s-num">4.2</span>Proactive Summarize Probe</a></div><div class="s-leaf"><a class="s-link " href="stage-4.3.html"><span class="s-num">4.3</span>LLM Query</a></div><div class="s-leaf"><a class="s-link " href="stage-4.4.html"><span class="s-num">4.4</span>Response Parse</a></div><div class="s-leaf"><a class="s-link " href="stage-4.5.html"><span class="s-num">4.5</span>Pending Handoff Prompt → User Step (or Split)</a></div><div class="s-leaf"><a class="s-link " href="stage-4.6.html"><span class="s-num">4.6</span>Error Branch</a></div><div class="s-leaf"><a class="s-link " href="stage-4.7.html"><span class="s-num">4.7</span>Command Execute → Observation → Trajectory Step</a></div><div class="s-leaf"><a class="s-link " href="stage-4.8.html"><span class="s-num">4.8</span>Completion Gate + Loop Control</a></div><div class="s-leaf"><a class="s-link " href="stage-4.9.html"><span class="s-num">4.9</span>Parser internal helpers</a></div></div></details><div class="s-leaf"><a class="s-link " href="stage-5.html"><span class="s-num">5</span>Run Teardown</a></div><div class="s-leaf"><a class="s-link " href="stage-6.html"><span class="s-num">6</span>Recording Post-process (External)</a></div><div class="s-leaf"><a class="s-link " href="side-S1.html"><span class="s-num">S1</span>Context Summarization</a></div><div class="s-leaf"><a class="s-link cur" href="crosscut-X1.html"><span class="s-num">X1</span>Token &amp; Cost Accounting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X2.html"><span class="s-num">X2</span>Output Length Limiting</a></div><div class="s-leaf"><a class="s-link " href="crosscut-X3.html"><span class="s-num">X3</span>Logging</a></div><div class="s-leaf"><a class="s-link " href="subsys-tmux-internal.html"><span class="s-num">sub</span>Tmux internal helpers</a></div></nav></div></aside>
+<main class="content"><nav class="crumbs"><a href="index.html">Index</a></nav><div class="stage-head"><h1>Token &amp; Cost Accounting</h1><div class="meta"><span class="chip mono">crosscut-X1</span><span class="chip">5 functions</span></div></div>
+<h2 class="sec">Opening Explanation</h2>
+<p>This stage exists so the agent can measure how much model work it used, how long that work took, and how much it cost across both the main LLM and any subagents. An LLM is the language model call itself, and a subagent is a smaller agent the main agent asks to do part of the job. Without this stage, the run would still work, but you would lose basic visibility: Was this step expensive? Did latency spike? Did a subagent quietly consume most of the budget? This logic sits across the loop rather than in one single step because usage is created everywhere an LLM call happens, then gathered into final run totals near the end.</p>
+<h2 class="sec">Main Flow</h2>
+
+<ol><li>Before an LLM call, the system snapshots the current token counters.<p>This matters because token totals on the chat object are cumulative. To know what <em>this one call</em> used, the stage saves the “before” values, then compares them to the totals after the call.</p></li><li>After the call, it turns the delta into step-level metrics.<p><code>_count_total_tokens()</code> (sum the tokens present in a chat history) helps answer “how large is the conversation context?” The repeated before/after pattern records prompt, completion, and cache token use for the specific step, including error cases. That way failed calls do not disappear from accounting.</p></li><li>It also records latency for each API request.<p><code>_track_api_request_time()</code> (store request duration in milliseconds) exists so cost is not the only thing you can inspect. A run can be cheap but slow, and that still matters.</p></li><li>When subagents are involved, their usage is folded in separately.<p><code>_extract_usage_metrics()</code> (pull usage numbers out of a subagent result) and <code>_update_subagent_metrics()</code> (add those numbers into the running subagent totals) make sure nested work is not lost. <code>_append_subagent_response_step()</code> (add the subagent’s result back into the main run as a step) is one place where this accounting gets attached to the visible trace.</p></li><li>If detailed rollout collection is enabled, full subagent call records are saved too.<p>This is not required for basic accounting. It exists for deeper inspection when you want to understand where a run spent its budget in detail.</p></li><li>At the end of the loop, these running numbers are flushed into final context totals.<p>The key design choice is that main-chat usage and subagent usage are tracked separately during the run, then combined at the end. That keeps attribution clear while still producing one total for the whole trial.</p></li></ol>
+<h2 class="sec"> State Flow</h2>
+<ul><li>writes: <a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — each time an LLM API call finishes, the elapsed time is appended so latency can be summarized later</li><li>writes: <a class="reg" href="registers.html#reg-subagent-metrics"><code>reg-subagent-metrics</code></a> — updated whenever a subagent returns usage data, so nested LLM cost does not vanish from the run totals</li><li>writes: <code>_subagent_rollout_details</code> — when rollout-detail collection is enabled, full subagent records are stored for later inspection</li><li>reads: <a class="reg" href="registers.html#reg-subagent-metrics"><code>reg-subagent-metrics</code></a> — read at final aggregation time so trial totals include subagent usage in addition to the main chat</li><li>reads: <a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — used later for run-level reporting or summary metrics</li><li>triggers downstream: <code>crosscut-X2 Output Length Limiting</code> — after per-call usage and timing are attached to the current step, the pipeline continues to the next cross-cutting control</li></ul>
+<h2 class="sec">Pipeline Hand-Off</h2>
+<p>Upstream stages produce prompts, summaries, and actual LLM or subagent calls that consume tokens and time. This stage turns that raw consumption into tracked metrics on steps and run-level accumulators, which later stages use for final reporting, budgeting, and understanding where the agent spent its effort.</p><div class="files-bar"><h2 class="sec">Functions<span class="pill">5</span></h2><span class="spacer"></span><button class="tool" data-x="expand">Expand all</button><button class="tool" data-x="collapse">Collapse all</button></div><details class="file" id="fn-terminus2_count_total_tokens"><summary><span class="chev"></span><code class="fpath">Terminus2._count_total_tokens</code><a class="fn-range" href="../code/terminus_2.py.html#L524-L528" title="terminus_2.py:524-528">terminus_2.py:524–528 ↗</a></summary><div class="file-body"><p class="fn-sub">Chat transcript token counting helper</p>
+<blockquote><p><strong>Stage context</strong>: This entry is a small accounting utility inside the Token &amp; Cost Accounting stage. In the shown code, it only imports <code>token_counter</code> and returns <code>token_counter(model=self._model_name, messages=chat.messages)</code>.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_count_total_tokens</code> returns one integer token count for a <code>Chat</code>. It reads <code>self._model_name</code> and <code>chat.messages</code>, passes both directly to <code>litellm.utils.token_counter</code>, and does not mutate instance state.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, chat: Chat) -&gt; int</code></p>
+<ul><li>params: <code>chat</code>: <code>Chat</code> — source of the <code>messages</code> list passed to <code>token_counter</code></li><li>reads: <code>self._model_name</code>, <code>chat.messages</code></li><li>returns: the integer returned by <code>token_counter(model=self._model_name, messages=chat.messages)</code></li><li>effects: imports <code>token_counter</code> from <code>litellm.utils</code> inside the function body</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Import <code>token_counter</code> from <code>litellm.utils</code> inside <code>_count_total_tokens</code>.</li><li>Read <code>self._model_name</code> and <code>chat.messages</code>.</li><li>Return <code>token_counter(model=self._model_name, messages=chat.messages)</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _count_total_tokens(self, chat: Chat) -&gt; int:
+        """Count total tokens across all messages in the chat."""
+        from litellm.utils import token_counter
+
+        return token_counter(model=self._model_name, messages=chat.messages)</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The function imports <code>token_counter</code> inside the function body instead of at module scope.</li><li>The helper delegates all counting work to <code>litellm.utils.token_counter</code>; this code adds no intermediate processing around <code>chat.messages</code> or <code>self._model_name</code>.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: none shown in the provided source excerpt</li><li><strong>Core callees</strong>: litellm.utils.token_counter</li><li><strong>Config / state sources</strong>: self._model_name; chat.messages</li><li><strong>Results to</strong>: direct return value to this function's caller</li></ul></div></details><details class="file" id="fn-terminus2_extract_usage_metrics"><summary><span class="chev"></span><code class="fpath">Terminus2._extract_usage_metrics</code><a class="fn-range" href="../code/terminus_2.py.html#L632-L649" title="terminus_2.py:632-649">terminus_2.py:632–649 ↗</a></summary><div class="file-body"><p class="fn-sub">Normalize usage object into four metrics</p>
+<blockquote><p><strong>Stage context</strong>: This helper turns a <code>usage_info</code> object into a fixed <code>(prompt_tokens, completion_tokens, cached_tokens, cost_usd)</code> tuple. Within token-and-cost accounting, it provides a small normalization boundary that complements <code>_count_total_tokens</code>: <code>_count_total_tokens</code> derives one aggregate token count from a <code>Chat</code>, while this function reads precomputed per-field usage attributes from <code>usage_info</code> and returns them without touching instance state.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_extract_usage_metrics</code> accepts one <code>usage_info</code> input and returns four normalized metrics. If <code>usage_info</code> is falsy, it returns the literal fallback tuple <code>(0, 0, 0, 0)</code>. If <code>usage_info</code> is truthy, it requires <code>prompt_tokens</code>, <code>completion_tokens</code>, <code>cache_tokens</code>, and <code>cost_usd</code> attributes, and it only normalizes <code>cost_usd</code> by replacing values <code>&lt;= 0</code> with <code>0</code>. It does not read or write any <code>self</code> state.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, usage_info) -&gt; tuple[int, int, int, float]</code></p>
+<ul><li>params: <code>self</code>: <code>Terminus2</code> — instance receiver; unused by this method; <code>usage_info</code>: <code>?</code> — usage object to read; if truthy, it must expose <code>prompt_tokens</code>, <code>completion_tokens</code>, <code>cache_tokens</code>, and <code>cost_usd</code></li><li>returns: A 4-tuple <code>(prompt_tokens, completion_tokens, cached_tokens, cost_usd)</code>; returns <code>(0, 0, 0, 0)</code> when <code>usage_info</code> is falsy</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Check <code>usage_info</code> with <code>if not usage_info</code>; if that condition holds, return the literal zero tuple <code>(0, 0, 0, 0)</code> immediately.</li><li>Otherwise, read <code>usage_info.prompt_tokens</code>, <code>usage_info.completion_tokens</code>, and <code>usage_info.cache_tokens</code> directly for the first three tuple positions.</li><li>Read <code>usage_info.cost_usd</code> and place it in the fourth position only when <code>usage_info.cost_usd &gt; 0</code>; otherwise place <code>0</code> there.</li><li>Return the assembled 4-item tuple without mutating any instance attribute.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _extract_usage_metrics(self, usage_info) -&gt; tuple[int, int, int, float]:
+        """Extract and normalize metrics from usage info.
+
+        Args:
+            usage_info: Usage information from LLM response
+
+        Returns:
+            Tuple of (prompt_tokens, completion_tokens, cached_tokens, cost_usd)
+        """
+        if not usage_info:
+            return 0, 0, 0, 0
+
+        return (
+            usage_info.prompt_tokens,
+            usage_info.completion_tokens,
+            usage_info.cache_tokens,
+            usage_info.cost_usd if usage_info.cost_usd &gt; 0 else 0,
+        )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The guard uses broad falsiness, not an explicit <code>None</code> check. That means any falsy <code>usage_info</code> triggers the fallback <code>(0, 0, 0, 0)</code>, which keeps the return shape stable with one branch.</li><li>The truthy path reads attributes directly instead of using <code>getattr</code> defaults. This keeps the function strict about the expected <code>usage_info</code> interface and avoids silently inventing per-field values when the object shape is wrong.</li><li>The code normalizes only <code>cost_usd</code>, and only when <code>cost_usd &lt;= 0</code>. It leaves token counts untouched, so the function applies a narrow correction rather than rewriting every field.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Unknown from this source excerpt; Methods that already hold a <code>usage_info</code> object and need a fixed four-value metrics tuple</li><li><strong>Core callees</strong>: none; direct attribute access on <code>usage_info.prompt_tokens</code>; direct attribute access on <code>usage_info.completion_tokens</code>; direct attribute access on <code>usage_info.cache_tokens</code>; direct attribute access on <code>usage_info.cost_usd</code></li><li><strong>Config / state sources</strong>: <code>usage_info</code> truthiness controls the zero-tuple fallback; <code>usage_info.cost_usd</code> value controls the fourth-field normalization</li><li><strong>Results to</strong>: the immediate caller as a returned metrics tuple; code that needs a uniform <code>(prompt_tokens, completion_tokens, cached_tokens, cost_usd)</code> representation</li><li><strong>Related siblings</strong>: <code>Terminus2._count_total_tokens</code> computes one total token count from a <code>Chat</code>, whereas <code>_extract_usage_metrics</code> re-expresses an existing <code>usage_info</code> object as four separate metrics.</li></ul></div></details><details class="file" id="fn-terminus2_update_subagent_metrics"><summary><span class="chev"></span><code class="fpath">Terminus2._update_subagent_metrics</code><a class="fn-range" href="../code/terminus_2.py.html#L618-L630" title="terminus_2.py:618-630">terminus_2.py:618–630 ↗</a></summary><div class="file-body"><p class="fn-sub">Subagent usage accumulator update helper</p>
+<blockquote><p><strong>Stage context</strong>: This helper handles one narrow part of the token-and-cost accounting stage: it folds one <code>usage_info</code> record into <code>self._subagent_metrics</code>. It sits alongside <code>_extract_usage_metrics</code> and <code>_count_total_tokens</code>, but unlike those helpers it mutates stored totals instead of returning derived values.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_update_subagent_metrics</code> accepts one <code>usage_info</code> object and returns <code>None</code>. If <code>usage_info</code> is falsy, it exits without changing state. Otherwise, it reads <code>usage_info.prompt_tokens</code>, <code>completion_tokens</code>, <code>cache_tokens</code>, and <code>cost_usd</code>, then adds each value into the matching <code>self._subagent_metrics.total_*</code> field.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, usage_info) -&gt; None</code></p>
+<ul><li>params: <code>usage_info</code>: <code>object with </code>prompt_tokens<code>, </code>completion_tokens<code>, </code>cache_tokens<code>, and </code>cost_usd<code> attributes</code> — usage record supplying numeric token and cost values</li><li>reads: <code>self._subagent_metrics.total_prompt_tokens</code>, <code>self._subagent_metrics.total_completion_tokens</code>, <code>self._subagent_metrics.total_cached_tokens</code>, <code>self._subagent_metrics.total_cost_usd</code></li><li>returns: None; the product is an in-place update of <code>self._subagent_metrics</code> totals</li><li>effects: increments <code>self._subagent_metrics.total_prompt_tokens</code> by <code>usage_info.prompt_tokens</code>; increments <code>self._subagent_metrics.total_completion_tokens</code> by <code>usage_info.completion_tokens</code>; increments <code>self._subagent_metrics.total_cached_tokens</code> by <code>usage_info.cache_tokens</code>; increments <code>self._subagent_metrics.total_cost_usd</code> by <code>usage_info.cost_usd</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Check <code>if not usage_info</code>; if the argument is falsy, return immediately and leave <code>self._subagent_metrics</code> unchanged.</li><li>Read <code>self._subagent_metrics.total_prompt_tokens</code> and <code>usage_info.prompt_tokens</code>, then write back their sum to <code>self._subagent_metrics.total_prompt_tokens</code>.</li><li>Read <code>self._subagent_metrics.total_completion_tokens</code> and <code>usage_info.completion_tokens</code>, then write back their sum to <code>self._subagent_metrics.total_completion_tokens</code>.</li><li>Read <code>self._subagent_metrics.total_cached_tokens</code> and <code>usage_info.cache_tokens</code>, then write back their sum to <code>self._subagent_metrics.total_cached_tokens</code>.</li><li>Read <code>self._subagent_metrics.total_cost_usd</code> and <code>usage_info.cost_usd</code>, then write back their sum to <code>self._subagent_metrics.total_cost_usd</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _update_subagent_metrics(self, usage_info) -&gt; None:
+        """Update subagent metrics with usage information from an LLM response.
+
+        Args:
+            usage_info: Usage information from LLM response containing token counts and cost
+        """
+        if not usage_info:
+            return
+
+        self._subagent_metrics.total_prompt_tokens += usage_info.prompt_tokens
+        self._subagent_metrics.total_completion_tokens += usage_info.completion_tokens
+        self._subagent_metrics.total_cached_tokens += usage_info.cache_tokens
+        self._subagent_metrics.total_cost_usd += usage_info.cost_usd</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The broad guard <code>if not usage_info</code> treats any falsy value as "no usage data" and makes the function a no-op in that case. This avoids attribute access on missing input, but it also means the check is not limited to <code>None</code>.</li><li>The function updates each metric field directly with <code>+=</code> instead of normalizing or validating per-field values first. That keeps this helper focused on accumulation, but it assumes <code>usage_info</code> already exposes usable numeric attributes.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: internal code that has a <code>usage_info</code> object and wants to accumulate it into <code>self._subagent_metrics</code></li><li><strong>Core callees</strong>: none</li><li><strong>Config / state sources</strong>: <code>usage_info.prompt_tokens</code>; <code>usage_info.completion_tokens</code>; <code>usage_info.cache_tokens</code>; <code>usage_info.cost_usd</code>; <code>self._subagent_metrics.total_prompt_tokens</code>; <code>self._subagent_metrics.total_completion_tokens</code>; <code>self._subagent_metrics.total_cached_tokens</code>; <code>self._subagent_metrics.total_cost_usd</code></li><li><strong>Results to</strong>: <code>self._subagent_metrics.total_prompt_tokens</code>; <code>self._subagent_metrics.total_completion_tokens</code>; <code>self._subagent_metrics.total_cached_tokens</code>; <code>self._subagent_metrics.total_cost_usd</code></li><li><strong>Related siblings</strong>: <code>Terminus2._extract_usage_metrics</code> also works with usage fields, but it returns normalized values instead of mutating state.; <code>Terminus2._count_total_tokens</code> is another accounting helper in this stage, but it computes a fresh token count from a <code>Chat</code> instead of updating an accumulator.</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-subagent-metrics"><code>reg-subagent-metrics</code></a> — increments four stored subagent total fields</li></ul></div>
+</div></details><details class="file" id="fn-terminus2_append_subagent_response_step"><summary><span class="chev"></span><code class="fpath">Terminus2._append_subagent_response_step</code><a class="fn-range" href="../code/terminus_2.py.html#L1705-L1755" title="terminus_2.py:1705-1755">terminus_2.py:1705–1755 ↗</a></summary><div class="file-body"><p class="fn-sub">Append subagent response step with optional usage metrics</p>
+<blockquote><p><strong>Stage context</strong>: This helper records one subagent LLM reply as a <code>Step</code> and, when available, attaches token and cost data to that step. It runs inside the stage's broader token-and-cost accounting flow, but this function itself only serializes caller-supplied <code>usage_info</code> into <code>Step.metrics</code>. Unlike siblings such as <code>_extract_usage_metrics</code> and <code>_update_subagent_metrics</code>, it does not aggregate totals; it only appends a trajectory record.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_append_subagent_response_step</code> adds one agent-authored <code>Step</code> to the caller-provided <code>steps</code> list for a subagent response. It reads <code>response</code>, <code>step_id</code>, <code>subagent_name</code>, and the truthiness of <code>usage_info</code>, and it falls back to <code>self._model_name</code> when <code>response.model_name</code> is missing. If <code>usage_info</code> is truthy, it also builds a <code>Metrics</code> object from <code>usage_info</code> and <code>response</code> fields; otherwise it logs a warning and appends the step without metrics. The appended <code>Step</code> always includes <code>reasoning_content=response.reasoning_content</code>.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, steps: list[Step], step_id: int, response: LLMResponse, usage_info, subagent_name: str) -&gt; None</code></p>
+<ul><li>params: <code>steps</code>: <code>list[Step]</code> — target trajectory list that receives the new <code>Step</code>; <code>step_id</code>: <code>int</code> — identifier written into the appended <code>Step.step_id</code>; <code>response</code>: <code>LLMResponse</code> — subagent LLM output supplying content, reasoning, model name, token ids, and logprobs; <code>usage_info</code>: <code>?</code> — truthiness-gated usage payload; when truthy, supplies prompt/completion/cache tokens and cost; <code>subagent_name</code>: <code>str</code> — name inserted into the warning message when <code>usage_info</code> is falsy</li><li>reads: <code>self._model_name</code>, <code>self.logger</code></li><li>returns: None; the real product is one appended <code>Step</code> in <code>steps</code>, always carrying <code>reasoning_content=response.reasoning_content</code> and sometimes carrying <code>metrics</code></li><li>effects: appends one <code>Step</code> object to the provided <code>steps</code> list; emits <code>self.logger.warning(...)</code> when <code>usage_info</code> is falsy; reads current UTC time via <code>datetime.now(timezone.utc).isoformat()</code> for the step timestamp</li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Check <code>if usage_info:</code> by truthiness. Truthy values take the metrics path; any falsy value takes the warning/no-metrics path.</li><li>On the truthy branch, build and append a <code>Step</code> with <code>step_id=step_id</code>, <code>timestamp=datetime.now(timezone.utc).isoformat()</code>, <code>source="agent"</code>, <code>model_name=response.model_name or self._model_name</code>, <code>message=response.content</code>, and <code>reasoning_content=response.reasoning_content</code>.</li><li>Still on the truthy branch, attach <code>metrics=Metrics(...)</code> with exact field mappings: <code>prompt_tokens=usage_info.prompt_tokens</code>, <code>completion_tokens=usage_info.completion_tokens</code>, <code>cached_tokens=usage_info.cache_tokens</code>, <code>cost_usd=usage_info.cost_usd if usage_info.cost_usd &gt; 0 else None</code>, <code>prompt_token_ids=response.prompt_token_ids</code>, <code>completion_token_ids=response.completion_token_ids</code>, and <code>logprobs=response.logprobs</code>.</li><li>On the falsy branch, log <code>Failed to get token usage for {subagent_name}</code> through <code>self.logger.warning(...)</code>.</li><li>Then append a <code>Step</code> with the same core response fields as above—<code>step_id</code>, UTC <code>timestamp</code>, <code>source="agent"</code>, fallback <code>model_name</code>, <code>message=response.content</code>, and <code>reasoning_content=response.reasoning_content</code>—but without a <code>metrics</code> object.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _append_subagent_response_step(
+        self,
+        steps: list[Step],
+        step_id: int,
+        response: LLMResponse,
+        usage_info,
+        subagent_name: str,
+    ) -&gt; None:
+        """Append a response step with conditional metrics to trajectory steps.
+
+        Args:
+            steps: List of steps to append to
+            step_id: ID for the new step
+            response: LLM response
+            usage_info: Usage info (may be None)
+            subagent_name: Name of subagent for warning message
+        """
+        if usage_info:
+            steps.append(
+                Step(
+                    step_id=step_id,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    source="agent",
+                    model_name=response.model_name or self._model_name,
+                    message=response.content,
+                    reasoning_content=response.reasoning_content,
+                    metrics=Metrics(
+                        prompt_tokens=usage_info.prompt_tokens,
+                        completion_tokens=usage_info.completion_tokens,
+                        cached_tokens=usage_info.cache_tokens,
+                        cost_usd=usage_info.cost_usd
+                        if usage_info.cost_usd &gt; 0
+                        else None,
+                        prompt_token_ids=response.prompt_token_ids,
+                        completion_token_ids=response.completion_token_ids,
+                        logprobs=response.logprobs,
+                    ),
+                )
+            )
+        else:
+            self.logger.warning(f"Failed to get token usage for {subagent_name}")
+            steps.append(
+                Step(
+                    step_id=step_id,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    source="agent",
+                    model_name=response.model_name or self._model_name,
+                    message=response.content,
+                    reasoning_content=response.reasoning_content,
+                )
+            )</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>It gates metrics attachment on <code>if usage_info:</code> instead of checking only for <code>None</code>. That makes any falsy payload follow the warning path, which avoids dereferencing missing token fields but also treats all falsy values as unusable usage data.</li><li>It always appends a <code>Step</code>, even when usage data is unavailable. This preserves the response record in <code>steps</code> and isolates the failure to a warning plus missing <code>metrics</code> rather than dropping the subagent output entirely.</li><li>It uses <code>response.model_name or self._model_name</code> for <code>Step.model_name</code>. This keeps the step populated when the response omits a model name, using the instance's configured model as a local fallback.</li><li>It stores <code>cost_usd</code> only when <code>usage_info.cost_usd &gt; 0</code>, otherwise <code>None</code>. This is a visible local choice in this function: token counts are copied through directly, but non-positive cost values are omitted from the serialized metrics.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Terminus2._run_subagent</li><li><strong>Core callees</strong>: Step(...); Metrics(...); datetime.now(timezone.utc).isoformat(); self.logger.warning(...)</li><li><strong>Config / state sources</strong>: self._model_name; self.logger</li><li><strong>Results to</strong>: the caller-provided <code>steps</code> list; subagent trajectory records stored by the caller; warning log output when <code>usage_info</code> is falsy</li><li><strong>Related siblings</strong>: Terminus2._extract_usage_metrics; Terminus2._update_subagent_metrics</li></ul></div></details><details class="file" id="fn-terminus2_track_api_request_time"><summary><span class="chev"></span><code class="fpath">Terminus2._track_api_request_time</code><a class="fn-range" href="../code/terminus_2.py.html#L651-L659" title="terminus_2.py:651-659">terminus_2.py:651–659 ↗</a></summary><div class="file-body"><p class="fn-sub">Append one API latency sample in milliseconds</p>
+<blockquote><p><strong>Stage context</strong>: This helper contributes one timing sample to the instance's accumulated API request timings. It runs after a caller has already captured a <code>start_time</code>, and it only records the elapsed duration; it does not aggregate, normalize, or report the data itself.</p></blockquote>
+<p><strong>What this code does</strong></p>
+<p><code>_track_api_request_time</code> takes a previously captured <code>start_time</code> and records one elapsed request duration in milliseconds. It reads the current time with <code>time.time()</code>, computes <code>(end_time - start_time) * 1000</code>, appends that numeric value to <code>self._api_request_times</code>, and returns <code>None</code>.</p>
+<p><strong>Interface · params / IO</strong></p>
+<p><code>(self, start_time: float) -&gt; None</code></p>
+<ul><li>params: <code>start_time</code>: <code>float</code> — Earlier timestamp, expected to come from <code>time.time()</code></li><li>reads: <code>self._api_request_times</code></li><li>returns: None; the real product is one appended latency sample in <code>self._api_request_times</code></li><li>effects: Appends one elapsed-milliseconds value to <code>self._api_request_times</code>; Reads wall-clock time via <code>time.time()</code></li></ul>
+<p><strong>Execution flow</strong></p>
+<ol><li>Call <code>time.time()</code> to capture <code>end_time</code> at the moment this helper runs.</li><li>Compute <code>request_time_ms</code> from the caller-supplied <code>start_time</code> and the new <code>end_time</code> using <code>(end_time - start_time) * 1000</code>.</li><li>Append <code>request_time_ms</code> to <code>self._api_request_times</code>.</li></ol>
+<p><strong>Source</strong></p>
+<pre><code>    def _track_api_request_time(self, start_time: float) -&gt; None:
+        """Track API request time from start timestamp.
+
+        Args:
+            start_time: Start time from time.time()
+        """
+        end_time = time.time()
+        request_time_ms = (end_time - start_time) * 1000
+        self._api_request_times.append(request_time_ms)</code></pre>
+<p><strong>Non-obvious design decisions</strong></p>
+<ul><li>The helper samples the end timestamp internally instead of accepting an <code>end_time</code> argument. That keeps the call site small and ensures the recorded duration always ends exactly where this method runs.</li><li>This method has no branches, validation, or error handling. The code assumes <code>start_time</code> is a valid timestamp and leaves any bad-input behavior to normal Python arithmetic and attribute errors.</li></ul>
+<p><strong>Relations</strong></p>
+<ul><li><strong>Callers</strong>: Any method that captured a request <code>start_time</code> and wants to record one elapsed API-call duration</li><li><strong>Core callees</strong>: <code>time.time</code>; <code>self._api_request_times.append</code></li><li><strong>Config / state sources</strong>: <code>self._api_request_times</code></li><li><strong>Results to</strong>: <code>self._api_request_times</code> for later consumers of accumulated request timings</li></ul>
+<div class="reg-ops"><span class="reg-ops__label">Register interactions</span><ul><li><a class="reg" href="registers.html#reg-api-request-times"><code>reg-api-request-times</code></a> — append one elapsed request-time sample</li></ul></div>
+</div></details><nav class="pn"><a class="pn-prev" href="side-S1.html"><span>← Previous</span><strong>Context Summarization</strong></a><a class="pn-next" href="crosscut-X2.html"><span>Next →</span><strong>Output Length Limiting</strong></a></nav></main>
+<aside class="codepane" id="codepane" hidden>
+<div class="codepane__bar">
+<code class="codepane__path" id="codepane-path"></code>
+<a class="codepane__act" id="codepane-open" href="#" target="_blank" title="Open in full page">⤢</a>
+<button class="codepane__act" id="codepane-close" title="Close (Esc)">✕</button>
+</div>
+<div class="codepane__body">
+<div class="codepane__resize" id="codepane-resize"></div>
+<iframe class="codepane__frame" id="codepane-frame" title="source code"></iframe>
+</div>
+</aside>
+</div>
+<script src="../assets/app.js"></script>
+</body>
+</html>
